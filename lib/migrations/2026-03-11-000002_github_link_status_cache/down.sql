@@ -1,0 +1,2 @@
+DROP INDEX github_link_statuses_kind_refresh_idx;
+DROP TABLE github_link_statuses;

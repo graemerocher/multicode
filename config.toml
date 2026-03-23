@@ -1,0 +1,94 @@
+workspace-directory = "~/dev/agent-work"
+opencode = ["opencode-cli", "opencode"]
+# todo: find a solution that isn't bound to TUI lifecycle
+
+[github]
+#token = {command = "gh auth token"}
+token = {env = "GITHUB_MCP_TOKEN"}
+populate-git-credentials = true
+
+[isolation]
+add-skills-from = ["./workspace-skills"]
+writable = [
+    "~/.local/share/opencode/bin",
+    "~/.cache/opencode",
+    "~/.bun",
+    "~/.cache/bun",
+    "~/.gradle",
+    "~/.claude",
+    "~/.m2/repository",
+    "~/.config/gh",
+    "$XDG_RUNTIME_DIR",
+]
+isolated = [
+    "~/.local/share/opencode",
+    "/var/tmp",
+    "~/.gradle/daemon",
+    "~/.gradle/.tmp",
+    "~/.gradle/kotlin-profile",
+    "~/.local/share/kotlin",
+    "~/.local/state/opencode",
+]
+readable = [
+    "~/.local/share/opencode/auth.json",
+]
+tmpfs = [
+    "/tmp",
+    #"~/.ssh",
+]
+inherit-env = [
+    "XDG_RUNTIME_DIR",
+    "DISPLAY",
+    "HOME",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "GITHUB_MCP_TOKEN",
+]
+memory-high = "12 GiB"
+memory-max = "16 GiB"
+cpu = "300%"
+
+
+[handler]
+review = "/usr/bin/smerge ."
+review-pty = false
+web = "/usr/bin/firefox {}"
+
+[[tool]]
+type = "exec"
+name = "bash"
+key = "b"
+exec = "/bin/bash"
+
+[remote]
+sync-interval-seconds = 4
+
+[[remote.sync-up]]
+local = "~/.gitconfig"
+remote = "~/.gitconfig"
+# OpenCode credentials (!)
+[[remote.sync-up]]
+local = "~/.config/opencode"
+remote = "~/.config/opencode"
+dereference-symlinks = true
+[[remote.sync-up]]
+local = "~/.local/share/opencode/auth.json"
+remote = "~/.local/share/opencode/auth.json"
+dereference-symlinks = true
+
+[[remote.sync-bidi]]
+local = "/var/tmp/multicode-remote-workspace"
+remote = "~/dev/agent-work"
+exclude = [".multicode/remote"]
+
+[remote.install]
+command = """
+sudo loginctl enable-linger $(whoami)
+sudo dnf config-manager --enable ol10_developer ol10_codeready_builder
+sudo dnf install -yq tmux rsync bubblewrap nodejs-npm zstd git java-21-openjdk-devel java-25-openjdk-devel graalvm-17-native-image graalvm-21-native-image graalvm-25-native-image
+sudo dnf config-manager -q --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+sudo dnf install -yq gh --repo gh-cli
+sudo npm i -g opencode-ai
+sudo alternatives --set java /usr/lib/jvm/java-25-openjdk/bin/java
+"""

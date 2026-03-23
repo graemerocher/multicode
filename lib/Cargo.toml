@@ -1,0 +1,35 @@
+[package]
+name = "multicode-lib"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "fs", "rt", "time", "process", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shellexpand = "3"
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "rustls"] }
+progenitor-client = "0.13"
+regress = "0.10"
+tokio-stream = "0.1"
+diesel = { version = "2", features = ["sqlite", "r2d2"] }
+diesel_migrations = "2"
+libsqlite3-sys = { version = "0", features = ["bundled"] }
+octocrab = { version = "0", default-features = false, features = ["follow-redirect", "retry", "rustls", "timeout", "tracing", "default-client", "rustls-aws-lc-rs", "jwt-rust-crypto"] }
+url = "2"
+tracing = "0"
+tracing-subscriber = { version = "0", features = ["fmt", "ansi"] }
+shell-words = "1"
+size = "0"
+
+[build-dependencies]
+openapiv3 = "2"
+prettyplease = "0.2"
+progenitor = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "charset", "http2", "rustls", "blocking"] }
+serde_json = "1"
+syn = "2"

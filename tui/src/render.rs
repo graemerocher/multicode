@@ -1,0 +1,630 @@
+use crate::icons::{
+    icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
+    pr_review_icon_color,
+};
+use crate::system::centered_rect_fixed;
+use crate::*;
+
+pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+    let create_row_server = "Machine:";
+    let create_row_cpu_raw = machine_cpu_cell_label(app.machine_cpu_percent);
+    let create_row_ram_raw = machine_ram_cell_label(app.machine_used_ram_bytes);
+    let create_row_description = machine_description(
+        app.machine_cpu_count,
+        app.machine_total_ram_bytes,
+        app.machine_agent_directory_disk_usage,
+    );
+    let (
+        workspace_width,
+        server_width,
+        cpu_width,
+        ram_width,
+        cost_width,
+        re_width,
+        is_width,
+        pr_width,
+        build_width,
+        review_width,
+    ) = table_column_widths(
+        &app.ordered_keys,
+        &app.snapshots,
+        create_row_server,
+        &create_row_cpu_raw,
+        &create_row_ram_raw,
+    );
+    let create_row_cpu = right_align_cell_text(&create_row_cpu_raw, cpu_width);
+    let create_row_ram = right_align_cell_text(&create_row_ram_raw, ram_width);
+    let workspace_memory_high_bytes = multicode_lib::services::parse_optional_size_bytes(
+        app.service.config.isolation.memory_high.as_deref(),
+        "memory_high",
+    )
+    .ok()
+    .flatten();
+
+    let mut rows = Vec::with_capacity(app.ordered_keys.len() + 1);
+    rows.push(
+        Row::new(vec![
+            Cell::from(CREATE_ROW_LABEL),
+            Cell::from(create_row_server),
+            Cell::from(create_row_cpu),
+            Cell::from(create_row_ram),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(create_row_description),
+        ])
+        .style(Style::default().fg(CREATE_ROW_COLOR)),
+    );
+
+    for key in &app.ordered_keys {
+        if let Some(snapshot) = app.snapshots.get(key) {
+            let archived = snapshot.persistent.archived;
+            let user_description = if app.mode == UiMode::EditDescription
+                && app.selected_workspace_key() == Some(key.as_str())
+            {
+                format!("{}▏", app.edit_input)
+            } else {
+                snapshot.persistent.description.clone()
+            };
+            let selected_link_index: Option<usize> = if app.mode == UiMode::Normal
+                && app.selected_workspace_key() == Some(key.as_str())
+            {
+                app.selected_link_index
+            } else {
+                None
+            };
+            let links = selectable_workspace_links(
+                snapshot,
+                &app.workspace_link_validation_results,
+                &app.github_link_statuses,
+            );
+            let selected_link_kind = selected_link_index
+                .and_then(|index| links.get(index))
+                .map(|link| link.kind);
+            let review_link = links
+                .iter()
+                .find(|link| link.kind == WorkspaceLinkKind::Review);
+            let issue_link = links
+                .iter()
+                .find(|link| link.kind == WorkspaceLinkKind::Issue);
+            let pr_link = links.iter().find(|link| link.kind == WorkspaceLinkKind::Pr);
+            let issue_status = issue_link.and_then(|link| app.github_link_statuses.get(link));
+            let pr_status = pr_link.and_then(|link| app.github_link_statuses.get(link));
+            let description = Cell::from(description_line_for_snapshot(
+                snapshot,
+                user_description.as_str(),
+                archived,
+            ));
+            let cpu = cpu_cell_label(snapshot);
+            let cpu = right_align_cell_text(&cpu, cpu_width);
+            let ram = ram_cell_label(snapshot);
+            let ram = right_align_cell_text(&ram, ram_width);
+            let cost = cost_cell_label(snapshot);
+            let cost = right_align_cell_text(&cost, cost_width);
+
+            let review_cell = review_link.map_or_else(Cell::default, |_| {
+                status_icon_cell(
+                    StatusIconKind::FileDiff,
+                    if archived {
+                        Color::DarkGray
+                    } else {
+                        AGENT_LINK_COLOR
+                    },
+                    selected_link_kind == Some(WorkspaceLinkKind::Review),
+                )
+            });
+            let issue_cell = if let Some(GithubLinkStatusView::Issue(issue_status)) = issue_status {
+                let (kind, color) = issue_icon_kind_and_color(issue_status.state);
+                status_icon_cell(
+                    kind,
+                    if archived { Color::DarkGray } else { color },
+                    selected_link_kind == Some(WorkspaceLinkKind::Issue),
+                )
+            } else {
+                Cell::default()
+            };
+            let (pr_cell, build_cell, review_status_cell) =
+                if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
+                    let (kind, color) = pr_icon_kind_and_color(*pr_status);
+                    (
+                        status_icon_cell(
+                            kind,
+                            if archived { Color::DarkGray } else { color },
+                            selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                        ),
+                        pr_build_icon_color(*pr_status).map_or_else(Cell::default, |build_color| {
+                            status_icon_cell(
+                                StatusIconKind::Server,
+                                if archived {
+                                    Color::DarkGray
+                                } else {
+                                    build_color
+                                },
+                                false,
+                            )
+                        }),
+                        pr_review_icon_color(*pr_status).map_or_else(
+                            Cell::default,
+                            |review_color| {
+                                status_icon_cell(
+                                    StatusIconKind::Eye,
+                                    if archived {
+                                        Color::DarkGray
+                                    } else {
+                                        review_color
+                                    },
+                                    false,
+                                )
+                            },
+                        ),
+                    )
+                } else {
+                    (Cell::default(), Cell::default(), Cell::default())
+                };
+
+            rows.push(
+                Row::new(vec![
+                    Cell::from(key.clone()),
+                    Cell::from(server_cell_label(snapshot))
+                        .style(server_cell_style(snapshot, archived)),
+                    Cell::from(cpu),
+                    Cell::from(ram).style(ram_cell_style(
+                        snapshot,
+                        workspace_memory_high_bytes,
+                        archived,
+                    )),
+                    Cell::from(cost),
+                    review_cell,
+                    issue_cell,
+                    pr_cell,
+                    build_cell,
+                    review_status_cell,
+                    description,
+                ])
+                .style(workspace_row_style(snapshot)),
+            );
+        }
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(workspace_width),
+            Constraint::Length(server_width),
+            Constraint::Length(cpu_width),
+            Constraint::Length(ram_width),
+            Constraint::Length(cost_width),
+            Constraint::Length(re_width),
+            Constraint::Length(is_width),
+            Constraint::Length(pr_width),
+            Constraint::Length(build_width),
+            Constraint::Length(review_width),
+            Constraint::Fill(1),
+        ],
+    )
+    .column_spacing(1)
+    .header(
+        Row::new(vec![
+            Cell::from("Workspace"),
+            Cell::from("Server"),
+            Cell::from(right_align_cell_text("CPU", cpu_width)),
+            Cell::from(right_align_cell_text("RAM", ram_width)),
+            Cell::from(right_align_cell_text("Cost", cost_width)),
+            Cell::from("RE"),
+            Cell::from("IS"),
+            Cell::from("PR"),
+            Cell::from("B"),
+            Cell::from("R"),
+            Cell::from("Description"),
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().title("Workspaces").borders(Borders::ALL))
+    .row_highlight_style(if app.selected_link_index.is_some() {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    });
+
+    let mut table_state = TableState::default();
+    table_state.select(Some(app.selected_row));
+    frame.render_stateful_widget(table, chunks[0], &mut table_state);
+
+    let help = help_line(
+        app.mode,
+        app.selected_row,
+        app.ordered_keys.len(),
+        app.selected_workspace_snapshot(),
+        app.selected_workspace_link_count(),
+        app.selected_link_index,
+        app.selected_workspace_link()
+            .is_some_and(|link| link.is_custom()),
+        app.selected_workspace_link()
+            .is_some_and(|link| link.value.is_empty()),
+        app.selected_workspace_link().map(|link| link.kind),
+        app.selected_workspace_has_refreshable_github_link(),
+        &app.contextual_tool_hotkeys(),
+        &app.status,
+    );
+    frame.render_widget(Paragraph::new(help), chunks[1]);
+
+    if app.mode == UiMode::CreateModal {
+        draw_create_modal(frame, &app.create_input);
+    } else if app.mode == UiMode::EditCustomLink {
+        draw_custom_link_modal(
+            frame,
+            app.custom_link_kind,
+            app.custom_link_action,
+            &app.custom_link_input,
+        );
+    } else if app.mode == UiMode::StartingModal
+        && let Some(workspace_key) = app.starting_workspace_key.as_deref()
+    {
+        draw_starting_modal(frame, workspace_key);
+    } else if app.mode == UiMode::ToolProgressModal
+        && let Some((tool_name, progress)) = app.running_tool_progress()
+    {
+        draw_tool_progress_modal(frame, tool_name, &progress);
+    }
+
+    if app.mode == UiMode::Normal
+        && app.selected_link_index.is_some()
+        && let Some(selected_link_kind) = app.selected_workspace_link().map(|link| link.kind)
+        && let Some(area) = selected_link_tooltip_area(
+            chunks[0],
+            app.selected_row,
+            selected_link_kind,
+            &app.selected_workspace_link_target_display_lines(),
+            [
+                workspace_width,
+                server_width,
+                cpu_width,
+                ram_width,
+                cost_width,
+                re_width,
+                is_width,
+                pr_width,
+                build_width,
+                review_width,
+            ],
+        )
+    {
+        draw_selected_link_tooltip(
+            frame,
+            area,
+            &app.selected_workspace_link_target_display_lines(),
+            app.selected_link_target_index,
+        );
+    }
+}
+
+fn draw_modal_text_input(frame: &mut Frame, area: Rect, input: &str) {
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(input).style(Style::default().add_modifier(Modifier::BOLD)),
+        inner,
+    );
+
+    let cursor_offset = input.chars().count() as u16;
+    let max_offset = inner.width.saturating_sub(1);
+    frame.set_cursor_position((
+        inner.x.saturating_add(cursor_offset.min(max_offset)),
+        inner.y,
+    ));
+}
+
+pub(crate) fn selected_link_tooltip_area(
+    table_area: Rect,
+    selected_row: usize,
+    selected_link_kind: WorkspaceLinkKind,
+    targets: &[(String, bool)],
+    column_widths: [u16; 10],
+) -> Option<Rect> {
+    if selected_row == 0 || targets.is_empty() {
+        return None;
+    }
+
+    let table_inner = Rect {
+        x: table_area.x.saturating_add(1),
+        y: table_area.y.saturating_add(1),
+        width: table_area.width.saturating_sub(2),
+        height: table_area.height.saturating_sub(2),
+    };
+
+    let tooltip_column_index = match selected_link_kind {
+        WorkspaceLinkKind::Review => 5,
+        WorkspaceLinkKind::Issue => 6,
+        WorkspaceLinkKind::Pr => 7,
+    };
+    let mut x = table_inner.x;
+    for width in column_widths.iter().take(tooltip_column_index) {
+        x = x.saturating_add(*width).saturating_add(1);
+    }
+
+    let max_height = table_inner.height.min(12);
+    if max_height < 3 {
+        return None;
+    }
+    let desired_height = (targets.len() as u16).saturating_add(2).min(max_height);
+    let link_y = table_inner.y.saturating_add(1 + selected_row as u16);
+    let below_y = link_y.saturating_add(1);
+    let below_space = table_inner
+        .y
+        .saturating_add(table_inner.height)
+        .saturating_sub(below_y);
+    let y = if below_space >= desired_height {
+        below_y
+    } else {
+        link_y.saturating_sub(desired_height)
+    };
+
+    Some(Rect {
+        x,
+        y,
+        width: table_inner
+            .width
+            .saturating_sub(x.saturating_sub(table_inner.x))
+            .min(60),
+        height: desired_height,
+    })
+}
+
+fn draw_selected_link_tooltip(
+    frame: &mut Frame,
+    area: Rect,
+    targets: &[(String, bool)],
+    selected_target_index: usize,
+) {
+    if area.width < 6 || area.height < 3 || targets.is_empty() {
+        return;
+    }
+
+    let content_width = targets
+        .iter()
+        .map(|(target, _)| content_width(target))
+        .max()
+        .unwrap_or(0)
+        .min(area.width);
+    let width = content_width.max(1);
+    let visible_targets = targets.len().min(area.height as usize);
+    let height = visible_targets as u16;
+    let area = Rect {
+        x: area.x,
+        y: area.y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+    frame.render_widget(Clear, area);
+
+    let lines = targets
+        .iter()
+        .enumerate()
+        .take(area.height as usize)
+        .map(|(index, (target, is_custom))| {
+            let padded_target = format!("{target:<width$}", width = content_width as usize);
+            if index == selected_target_index {
+                Line::from(vec![Span::styled(
+                    padded_target,
+                    Style::default()
+                        .fg(if *is_custom {
+                            DESCRIPTION_COLOR
+                        } else {
+                            Color::Reset
+                        })
+                        .bg(Color::Rgb(60, 60, 60)),
+                )])
+            } else {
+                Line::from(vec![Span::styled(
+                    padded_target,
+                    Style::default()
+                        .fg(if *is_custom {
+                            DESCRIPTION_COLOR
+                        } else {
+                            Color::Reset
+                        })
+                        .bg(Color::Rgb(32, 32, 32)),
+                )])
+            }
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(Color::Rgb(32, 32, 32))),
+        area,
+    );
+}
+
+fn status_icon_cell(kind: StatusIconKind, color: Color, reversed: bool) -> Cell<'static> {
+    let style = Style::default().fg(color).bg(Color::Reset);
+    let style = if reversed {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    };
+    Cell::from(format!("{} ", icon_glyph(kind))).style(style)
+}
+
+pub(crate) fn draw_create_modal(frame: &mut Frame, input: &str) {
+    let area = centered_rect_fixed(CREATE_MODAL_WIDTH, CREATE_MODAL_HEIGHT, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Create workspace ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Enter a workspace key")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
+    draw_modal_text_input(frame, rows[2], input);
+    frame.render_widget(
+        Paragraph::new("Enter to create · Esc to cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+}
+
+pub(crate) fn draw_custom_link_modal(
+    frame: &mut Frame,
+    kind: Option<WorkspaceLinkKind>,
+    action: Option<CustomLinkModalAction>,
+    input: &str,
+) {
+    let area = centered_rect_fixed(
+        CUSTOM_LINK_MODAL_WIDTH,
+        CUSTOM_LINK_MODAL_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+
+    let title = match (action, kind) {
+        (Some(CustomLinkModalAction::Add), Some(WorkspaceLinkKind::Issue)) => " Add issue link ",
+        (Some(CustomLinkModalAction::Add), Some(WorkspaceLinkKind::Pr)) => " Add PR link ",
+        (Some(CustomLinkModalAction::Edit), Some(WorkspaceLinkKind::Issue)) => " Edit issue link ",
+        (Some(CustomLinkModalAction::Edit), Some(WorkspaceLinkKind::Pr)) => " Edit PR link ",
+        _ => " Edit link ",
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+    let footer = if action == Some(CustomLinkModalAction::Edit) {
+        "Enter to save · Delete to remove · Esc to cancel"
+    } else {
+        "Enter to save · Esc to cancel"
+    };
+
+    frame.render_widget(
+        Paragraph::new("Enter an HTTPS URL")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
+    draw_modal_text_input(frame, rows[2], input);
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+}
+
+pub(crate) fn draw_starting_modal(frame: &mut Frame, workspace_key: &str) {
+    let area = centered_rect_fixed(STARTING_MODAL_WIDTH, STARTING_MODAL_HEIGHT, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Starting workspace ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(format!("Starting '{workspace_key}'"))
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Waiting for server readiness...")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
+}
+
+pub(crate) fn draw_tool_progress_modal(frame: &mut Frame, tool_name: &str, progress: &str) {
+    let area = centered_rect_fixed(
+        TOOL_PROGRESS_MODAL_WIDTH,
+        TOOL_PROGRESS_MODAL_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" Tool: {tool_name} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightBlue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Running prompt tool")
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Progress")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(progress.to_string())
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        rows[3],
+    );
+}

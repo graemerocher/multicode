@@ -1,0 +1,17 @@
+[package]
+name = "multicode-tui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+multicode-lib = { path = "../lib" }
+ratatui = "0.30"
+crossterm = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+url = "2"
+tracing = "0"
+size = "0"
+toml = "1"
+rustix = { version = "1", features = ["fs"] }
