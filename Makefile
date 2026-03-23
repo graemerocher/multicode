@@ -16,7 +16,7 @@ CARGO_PROFILE_FLAG :=
 endif
 
 .PHONY: multicode-remote remote-tui stage-remote-tui clean-remote-tui \
-	build-bundle-remote package-bundle verify-bundle bundle-zip clean-bundle
+	build-linux-bundle-remote package-bundle verify-bundle bundle-zip clean-bundle
 
 multicode-remote: stage-remote-tui
 	$(CARGO) build -p $(REMOTE_PACKAGE) $(CARGO_PROFILE_FLAG)
@@ -32,11 +32,10 @@ stage-remote-tui:
 		chmod +x $(REMOTE_STAGE_DIR)/$$target-$(TUI_PACKAGE); \
 	done
 
-build-bundle-remote:
+build-linux-bundle-remote:
 	$(CROSS) build -p $(REMOTE_PACKAGE) --target $(REMOTE_TARGET_LINUX) $(CARGO_PROFILE_FLAG)
-	$(CROSS) build -p $(REMOTE_PACKAGE) --target $(REMOTE_TARGET_MACOS) $(CARGO_PROFILE_FLAG)
 
-package-bundle: stage-remote-tui build-bundle-remote
+package-bundle:
 	rm -rf $(PACKAGE_ROOT)
 	mkdir -p $(PACKAGE_ROOT)/multicode-remote/tui
 	cp target/$(REMOTE_TARGET_LINUX)/$(PROFILE)/$(REMOTE_PACKAGE) $(PACKAGE_ROOT)/multicode-remote-linux
