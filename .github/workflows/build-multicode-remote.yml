@@ -1,0 +1,172 @@
+name: Build multicode-remote
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-linux-tui:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build staged multicode-tui artifacts
+        run: make PROFILE=release remote-tui
+
+      - name: Verify staged Linux TUI artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui
+          test -x target/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui
+
+      - name: Upload staged Linux TUI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: multicode-remote-linux-tui
+          path: target/multicode-remote/tui
+          if-no-files-found: error
+
+  package-remote:
+    needs: build-linux-tui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: multicode-remote-linux
+          - os: macos-latest
+            artifact_name: multicode-remote-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download staged Linux TUI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: multicode-remote-linux-tui
+          path: target/multicode-remote/tui
+
+      - name: Build release multicode-remote
+        run: cargo build -p multicode-remote --release
+
+      - name: Prepare packaged artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="target/package/${{ matrix.artifact_name }}"
+          rm -rf "$package_root"
+          mkdir -p "$package_root/multicode-remote/tui"
+          cp target/release/multicode-remote "$package_root/multicode-remote"
+          cp config.toml "$package_root/config.toml"
+          cp target/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui "$package_root/multicode-remote/tui/"
+          cp target/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui "$package_root/multicode-remote/tui/"
+          chmod +x "$package_root/multicode-remote"
+          chmod +x "$package_root/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui"
+          chmod +x "$package_root/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui"
+
+      - name: Verify packaged artifact contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="target/package/${{ matrix.artifact_name }}"
+          test -x "$package_root/multicode-remote"
+          test -f "$package_root/config.toml"
+          test -x "$package_root/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui"
+          test -x "$package_root/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui"
+          "$package_root/multicode-remote" --help > /dev/null
+
+      - name: Upload packaged artifact directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/package/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  package-combined:
+    needs: package-remote
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: multicode-remote-linux
+          path: target/combined/linux
+
+      - name: Download macOS packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: multicode-remote-macos
+          path: target/combined/macos
+
+      - name: Create combined package tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          combined_root="target/combined/multicode-remote-bundle"
+          rm -rf "$combined_root"
+          mkdir -p "$combined_root/multicode-remote/tui"
+          cp target/combined/linux/multicode-remote "$combined_root/multicode-remote-linux"
+          cp target/combined/macos/multicode-remote "$combined_root/multicode-remote-macos"
+          cp target/combined/linux/config.toml "$combined_root/config.toml"
+          cp target/combined/linux/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui "$combined_root/multicode-remote/tui/"
+          cp target/combined/linux/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui "$combined_root/multicode-remote/tui/"
+          chmod +x "$combined_root/multicode-remote-linux"
+          chmod +x "$combined_root/multicode-remote-macos"
+          chmod +x "$combined_root/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui"
+          chmod +x "$combined_root/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui"
+
+      - name: Verify combined package tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          combined_root="target/combined/multicode-remote-bundle"
+          test -x "$combined_root/multicode-remote-linux"
+          test -x "$combined_root/multicode-remote-macos"
+          test -f "$combined_root/config.toml"
+          test -x "$combined_root/multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui"
+          test -x "$combined_root/multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui"
+
+      - name: Create combined zip artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_path="target/combined/multicode-remote-bundle.zip"
+          rm -f "$archive_path"
+          python -c 'from pathlib import Path; import zipfile; workspace = Path.cwd(); package_root = workspace / "target/combined/multicode-remote-bundle"; archive_path = workspace / "target/combined/multicode-remote-bundle.zip"; archive = zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED); [archive.write(path, path.relative_to(package_root)) for path in sorted(package_root.rglob("*")) if path.is_file()]; archive.close()'
+
+      - name: Verify combined zip contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_path="target/combined/multicode-remote-bundle.zip"
+          unzip -l "$archive_path"
+          unzip -l "$archive_path" | grep -F ' multicode-remote-linux'
+          unzip -l "$archive_path" | grep -F ' multicode-remote-macos'
+          unzip -l "$archive_path" | grep -F ' config.toml'
+          unzip -l "$archive_path" | grep -F ' multicode-remote/tui/x86_64-unknown-linux-gnu-multicode-tui'
+          unzip -l "$archive_path" | grep -F ' multicode-remote/tui/aarch64-unknown-linux-gnu-multicode-tui'
+
+      - name: Upload combined zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multicode-remote-bundle
+          path: target/combined/multicode-remote-bundle.zip
+          if-no-files-found: error
