@@ -50,7 +50,9 @@ pub fn is_excluded_relative_path(path: &Path, exclude: &[String]) -> bool {
     exclude.iter().any(|pattern| {
         let trimmed = pattern.trim_matches('/');
         !trimmed.is_empty()
-            && (normalized == trimmed || normalized.starts_with(&format!("{trimmed}/")))
+            && (normalized == trimmed
+                || normalized.starts_with(&format!("{trimmed}/"))
+                || trimmed.starts_with(&format!("{normalized}/")))
     })
 }
 
@@ -131,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_relative_path_matches_exact_paths_and_descendants() {
+    fn excluded_relative_path_matches_exact_paths_descendants_and_ancestors() {
         let exclude = vec![".multicode/remote".to_string()];
         assert!(is_excluded_relative_path(
             Path::new(".multicode/remote"),
@@ -141,10 +143,7 @@ mod tests {
             Path::new(".multicode/remote/relay/file.sock"),
             &exclude
         ));
-        assert!(!is_excluded_relative_path(
-            Path::new(".multicode"),
-            &exclude
-        ));
+        assert!(is_excluded_relative_path(Path::new(".multicode"), &exclude));
         assert!(!is_excluded_relative_path(
             Path::new("workspace/file.txt"),
             &exclude

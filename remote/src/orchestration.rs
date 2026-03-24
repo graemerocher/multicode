@@ -472,7 +472,12 @@ fn should_sync_bidirectional_mapping_up(
     local_latest: Option<SystemTime>,
     remote_latest: Option<SystemTime>,
 ) -> bool {
-    compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less
+    match (local_latest, remote_latest) {
+        (Some(_), Some(_)) => compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
 }
 
 fn compare_sync_tree_recency(
@@ -543,6 +548,9 @@ async fn latest_remote_tree_modified_time(
         .output()
         .await?;
     if !output.status.success() {
+        if remote_timestamp_probe_failed_for_missing_path(&output.stderr) {
+            return Ok(None);
+        }
         return Err(io::Error::other(format!(
             "failed to resolve latest remote modification timestamp for '{}' with status {}",
             mapping.remote.display(),
@@ -550,6 +558,11 @@ async fn latest_remote_tree_modified_time(
         )));
     }
     parse_remote_latest_timestamp_output(&output.stdout)
+}
+
+fn remote_timestamp_probe_failed_for_missing_path(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("No such file or directory")
 }
 
 fn build_remote_latest_timestamp_command(
@@ -1937,6 +1950,16 @@ mod tests {
                 .expect("missing path lookup should succeed"),
             None
         );
+    }
+
+    #[test]
+    fn remote_timestamp_probe_failed_for_missing_path_detects_missing_directory_error() {
+        assert!(remote_timestamp_probe_failed_for_missing_path(
+            b"Error: Custom { kind: NotFound, error: \"/root/agent-work: No such file or directory\" }\n"
+        ));
+        assert!(!remote_timestamp_probe_failed_for_missing_path(
+            b"Error: permission denied\n"
+        ));
     }
 
     #[test]
