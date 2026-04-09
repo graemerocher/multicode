@@ -2,9 +2,10 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::OnceLock,
 };
 
-use tokio::process::Command;
+use tokio::{process::Command, sync::Mutex};
 use uuid::Uuid;
 
 use super::{
@@ -109,13 +110,20 @@ impl WorkspaceRuntime {
     pub(super) async fn build_pty_command(
         &self,
         key: &str,
+        runtime_handle: Option<&RuntimeHandleSnapshot>,
         inherited_env: &[(String, String)],
         command: Vec<String>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
         match self {
-            Self::Linux(runtime) => runtime.build_pty_command(key, inherited_env, command).await,
+            Self::Linux(runtime) => {
+                runtime
+                    .build_pty_command(key, runtime_handle, inherited_env, command)
+                    .await
+            }
             Self::AppleContainer(runtime) => {
-                runtime.build_pty_command(key, inherited_env, command).await
+                runtime
+                    .build_pty_command(key, runtime_handle, inherited_env, command)
+                    .await
             }
         }
     }
@@ -317,6 +325,7 @@ impl LinuxSystemdBwrapRuntime {
     async fn build_pty_command(
         &self,
         key: &str,
+        _runtime_handle: Option<&RuntimeHandleSnapshot>,
         inherited_env: &[(String, String)],
         command: Vec<String>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
@@ -584,15 +593,17 @@ impl AppleContainerRuntime {
         key: &str,
         inherited_env: &[(String, String)],
     ) -> Result<RuntimeStartResult, CombinedServiceError> {
+        let _start_guard = apple_container_start_lock().lock().await;
         let password = generate_random_password();
         let port = pick_random_free_port().await?;
-        let container_name = self.container_name_for_key(key);
-        self.remove_container_if_present(&container_name).await?;
+        let container_name = self.generate_runtime_id(key);
         let command = self
             .build_run_command(key, &container_name, &password, port, inherited_env)
             .await?;
 
-        let output = run_blocking_process(command.program.clone(), command.args.clone()).await?;
+        let output = self
+            .run_container_start_command(command.program.clone(), command.args.clone())
+            .await?;
 
         if !output.status.success() {
             return Err(CombinedServiceError::StartWorkspaceFailed {
@@ -621,35 +632,60 @@ impl AppleContainerRuntime {
         })
     }
 
-    async fn remove_container_if_present(
+    async fn run_container_start_command(
         &self,
-        container_name: &str,
-    ) -> Result<(), CombinedServiceError> {
-        let output = run_blocking_process(
+        program: String,
+        args: Vec<String>,
+    ) -> Result<Output, CombinedServiceError> {
+        let output = run_blocking_process(program.clone(), args.clone()).await?;
+        if output.status.success() {
+            return Ok(output);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !container_start_reports_allocator_exhaustion(&stderr) {
+            return Ok(output);
+        }
+
+        tracing::warn!(
+            stderr = %stderr.trim(),
+            "apple container allocator exhausted; pruning containers before retry"
+        );
+        let prune_output = run_blocking_process(
             container_program(),
-            vec![
-                "rm".to_string(),
-                "-f".to_string(),
-                container_name.to_string(),
-            ],
+            vec!["prune".to_string(), "-f".to_string()],
         )
         .await?;
-
-        if output.status.success() {
-            return Ok(());
+        if !prune_output.status.success() {
+            let prune_stderr = String::from_utf8_lossy(&prune_output.stderr)
+                .trim()
+                .to_string();
+            return Err(CombinedServiceError::StartWorkspaceFailed {
+                status: output.status.code(),
+                stderr: if prune_stderr.is_empty() {
+                    format!("{stderr}\nautomatic container prune failed")
+                } else {
+                    format!("{stderr}\nautomatic container prune failed: {prune_stderr}")
+                },
+            });
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if container_delete_reports_missing(&stderr) {
-            return Ok(());
+        tracing::info!("apple container prune succeeded; retrying workspace startup");
+        let retry_output = run_blocking_process(program, args).await?;
+        if !retry_output.status.success()
+            && container_start_reports_allocator_exhaustion(&String::from_utf8_lossy(
+                &retry_output.stderr,
+            ))
+        {
+            return Err(CombinedServiceError::StartWorkspaceFailed {
+                status: retry_output.status.code(),
+                stderr: format!(
+                    "{}\nautomatic container prune was insufficient; restart the Apple container backend",
+                    String::from_utf8_lossy(&retry_output.stderr).trim()
+                ),
+            });
         }
-        tracing::warn!(
-            container_name,
-            status = output.status.code(),
-            stderr = %stderr,
-            "best-effort apple container preflight delete failed; continuing startup"
-        );
-        Ok(())
+        Ok(retry_output)
     }
 
     async fn stop_server(
@@ -678,9 +714,18 @@ impl AppleContainerRuntime {
     async fn build_pty_command(
         &self,
         key: &str,
+        runtime_handle: Option<&RuntimeHandleSnapshot>,
         inherited_env: &[(String, String)],
         command: Vec<String>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
+        if let Some(runtime_handle) = runtime_handle
+            && runtime_handle.backend == RuntimeBackend::AppleContainer
+        {
+            return self
+                .build_exec_command(runtime_handle, key, inherited_env, command)
+                .await;
+        }
+
         let image = self.context.runtime.image.as_deref().ok_or_else(|| {
             CombinedServiceError::InvalidRuntimeConfig {
                 field: "runtime.image".to_string(),
@@ -708,6 +753,40 @@ impl AppleContainerRuntime {
             .await?;
         args.push(image.to_string());
         args.extend(command);
+
+        Ok(SpawnCommand {
+            program: container_program(),
+            args,
+            inherited_env: Vec::new(),
+        })
+    }
+
+    async fn build_exec_command(
+        &self,
+        runtime_handle: &RuntimeHandleSnapshot,
+        key: &str,
+        inherited_env: &[(String, String)],
+        command: Vec<String>,
+    ) -> Result<SpawnCommand, CombinedServiceError> {
+        let mut env = inherited_env.to_vec();
+        let host_gitconfig = self.host_gitconfig_path_for_env(&env);
+        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
+            .await?;
+        let env_file = self.write_env_file(key, "exec.env", &env).await?;
+        let workspace_path = self.context.workspace_directory_path.join(key);
+        let args = vec![
+            "exec".to_string(),
+            "--tty".to_string(),
+            "--interactive".to_string(),
+            "--env-file".to_string(),
+            env_file.to_string_lossy().into_owned(),
+            "--workdir".to_string(),
+            workspace_path.to_string_lossy().into_owned(),
+            runtime_handle.id.clone(),
+        ]
+        .into_iter()
+        .chain(command)
+        .collect();
 
         Ok(SpawnCommand {
             program: container_program(),
@@ -974,12 +1053,7 @@ impl AppleContainerRuntime {
         };
 
         let source_root = self.apple_runtime_root(key).join("gitconfig");
-        match tokio::fs::remove_dir_all(&source_root).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-        tokio::fs::create_dir_all(&source_root).await?;
+        clear_directory_contents(&source_root).await?;
         let gitconfig_contents = std::fs::read(host_gitconfig)?;
         tokio::fs::write(
             source_root.join(APPLE_GITCONFIG_FILE_NAME),
@@ -1032,12 +1106,7 @@ impl AppleContainerRuntime {
         }
 
         let aggregate_root = self.apple_runtime_root(key).join("skills");
-        match tokio::fs::remove_dir_all(&aggregate_root).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-        tokio::fs::create_dir_all(&aggregate_root).await?;
+        clear_directory_contents(&aggregate_root).await?;
 
         if tokio::fs::metadata(&target_root).await.is_ok() {
             copy_directory_tree(&target_root, &aggregate_root).await?;
@@ -1100,8 +1169,8 @@ impl AppleContainerRuntime {
         self.apple_runtime_root(key).join("isolate").join(relative)
     }
 
-    fn container_name_for_key(&self, key: &str) -> String {
-        format!("multicode-{}", key)
+    fn generate_runtime_id(&self, key: &str) -> String {
+        format!("multicode-{key}-{}", Uuid::new_v4().as_simple())
     }
 }
 
@@ -1219,12 +1288,23 @@ fn container_program() -> String {
     std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
 }
 
+fn apple_container_start_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn container_delete_reports_missing(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     stderr.contains("not found")
         || stderr.contains("no such")
         || stderr.contains("no matching containers")
         || stderr.contains("does not exist")
+}
+
+fn container_start_reports_allocator_exhaustion(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("no free indices are available for allocation")
 }
 
 async fn run_blocking_process(
@@ -1259,6 +1339,21 @@ async fn copy_directory_tree(source: &Path, target: &Path) -> Result<(), std::io
         }
     }
 
+    Ok(())
+}
+
+async fn clear_directory_contents(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::create_dir_all(path).await?;
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_path = entry.path();
+        let metadata = entry.metadata().await?;
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(entry_path).await?;
+        } else {
+            tokio::fs::remove_file(entry_path).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1571,6 +1666,16 @@ mod tests {
     }
 
     #[test]
+    fn container_start_reports_allocator_exhaustion_matches_apple_error() {
+        assert!(container_start_reports_allocator_exhaustion(
+            "Error: failed to bootstrap container (cause: \"unknown: \"no free indices are available for allocation\"\")"
+        ));
+        assert!(!container_start_reports_allocator_exhaustion(
+            "Error: failed to bootstrap container: permission denied"
+        ));
+    }
+
+    #[test]
     fn apple_container_run_command_honors_limits_and_mounts() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1750,6 +1855,7 @@ mod tests {
             let command = runtime
                 .build_pty_command(
                     "alpha",
+                    None,
                     &[(
                         "HOME".to_string(),
                         root.path().to_string_lossy().into_owned(),
@@ -1772,6 +1878,60 @@ mod tests {
                     .any(|arg| arg == "ghcr.io/example/multicode-java25:latest")
             );
             assert!(command.args.iter().any(|arg| arg == "/bin/bash"));
+            assert!(command.inherited_env.is_empty());
+        });
+    }
+
+    #[test]
+    fn apple_container_pty_command_uses_container_exec_for_running_workspace() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            fs::create_dir_all(workspace_root.join("alpha")).expect("workspace should exist");
+            let runtime = apple_runtime(&root, IsolationConfig::default());
+            let runtime_handle = RuntimeHandleSnapshot {
+                backend: RuntimeBackend::AppleContainer,
+                id: "multicode-alpha-running".to_string(),
+                metadata: BTreeMap::new(),
+            };
+
+            let command = runtime
+                .build_pty_command(
+                    "alpha",
+                    Some(&runtime_handle),
+                    &[(
+                        "HOME".to_string(),
+                        root.path().to_string_lossy().into_owned(),
+                    )],
+                    vec!["/bin/bash".to_string()],
+                )
+                .await
+                .expect("pty command should build");
+
+            assert_eq!(command.program, "container");
+            assert!(contains_sequence(
+                &command.args,
+                &["exec", "--tty", "--interactive", "--env-file",]
+            ));
+            assert!(command.args.iter().any(|arg| arg.ends_with("exec.env")));
+            assert!(contains_sequence(
+                &command.args,
+                &[
+                    "--workdir",
+                    workspace_root.join("alpha").to_string_lossy().as_ref(),
+                    "multicode-alpha-running",
+                    "/bin/bash",
+                ]
+            ));
+            assert!(
+                !command.args.iter().any(|arg| arg == "run"),
+                "running workspaces should reuse the active container"
+            );
             assert!(command.inherited_env.is_empty());
         });
     }
@@ -2029,6 +2189,85 @@ mod tests {
                 fs::read_to_string(aggregated_source.join("workspace-skill/SKILL.md"))
                     .expect("workspace skill should be included"),
                 "# workspace"
+            );
+        });
+    }
+
+    #[test]
+    fn apple_container_reuses_aggregated_skills_directory_across_commands() {
+        use std::os::unix::fs::MetadataExt;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let host_home = root.path().join("host-home");
+            let host_skills_target = host_home.join(".config/opencode/skills");
+            let skill_root = root.path().join("workspace-skills");
+            let skill = skill_root.join("machine-readable-pr");
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(&skill).expect("skill should exist");
+            fs::write(skill.join("SKILL.md"), "# pr").expect("skill file should exist");
+
+            let runtime = AppleContainerRuntime {
+                context: RuntimeContext {
+                    runtime: RuntimeConfig {
+                        backend: RuntimeBackend::AppleContainer,
+                        image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                    },
+                    workspace_directory_path: workspace_root.clone(),
+                    expanded_isolation: ExpandedIsolationConfig {
+                        readable: vec![host_home.join(".config/opencode")],
+                        writable: Vec::new(),
+                        isolated: Vec::new(),
+                        tmpfs: Vec::new(),
+                        added_skills: vec![AddedSkillMount {
+                            source: skill.clone(),
+                            target: host_skills_target.join("machine-readable-pr"),
+                        }],
+                        inherit_env: Vec::new(),
+                        memory_high_bytes: None,
+                        memory_max_bytes: None,
+                        cpu: None,
+                    },
+                    host_opencode_command: "/opt/opencode/bin/opencode".to_string(),
+                    container_opencode_command: "opencode".to_string(),
+                },
+            };
+
+            runtime
+                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .await
+                .expect("run command should build");
+            let aggregate_root = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("skills");
+            let first_ino = fs::metadata(&aggregate_root)
+                .expect("aggregate root should exist")
+                .ino();
+
+            runtime
+                .build_pty_command("alpha", None, &[], vec!["/bin/sh".to_string()])
+                .await
+                .expect("pty command should build");
+            let second_ino = fs::metadata(&aggregate_root)
+                .expect("aggregate root should still exist")
+                .ino();
+
+            assert_eq!(
+                first_ino, second_ino,
+                "apple backend should update the aggregated skills directory in place so existing mounts stay valid"
+            );
+            assert_eq!(
+                fs::read_to_string(aggregate_root.join("machine-readable-pr/SKILL.md"))
+                    .expect("aggregated skill should remain present"),
+                "# pr"
             );
         });
     }

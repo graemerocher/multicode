@@ -21,6 +21,7 @@ use crate::{
 
 use super::{
     GithubStatusService, GithubStatusServiceError, WorkspaceDirectoryError,
+    autonomous_workspace_service::autonomous_workspace_service,
     config::{
         AddedSkillMount, Config, ExpandedIsolationConfig, expand_shell_path, inherited_env_value,
         read_config, resolve_opencode_command, validate_handler_config, validate_remote_config,
@@ -131,7 +132,7 @@ impl CombinedService {
         spawn_usage_aggregation_service(manager.clone());
         spawn_resource_usage_service(manager.clone());
 
-        Ok(Self {
+        let service = Self {
             config,
             manager,
             database,
@@ -141,7 +142,11 @@ impl CombinedService {
             opencode_command,
             runtime,
             github_git_credentials_env,
-        })
+        };
+
+        spawn_autonomous_workspace_service(service.clone());
+
+        Ok(service)
     }
 
     pub fn workspace_directory_path(&self) -> &Path {
@@ -213,6 +218,56 @@ impl CombinedService {
         Ok(())
     }
 
+    pub async fn assign_workspace_repository(
+        &self,
+        key: &str,
+        repository: Option<&str>,
+    ) -> Result<Option<String>, CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let normalized = repository
+            .map(|repository| {
+                super::autonomous_workspace_service::normalize_github_repository_spec(repository)
+                    .ok_or_else(|| {
+                        CombinedServiceError::InvalidRepositorySpec(repository.trim().to_string())
+                    })
+            })
+            .transpose()?;
+
+        let workspace = self.manager.get_workspace(&key)?;
+        workspace.update(|snapshot| {
+            if snapshot.persistent.assigned_repository == normalized {
+                return false;
+            }
+            snapshot.persistent.assigned_repository = normalized.clone();
+            snapshot.persistent.automation_issue = None;
+            snapshot.automation_status = normalized
+                .as_ref()
+                .map(|repository| format!("Repository assigned; scan queued for {repository}"));
+            if normalized.is_some() {
+                snapshot.automation_scan_request_nonce =
+                    snapshot.automation_scan_request_nonce.saturating_add(1);
+            }
+            true
+        });
+        Ok(normalized)
+    }
+
+    pub fn request_workspace_issue_scan(&self, key: &str) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        workspace.update(|snapshot| {
+            if let Some(repository) = snapshot.persistent.assigned_repository.as_deref() {
+                if snapshot.persistent.automation_issue.is_none() {
+                    snapshot.automation_status = Some(format!("Scan requested for {repository}"));
+                }
+            }
+            snapshot.automation_scan_request_nonce =
+                snapshot.automation_scan_request_nonce.saturating_add(1);
+            true
+        });
+        Ok(())
+    }
+
     pub async fn stop_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
         let workspace = self.manager.get_workspace(&key)?;
@@ -233,6 +288,20 @@ impl CombinedService {
                 false
             }
         });
+        Ok(())
+    }
+
+    pub async fn delete_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        let snapshot = workspace.subscribe().borrow().clone();
+
+        if let Some(transient) = snapshot.transient.as_ref() {
+            self.runtime.stop_server(&transient.runtime).await?;
+        }
+
+        self.remove_workspace_disk_state(&key).await?;
+        self.manager.remove(&key)?;
         Ok(())
     }
 
@@ -266,6 +335,14 @@ impl CombinedService {
                 "PTY tool command must not be empty".to_string(),
             ));
         }
+        let runtime_handle = self
+            .manager
+            .get_workspace(&key)?
+            .subscribe()
+            .borrow()
+            .transient
+            .as_ref()
+            .map(|transient| transient.runtime.clone());
 
         let workspace_path = self.workspace_directory_path.join(&key);
         tokio::fs::create_dir_all(&workspace_path).await?;
@@ -274,7 +351,7 @@ impl CombinedService {
             .sandbox_env_pairs(Vec::<(String, String)>::new())
             .await?;
         self.runtime
-            .build_pty_command(&key, &inherited_env, command)
+            .build_pty_command(&key, runtime_handle.as_ref(), &inherited_env, command)
             .await
     }
 
@@ -464,6 +541,36 @@ impl CombinedService {
             .join(".multicode")
             .join("isolate")
             .join(key)
+    }
+
+    fn persistent_snapshot_path_for_key(&self, key: &str) -> PathBuf {
+        self.workspace_directory_path
+            .join(".multicode")
+            .join("persistent")
+            .join(format!("{key}.json"))
+    }
+
+    fn transient_snapshot_path_for_key(&self, key: &str) -> PathBuf {
+        self.workspace_directory_path
+            .join(".multicode")
+            .join("transient")
+            .join(format!("{key}.json"))
+    }
+
+    async fn remove_workspace_disk_state(&self, key: &str) -> Result<(), CombinedServiceError> {
+        remove_path_if_exists(&self.workspace_directory_path.join(key)).await?;
+        remove_path_if_exists(&self.isolate_path_for_key(key)).await?;
+        remove_path_if_exists(&self.persistent_snapshot_path_for_key(key)).await?;
+        remove_path_if_exists(&self.transient_snapshot_path_for_key(key)).await?;
+
+        for format in WorkspaceArchiveFormat::all() {
+            let archive_entry = ArchiveWorkspaceEntry::new(key, format);
+            remove_path_if_exists(&archive_entry.to_path(&self.workspace_directory_path)).await?;
+            remove_path_if_exists(&archive_entry.to_isolate_path(&self.workspace_directory_path))
+                .await?;
+        }
+
+        Ok(())
     }
 
     fn github_git_credentials_env_vars(&self) -> Vec<(String, String)> {
@@ -690,6 +797,21 @@ fn github_git_credentials_env_vars(
     ]
 }
 
+async fn remove_path_if_exists(path: &Path) -> Result<(), CombinedServiceError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => {
+            tokio::fs::remove_dir_all(path).await?;
+            Ok(())
+        }
+        Ok(_) => {
+            tokio::fs::remove_file(path).await?;
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 async fn strip_workspace_git_identity_overrides(
     workspace_path: &Path,
 ) -> Result<(), CombinedServiceError> {
@@ -831,6 +953,7 @@ pub enum CombinedServiceError {
         message: String,
     },
     InvalidToolExecution(String),
+    InvalidRepositorySpec(String),
     UnsupportedRuntimeBackend(String),
     WorkspaceArchived(String),
     WorkspaceNotArchived(String),
@@ -847,6 +970,67 @@ pub enum CombinedServiceError {
     OpencodeCommandNotFound {
         candidates: Vec<String>,
     },
+}
+
+impl CombinedServiceError {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::StartWorkspaceFailed { status, stderr } => {
+                summarize_workspace_start_failure(*status, stderr)
+            }
+            Self::StopWorkspaceFailed { status, stderr } => {
+                summarize_workspace_stop_failure(*status, stderr)
+            }
+            _ => format!("{self:?}"),
+        }
+    }
+}
+
+pub fn summarize_workspace_start_failure(status: Option<i32>, stderr: &str) -> String {
+    let stderr = compact_process_stderr(stderr);
+    if stderr.contains("no free indices are available for allocation") {
+        return format!(
+            "Apple container vmnet allocator exhausted{}; restart the Apple container backend",
+            exit_status_suffix(status),
+        );
+    }
+
+    if stderr.is_empty() {
+        format!("workspace start failed{}", exit_status_suffix(status))
+    } else {
+        format!(
+            "workspace start failed{}: {stderr}",
+            exit_status_suffix(status),
+        )
+    }
+}
+
+fn summarize_workspace_stop_failure(status: Option<i32>, stderr: &str) -> String {
+    let stderr = compact_process_stderr(stderr);
+    if stderr.is_empty() {
+        format!("workspace stop failed{}", exit_status_suffix(status))
+    } else {
+        format!(
+            "workspace stop failed{}: {stderr}",
+            exit_status_suffix(status),
+        )
+    }
+}
+
+fn compact_process_stderr(stderr: &str) -> String {
+    stderr
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_matches('"')
+        .to_string()
+}
+
+fn exit_status_suffix(status: Option<i32>) -> String {
+    status
+        .map(|status| format!(" (exit {status})"))
+        .unwrap_or_default()
 }
 
 impl From<std::io::Error> for CombinedServiceError {
@@ -963,6 +1147,14 @@ fn spawn_resource_usage_service(manager: Arc<WorkspaceManager>) {
     });
 }
 
+fn spawn_autonomous_workspace_service(service: CombinedService) {
+    tokio::spawn(async move {
+        if let Err(err) = autonomous_workspace_service(service).await {
+            tracing::error!(error = ?err, "autonomous workspace service exited with error");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1190,19 @@ mod tests {
         path::{Path, PathBuf},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn summarize_workspace_start_failure_reports_allocator_exhaustion_hint() {
+        let summary = summarize_workspace_start_failure(
+            Some(1),
+            r#"Error: failed to bootstrap container (cause: "unknown: "no free indices are available for allocation"")"#,
+        );
+
+        assert_eq!(
+            summary,
+            "Apple container vmnet allocator exhausted (exit 1); restart the Apple container backend"
+        );
+    }
 
     struct TestDir {
         path: PathBuf,
@@ -1631,6 +1836,247 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 "GIT_CONFIG_VALUE_0".to_string(),
                 r#"!f() { test "$1" = get || exit 0; echo username=$MULTICODE_GITHUB_USERNAME; echo password=$MULTICODE_GITHUB_TOKEN; }; f"#.to_string(),
             )));
+    }
+
+    #[test]
+    fn assign_workspace_repository_normalizes_and_clears_automation_issue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+
+            service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .update(|snapshot| {
+                    snapshot.persistent.automation_issue =
+                        Some("https://github.com/example/repo/issue/1".to_string());
+                    true
+                });
+
+            let normalized = service
+                .assign_workspace_repository("alpha", Some("https://github.com/example/repo.git"))
+                .await
+                .expect("repository assignment should succeed");
+            assert_eq!(normalized.as_deref(), Some("example/repo"));
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+            assert_eq!(
+                snapshot.persistent.assigned_repository.as_deref(),
+                Some("example/repo")
+            );
+            assert!(snapshot.persistent.automation_issue.is_none());
+            assert_eq!(snapshot.automation_scan_request_nonce, 1);
+
+            let cleared = service
+                .assign_workspace_repository("alpha", None)
+                .await
+                .expect("clearing repository assignment should succeed");
+            assert!(cleared.is_none());
+            let cleared_snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+            assert!(cleared_snapshot.persistent.assigned_repository.is_none());
+            assert_eq!(cleared_snapshot.automation_scan_request_nonce, 1);
+        });
+    }
+
+    #[test]
+    fn delete_workspace_stops_runtime_and_removes_workspace_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let stop_log = root.path().join("systemctl-stop.log");
+            let fake_systemctl = bin_dir.join("systemctl");
+            fs::write(
+                &fake_systemctl,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf -- '---\\n' >> '{}'\nexit 0\n",
+                    stop_log.display(),
+                    stop_log.display()
+                ),
+            )
+            .expect("fake systemctl should be written");
+            make_executable(&fake_systemctl);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            workspace.update(|snapshot| {
+                snapshot.transient = Some(crate::TransientWorkspaceSnapshot {
+                    uri: "http://opencode:secret@127.0.0.1:31337/".to_string(),
+                    runtime: crate::RuntimeHandleSnapshot {
+                        backend: crate::RuntimeBackend::LinuxSystemdBwrap,
+                        id: "alpha.service".to_string(),
+                        metadata: Default::default(),
+                    },
+                });
+                true
+            });
+
+            let live_dir = workspace_directory.join("alpha");
+            let isolate_dir = workspace_directory.join(".multicode").join("isolate").join("alpha");
+            let persistent_snapshot = workspace_directory
+                .join(".multicode")
+                .join("persistent")
+                .join("alpha.json");
+            let transient_snapshot = workspace_directory
+                .join(".multicode")
+                .join("transient")
+                .join("alpha.json");
+            let archive_path =
+                ArchiveWorkspaceEntry::new("alpha", WorkspaceArchiveFormat::TarZstd)
+                    .to_path(&workspace_directory);
+            let isolate_archive_path =
+                ArchiveWorkspaceEntry::new("alpha", WorkspaceArchiveFormat::TarZstd)
+                    .to_isolate_path(&workspace_directory);
+
+            tokio::fs::create_dir_all(&live_dir)
+                .await
+                .expect("live dir should exist");
+            tokio::fs::create_dir_all(&isolate_dir)
+                .await
+                .expect("isolate dir should exist");
+            tokio::fs::write(live_dir.join("README.md"), "workspace")
+                .await
+                .expect("workspace file should exist");
+            tokio::fs::write(isolate_dir.join("marker.txt"), "isolate")
+                .await
+                .expect("isolate file should exist");
+            tokio::fs::write(&persistent_snapshot, "{}")
+                .await
+                .expect("persistent snapshot should exist");
+            tokio::fs::write(&transient_snapshot, "{}")
+                .await
+                .expect("transient snapshot should exist");
+            if let Some(parent) = archive_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .expect("archive parent should exist");
+            }
+            if let Some(parent) = isolate_archive_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .expect("isolate archive parent should exist");
+            }
+            tokio::fs::write(&archive_path, "archive")
+                .await
+                .expect("archive should exist");
+            tokio::fs::write(&isolate_archive_path, "isolate archive")
+                .await
+                .expect("isolate archive should exist");
+
+            service
+                .delete_workspace("alpha")
+                .await
+                .expect("workspace deletion should succeed");
+
+            assert!(service.manager.get_workspace("alpha").is_err());
+            assert!(!live_dir.exists());
+            assert!(!isolate_dir.exists());
+            assert!(!persistent_snapshot.exists());
+            assert!(!transient_snapshot.exists());
+            assert!(!archive_path.exists());
+            assert!(!isolate_archive_path.exists());
+
+            let stop_invocation =
+                fs::read_to_string(&stop_log).expect("runtime stop should be recorded");
+            assert!(stop_invocation.contains("alpha.service"));
+        });
     }
 
     #[test]
