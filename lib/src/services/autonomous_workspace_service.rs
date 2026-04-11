@@ -176,7 +176,9 @@ async fn watch_workspace(
 
         let current_issue_url = snapshot.persistent.automation_issue.clone();
         if let Some(current_issue_url) = current_issue_url {
-            let root_status = snapshot.root_session_status.unwrap_or(RootSessionStatus::Idle);
+            let root_status = snapshot
+                .root_session_status
+                .unwrap_or(RootSessionStatus::Idle);
             let should_resume_assigned_issue = matches!(root_status, RootSessionStatus::Idle)
                 && (scan_requested
                     || (previous_root_status.is_none()
