@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(
             target,
             AttachTarget::Codex {
-                uri: "ws://127.0.0.1:3456".to_string(),
+                uri: "ws://127.0.0.1:3456/".to_string(),
                 thread_id: Some("thread-123".to_string()),
             }
         );
@@ -679,6 +679,71 @@ mod tests {
     }
 
     #[test]
+    fn compare_target_path_prefers_validated_review_repo() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
+        let workspace = TestDir::new();
+
+        let all_links = workspace_links(&started);
+        let mut validations = HashMap::new();
+        validations.insert(
+            all_links[0].clone(),
+            WorkspaceLinkValidationResult::Valid("/tmp/repo-a".to_string()),
+        );
+
+        assert_eq!(
+            compare_target_path(&started, &validations, workspace.path()),
+            Some(PathBuf::from("/tmp/repo-a"))
+        );
+    }
+
+    #[test]
+    fn compare_target_path_falls_back_to_issue_worktree() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-serialization".to_string());
+        started.persistent.automation_issue = Some(
+            "https://github.com/micronaut-projects/micronaut-serialization/issues/921".to_string(),
+        );
+        let workspace = TestDir::new();
+        let repo_path = workspace
+            .path()
+            .join("work/micronaut-serialization-921/.git");
+        fs::create_dir_all(&repo_path).expect("issue worktree repo should be created");
+
+        assert_eq!(
+            compare_target_path(&started, &HashMap::new(), workspace.path()),
+            Some(workspace.path().join("work/micronaut-serialization-921"))
+        );
+    }
+
+    #[test]
+    fn compare_target_path_falls_back_to_assigned_repository_root() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-serialization".to_string());
+        let workspace = TestDir::new();
+        let repo_path = workspace.path().join("micronaut-serialization/.git");
+        fs::create_dir_all(&repo_path).expect("assigned repo root should be created");
+
+        assert_eq!(
+            compare_target_path(&started, &HashMap::new(), workspace.path()),
+            Some(workspace.path().join("micronaut-serialization"))
+        );
+    }
+
+    #[test]
+    fn compare_target_path_is_none_without_review_repo_or_workspace_repo() {
+        let started = snapshot(true, Some("http://example"));
+        let workspace = TestDir::new();
+
+        assert_eq!(
+            compare_target_path(&started, &HashMap::new(), workspace.path()),
+            None
+        );
+    }
+
+    #[test]
     fn selectable_workspace_links_include_custom_issue_and_pr_without_github_status() {
         let mut started = snapshot(true, Some("http://example"));
         started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
@@ -1007,6 +1072,7 @@ mod tests {
             Some(WorkspaceLinkKind::Issue),
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1042,6 +1108,7 @@ mod tests {
             Some(WorkspaceLinkKind::Issue),
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1069,6 +1136,7 @@ mod tests {
             true,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -1100,6 +1168,7 @@ mod tests {
             None,
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1120,6 +1189,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1145,6 +1215,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1176,6 +1247,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1197,6 +1269,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1227,6 +1300,7 @@ mod tests {
             None,
             false,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1252,6 +1326,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1281,6 +1356,7 @@ mod tests {
             None,
             false,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1291,6 +1367,56 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("x delete"));
+    }
+
+    #[test]
+    fn help_line_shows_compare_hotkey_only_when_enabled() {
+        let started = snapshot(true, Some("http://example"));
+        let enabled_line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            no_tool_hotkeys(),
+            "",
+        );
+        let enabled_text = enabled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(enabled_text.contains("c compare"));
+
+        let disabled_line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let disabled_text = disabled_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!disabled_text.contains("c compare"));
     }
 
     #[test]
@@ -1305,6 +1431,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1331,6 +1458,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1407,6 +1535,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             &tool_hotkeys,
@@ -1570,6 +1699,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1592,6 +1722,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1901,6 +2032,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1926,6 +2058,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1948,6 +2081,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             no_tool_hotkeys(),

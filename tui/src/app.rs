@@ -50,7 +50,9 @@ pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
             | AutomationAgentState::Stale,
         ) => false,
         None => matches!(
-            snapshot.automation_session_status.or(snapshot.root_session_status),
+            snapshot
+                .automation_session_status
+                .or(snapshot.root_session_status),
             Some(RootSessionStatus::Busy)
         ),
     }
@@ -291,6 +293,28 @@ impl TuiState {
     pub(crate) fn selected_workspace_snapshot(&self) -> Option<&WorkspaceSnapshot> {
         self.selected_workspace_key()
             .and_then(|key| self.snapshots.get(key))
+    }
+
+    pub(crate) fn selected_workspace_can_compare(&self) -> bool {
+        if self.selected_link_index.is_some() {
+            return false;
+        }
+
+        self.selected_workspace_snapshot()
+            .is_some_and(workspace_is_usable)
+            && self.selected_workspace_compare_target_path().is_some()
+            && vscode_is_available()
+    }
+
+    fn selected_workspace_compare_target_path(&self) -> Option<PathBuf> {
+        let key = self.selected_workspace_key()?;
+        let snapshot = self.snapshots.get(key)?;
+        let workspace_path = self.service.workspace_directory_path().join(key);
+        compare_target_path(
+            snapshot,
+            &self.workspace_link_validation_results,
+            &workspace_path,
+        )
     }
 
     fn selected_workspace_link_targets(&self) -> Vec<(WorkspaceLink, String)> {
@@ -1376,6 +1400,58 @@ impl TuiState {
                     });
                     self.mode = UiMode::ToolProgressModal;
                     self.status = format!("{} workspace '{}'", operation_name, key);
+                }
+            }
+            KeyCode::Char('c') => {
+                if link_selected {
+                    return;
+                }
+                if let Some(key) = self.selected_workspace_key().map(str::to_string) {
+                    let Some(snapshot) = self.snapshots.get(&key) else {
+                        return;
+                    };
+                    if !workspace_is_usable(snapshot) {
+                        self.status = format!("Workspace '{key}' is archived and cannot be opened");
+                        return;
+                    }
+                    let Some(repo_path) = self.selected_workspace_compare_target_path() else {
+                        self.status =
+                            format!("Workspace '{key}' does not have a repository to compare");
+                        return;
+                    };
+
+                    match write_compare_preview(&repo_path, &key).await {
+                        Ok((program, args)) => {
+                            tracing::info!(
+                                command = %format_command_line(&program, &args),
+                                workspace = %key,
+                                repo = %repo_path.display(),
+                                "opening workspace compare in vscode"
+                            );
+                            let mut command = Command::new(&program);
+                            match command
+                                .args(&args)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn()
+                            {
+                                Ok(_) => {
+                                    self.status =
+                                        format!("Opened compare for workspace '{key}' in VS Code");
+                                }
+                                Err(err) => {
+                                    self.status = format!(
+                                        "Failed to open compare for workspace '{key}': {err}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.status =
+                                format!("Failed to open compare for workspace '{key}': {err}");
+                        }
+                    }
                 }
             }
             KeyCode::Char('d') => {

@@ -650,6 +650,53 @@ fn validated_workspace_links_by_kind(
         .collect()
 }
 
+fn compare_target_path(
+    snapshot: &WorkspaceSnapshot,
+    validations: &HashMap<WorkspaceLink, WorkspaceLinkValidationResult>,
+    workspace_path: &Path,
+) -> Option<PathBuf> {
+    first_validated_workspace_link_by_kind(snapshot, validations, WorkspaceLinkKind::Review)
+        .and_then(|link| match validations.get(&link) {
+            Some(WorkspaceLinkValidationResult::Valid(path)) => Some(PathBuf::from(path)),
+            _ => None,
+        })
+        .or_else(|| compare_target_path_from_workspace(snapshot, workspace_path))
+}
+
+fn compare_target_path_from_workspace(
+    snapshot: &WorkspaceSnapshot,
+    workspace_path: &Path,
+) -> Option<PathBuf> {
+    let repo_name = snapshot
+        .persistent
+        .assigned_repository
+        .as_deref()
+        .and_then(|repository| repository.rsplit('/').next())
+        .filter(|segment| !segment.is_empty());
+    let issue_number = snapshot
+        .persistent
+        .automation_issue
+        .as_deref()
+        .and_then(|issue| issue.rsplit('/').next())
+        .filter(|segment| !segment.is_empty());
+
+    let mut candidates = Vec::new();
+    if let (Some(repo_name), Some(issue_number)) = (repo_name, issue_number) {
+        candidates.push(
+            workspace_path
+                .join("work")
+                .join(format!("{repo_name}-{issue_number}")),
+        );
+    }
+    if let Some(repo_name) = repo_name {
+        candidates.push(workspace_path.join(repo_name));
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join(".git").is_dir())
+}
+
 fn visible_workspace_links(
     snapshot: &WorkspaceSnapshot,
     validations: &HashMap<WorkspaceLink, WorkspaceLinkValidationResult>,
@@ -821,6 +868,7 @@ fn help_line(
     selected_link_kind: Option<WorkspaceLinkKind>,
     selected_workspace_has_refreshable_github_link: bool,
     selected_workspace_can_assign_issue: bool,
+    selected_workspace_can_compare: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
 ) -> Line<'static> {
@@ -877,6 +925,9 @@ fn help_line(
                         }
                         if selected_workspace_can_assign_issue {
                             push_hotkey(&mut spans, "i", " issue  ");
+                        }
+                        if selected_workspace_can_compare {
+                            push_hotkey(&mut spans, "c", " compare  ");
                         }
                         push_hotkey(&mut spans, "d", " edit description  ");
                         push_hotkey(&mut spans, "x", " delete  ");
