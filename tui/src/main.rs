@@ -14,7 +14,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use multicode_lib::{
-    RootSessionStatus, WorkspaceSnapshot, logging, opencode,
+    AutomationAgentState, RootSessionStatus, WorkspaceSnapshot, logging, opencode,
     services::{
         CombinedService, GithubIssueState, GithubIssueStatus, GithubPrBuildState,
         GithubPrReviewState, GithubPrState, GithubPrStatus, GithubStatus, ToolConfig, ToolType,
@@ -65,8 +65,8 @@ const MACHINE_USAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const ROOT_SESSION_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const PROMPT_TOOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const UI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const CREATE_MODAL_WIDTH: u16 = 56;
-const CREATE_MODAL_HEIGHT: u16 = 9;
+const CREATE_MODAL_WIDTH: u16 = 72;
+const CREATE_MODAL_HEIGHT: u16 = 13;
 const STARTING_MODAL_WIDTH: u16 = 62;
 const STARTING_MODAL_HEIGHT: u16 = 8;
 const TOOL_PROGRESS_MODAL_WIDTH: u16 = 72;
@@ -81,11 +81,17 @@ enum UiMode {
     Normal,
     CreateModal,
     EditDescription,
-    EditRepository,
+    EditIssue,
     EditCustomLink,
     ConfirmDelete,
     StartingModal,
     ToolProgressModal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateModalField {
+    Key,
+    Repository,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +117,10 @@ struct TuiState {
     selected_link_target_index: usize,
     mode: UiMode,
     create_input: String,
-    edit_input: String,
     repository_input: String,
+    create_field: CreateModalField,
+    edit_input: String,
+    issue_input: String,
     custom_link_input: String,
     custom_link_kind: Option<WorkspaceLinkKind>,
     custom_link_action: Option<CustomLinkModalAction>,
@@ -217,11 +225,17 @@ impl WorkspaceLinkKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachTarget {
-    uri: String,
-    username: String,
-    password: String,
-    session_id: Option<String>,
+enum AttachTarget {
+    Opencode {
+        uri: String,
+        username: String,
+        password: String,
+        session_id: Option<String>,
+    },
+    Codex {
+        uri: String,
+        thread_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,10 +258,16 @@ struct DiskUsage {
 }
 
 fn workspace_state(snapshot: &WorkspaceSnapshot) -> WorkspaceUiState {
-    match (
-        snapshot.transient.is_some(),
-        snapshot.opencode_client.is_some(),
-    ) {
+    let agent_ready = snapshot
+        .transient
+        .as_ref()
+        .and_then(|transient| url::Url::parse(&transient.uri).ok())
+        .map(|uri| match uri.scheme() {
+            "ws" | "wss" => snapshot.root_session_id.is_some(),
+            _ => snapshot.opencode_client.is_some(),
+        })
+        .unwrap_or(false);
+    match (snapshot.transient.is_some(), agent_ready) {
         (false, _) => WorkspaceUiState::Stopped,
         (true, false) => WorkspaceUiState::Starting,
         (true, true) => WorkspaceUiState::Started,
@@ -283,15 +303,32 @@ fn server_cell_label(snapshot: &WorkspaceSnapshot) -> &'static str {
     match workspace_state(snapshot) {
         WorkspaceUiState::Stopped => "",
         WorkspaceUiState::Starting => "Starting",
-        WorkspaceUiState::Started => match snapshot
-            .root_session_status
-            .unwrap_or(RootSessionStatus::Idle)
-        {
+        WorkspaceUiState::Started => match effective_server_status(snapshot) {
             RootSessionStatus::Idle => "Idle",
             RootSessionStatus::Busy => "Busy",
             RootSessionStatus::Question => "Question",
         },
     }
+}
+
+fn effective_server_status(snapshot: &WorkspaceSnapshot) -> RootSessionStatus {
+    if snapshot.persistent.automation_issue.is_some() {
+        if let Some(agent_state) = snapshot.automation_agent_state {
+            return match agent_state {
+                AutomationAgentState::Working => RootSessionStatus::Busy,
+                AutomationAgentState::Question => RootSessionStatus::Question,
+                AutomationAgentState::Review
+                | AutomationAgentState::Idle
+                | AutomationAgentState::Stale => RootSessionStatus::Idle,
+            };
+        }
+        if let Some(status) = snapshot.automation_session_status {
+            return status;
+        }
+    }
+    snapshot
+        .root_session_status
+        .unwrap_or(RootSessionStatus::Idle)
 }
 
 fn format_tokens_spaced(tokens: u64) -> String {
@@ -783,7 +820,7 @@ fn help_line(
     selected_link_is_placeholder: bool,
     selected_link_kind: Option<WorkspaceLinkKind>,
     selected_workspace_has_refreshable_github_link: bool,
-    selected_workspace_can_assign_repository: bool,
+    selected_workspace_can_assign_issue: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
 ) -> Line<'static> {
@@ -838,8 +875,8 @@ fn help_line(
                                 push_hotkey(&mut spans, "r", " recheck GH status  ");
                             }
                         }
-                        if selected_workspace_can_assign_repository {
-                            push_hotkey(&mut spans, "g", " repository  ");
+                        if selected_workspace_can_assign_issue {
+                            push_hotkey(&mut spans, "i", " issue  ");
                         }
                         push_hotkey(&mut spans, "d", " edit description  ");
                         push_hotkey(&mut spans, "x", " delete  ");
@@ -858,7 +895,8 @@ fn help_line(
             push_hotkey(&mut spans, "q", " quit");
         }
         UiMode::CreateModal => {
-            spans.push(Span::raw("Create workspace: type key, "));
+            spans.push(Span::raw("Create workspace: type key and repository, "));
+            push_hotkey(&mut spans, "Tab", " next field, ");
             push_hotkey(&mut spans, "Enter", " confirm, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }
@@ -867,8 +905,8 @@ fn help_line(
             push_hotkey(&mut spans, "Enter", " save, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }
-        UiMode::EditRepository => {
-            spans.push(Span::raw("Assign repository: type owner/repo or URL, "));
+        UiMode::EditIssue => {
+            spans.push(Span::raw("Assign issue: type number or GitHub issue URL, "));
             push_hotkey(&mut spans, "Enter", " save, ");
             push_hotkey(&mut spans, "Esc", " cancel");
         }

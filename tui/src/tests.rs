@@ -2,10 +2,13 @@ use crate::*;
 
 #[cfg(test)]
 mod tests {
-    use multicode_lib::services::HandlerConfig;
+    use multicode_lib::{AutomationAgentState, services::HandlerConfig};
 
     use super::*;
-    use crate::app::{compact_github_tooltip_target, starting_modal_failure_status};
+    use crate::app::{
+        compact_github_tooltip_target, should_auto_resume_autonomous_codex_after_attach,
+        starting_modal_failure_status,
+    };
     use crate::icons::{
         icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
         pr_review_icon_color,
@@ -83,6 +86,9 @@ mod tests {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_session_id: None,
+            automation_session_status: None,
+            automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
             usage_total_tokens: None,
@@ -108,6 +114,9 @@ mod tests {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_session_id: None,
+            automation_session_status: None,
+            automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
             usage_total_tokens: None,
@@ -141,6 +150,27 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_after_attach_requires_autonomous_issue_workspace() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.assigned_repository = Some("example/repo".to_string());
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/42".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Question);
+
+        assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
+
+        snapshot.root_session_status = Some(RootSessionStatus::Idle);
+        assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
+
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
+        assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
+
+        snapshot.root_session_status = Some(RootSessionStatus::Question);
+        snapshot.persistent.automation_issue = None;
+        assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
+    }
+
+    #[test]
     fn workspace_attach_target_requires_started_state() {
         let err = workspace_attach_target(&snapshot(false, Some("http://example")))
             .expect_err("non-started workspace should not provide attach URI");
@@ -167,7 +197,7 @@ mod tests {
             .expect("started workspace should expose attach target with auth");
         assert_eq!(
             target,
-            AttachTarget {
+            AttachTarget::Opencode {
                 uri: "http://127.0.0.1:3000/".to_string(),
                 username: "opencode".to_string(),
                 password: "secret".to_string(),
@@ -184,12 +214,20 @@ mod tests {
         let target = workspace_attach_target(&started)
             .expect("started workspace should expose attach target with latest root session id");
 
-        assert_eq!(target.session_id.as_deref(), Some("ses-root-latest"));
+        assert_eq!(
+            target,
+            AttachTarget::Opencode {
+                uri: "http://127.0.0.1:3000/".to_string(),
+                username: "opencode".to_string(),
+                password: "secret".to_string(),
+                session_id: Some("ses-root-latest".to_string()),
+            }
+        );
     }
 
     #[test]
     fn attach_cli_args_appends_session_when_present() {
-        let target = AttachTarget {
+        let target = AttachTarget::Opencode {
             uri: "http://127.0.0.1:3000/".to_string(),
             username: "opencode".to_string(),
             password: "secret".to_string(),
@@ -210,7 +248,7 @@ mod tests {
 
     #[test]
     fn attach_cli_args_omits_session_when_unavailable() {
-        let target = AttachTarget {
+        let target = AttachTarget::Opencode {
             uri: "http://127.0.0.1:3000/".to_string(),
             username: "opencode".to_string(),
             password: "secret".to_string(),
@@ -223,6 +261,42 @@ mod tests {
                 "opencode".to_string(),
                 "attach".to_string(),
                 "http://127.0.0.1:3000/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_attach_target_uses_codex_variant_for_websocket_uri() {
+        let mut started = snapshot(false, Some("ws://127.0.0.1:3456"));
+        started.root_session_id = Some("thread-123".to_string());
+
+        let target = workspace_attach_target(&started)
+            .expect("codex workspace should expose websocket attach target");
+
+        assert_eq!(
+            target,
+            AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456".to_string(),
+                thread_id: Some("thread-123".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn attach_cli_args_use_codex_resume_for_codex_target() {
+        let target = AttachTarget::Codex {
+            uri: "ws://127.0.0.1:3456".to_string(),
+            thread_id: Some("thread-123".to_string()),
+        };
+
+        assert_eq!(
+            attach_cli_args("codex", &target),
+            vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "--remote".to_string(),
+                "ws://127.0.0.1:3456".to_string(),
+                "--last".to_string(),
             ]
         );
     }
@@ -1131,8 +1205,9 @@ mod tests {
     }
 
     #[test]
-    fn help_line_shows_repository_hotkey_for_usable_workspace_row_focus() {
-        let started = snapshot(true, Some("http://example"));
+    fn help_line_shows_issue_hotkey_for_workspace_with_assigned_repository() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository = Some("example/repo".to_string());
         let line = help_line(
             UiMode::Normal,
             1,
@@ -1154,7 +1229,34 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("g repository"));
+        assert!(text.contains("i issue"));
+    }
+
+    #[test]
+    fn help_line_hides_issue_hotkey_without_assigned_repository() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!text.contains("i issue"));
     }
 
     #[test]
@@ -1520,6 +1622,26 @@ mod tests {
         let mut started = snapshot(true, Some("http://example"));
         started.root_session_status = Some(RootSessionStatus::Question);
         assert_eq!(server_cell_label(&started), "Question");
+    }
+
+    #[test]
+    fn server_cell_label_uses_automation_question_state() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/42".to_string());
+        started.automation_agent_state = Some(AutomationAgentState::Question);
+
+        assert_eq!(server_cell_label(&started), "Question");
+    }
+
+    #[test]
+    fn server_cell_label_uses_automation_review_state_as_idle() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/42".to_string());
+        started.automation_agent_state = Some(AutomationAgentState::Review);
+
+        assert_eq!(server_cell_label(&started), "Idle");
     }
 
     #[test]

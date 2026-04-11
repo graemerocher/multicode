@@ -72,6 +72,8 @@ pub struct PersistentWorkspaceSnapshot {
     #[serde(default)]
     pub automation_issue: Option<String>,
     #[serde(default)]
+    pub automation_paused: bool,
+    #[serde(default)]
     pub archive_format: Option<WorkspaceArchiveFormat>,
     #[serde(default)]
     pub agent_provided: AgentProvidedPersistentSnapshot,
@@ -87,6 +89,7 @@ impl Default for PersistentWorkspaceSnapshot {
             created_at: None,
             assigned_repository: None,
             automation_issue: None,
+            automation_paused: false,
             archive_format: None,
             agent_provided: AgentProvidedPersistentSnapshot::default(),
             custom_links: CustomLinksPersistentSnapshot::default(),
@@ -131,6 +134,15 @@ pub struct TransientWorkspaceSnapshot {
     pub runtime: RuntimeHandleSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationAgentState {
+    Working,
+    Question,
+    Review,
+    Idle,
+    Stale,
+}
+
 /// Holder for the HTTP connection to the opencode server.
 #[derive(Clone)]
 pub struct OpencodeClientSnapshot {
@@ -154,6 +166,9 @@ pub struct WorkspaceSnapshot {
     pub root_session_id: Option<String>,
     pub root_session_title: Option<String>,
     pub root_session_status: Option<RootSessionStatus>,
+    pub automation_session_id: Option<String>,
+    pub automation_session_status: Option<RootSessionStatus>,
+    pub automation_agent_state: Option<AutomationAgentState>,
     pub automation_status: Option<String>,
     pub automation_scan_request_nonce: u64,
     pub usage_total_tokens: Option<u64>,
@@ -172,6 +187,9 @@ impl Default for WorkspaceSnapshot {
             root_session_id: None,
             root_session_title: None,
             root_session_status: None,
+            automation_session_id: None,
+            automation_session_status: None,
+            automation_agent_state: None,
             automation_status: None,
             automation_scan_request_nonce: 0,
             usage_total_tokens: None,

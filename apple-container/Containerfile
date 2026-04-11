@@ -5,6 +5,8 @@ FROM ghcr.io/graalvm/native-image-community:25
 ARG HOST_UID=1000
 ARG HOST_GID=1000
 ARG GH_VERSION=2.83.2
+ARG INSTALL_OPENCODE=1
+ARG INSTALL_CODEX=0
 
 COPY --from=node /usr/local/ /usr/local/
 
@@ -35,7 +37,12 @@ RUN set -eux; \
     tar -xzf /tmp/gh.tar.gz -C /tmp; \
     install "/tmp/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /usr/local/bin/gh; \
     rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${gh_arch}"; \
-    npm install -g opencode-ai; \
+    if [ "${INSTALL_OPENCODE}" = "1" ]; then \
+        npm install -g opencode-ai; \
+    fi; \
+    if [ "${INSTALL_CODEX}" = "1" ]; then \
+        npm install -g @openai/codex; \
+    fi; \
     if ! getent group "${HOST_GID}" >/dev/null; then \
         groupadd --gid "${HOST_GID}" multicode; \
     fi; \

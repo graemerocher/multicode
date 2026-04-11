@@ -2,9 +2,21 @@ workspace-directory = "~/dev/agent-work"
 opencode = ["opencode-cli", "opencode"]
 # todo: find a solution that isn't bound to TUI lifecycle
 
+[agent]
+provider = "opencode"
+
+[agent.codex]
+commands = ["codex"]
+# profile = "default"
+# model = "gpt-5-codex"
+# model-provider = "openai"
+# approval-policy = "never"
+# sandbox-mode = "external-sandbox"
+# network-access = "enabled"
+
 [runtime]
 backend = "apple-container"
-# Local Apple container image. It should contain Java 25, git, gh, and opencode.
+# Local Apple container image. It should contain Java 25, git, gh, opencode, and codex.
 image = "multicode-java25:latest"
 
 [github]
@@ -17,6 +29,7 @@ add-skills-from = ["./workspace-skills"]
 writable = [
     "~/.local/share/opencode/bin",
     "~/.cache/opencode",
+    "~/.codex",
     "~/.bun",
     "~/.cache/bun",
     "~/.gradle",
@@ -81,6 +94,10 @@ dereference-symlinks = true
 [[remote.sync-up]]
 local = "~/.local/share/opencode/auth.json"
 remote = "~/.local/share/opencode/auth.json"
+dereference-symlinks = true
+[[remote.sync-up]]
+local = "~/.codex"
+remote = "~/.codex"
 dereference-symlinks = true
 
 [[remote.sync-bidi]]

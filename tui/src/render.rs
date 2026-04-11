@@ -253,18 +253,23 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             || app
                 .selected_workspace_snapshot()
                 .is_some_and(|snapshot| snapshot.persistent.assigned_repository.is_some()),
-        app.selected_workspace_snapshot()
-            .is_some_and(workspace_is_usable)
-            && app.selected_link_index.is_none(),
+        app.selected_workspace_snapshot().is_some_and(|snapshot| {
+            workspace_is_usable(snapshot) && snapshot.persistent.assigned_repository.is_some()
+        }) && app.selected_link_index.is_none(),
         &app.contextual_tool_hotkeys(),
         &app.status,
     );
     frame.render_widget(Paragraph::new(help), chunks[1]);
 
     if app.mode == UiMode::CreateModal {
-        draw_create_modal(frame, &app.create_input);
-    } else if app.mode == UiMode::EditRepository {
-        draw_repository_modal(frame, &app.repository_input);
+        draw_create_modal(
+            frame,
+            &app.create_input,
+            &app.repository_input,
+            app.create_field,
+        );
+    } else if app.mode == UiMode::EditIssue {
+        draw_issue_modal(frame, &app.issue_input);
     } else if app.mode == UiMode::EditCustomLink {
         draw_custom_link_modal(
             frame,
@@ -321,8 +326,14 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
     }
 }
 
-fn draw_modal_text_input(frame: &mut Frame, area: Rect, input: &str) {
-    let block = Block::default().borders(Borders::ALL);
+fn draw_modal_text_input(frame: &mut Frame, area: Rect, input: &str, active: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if active {
+            Style::default().fg(Color::LightBlue)
+        } else {
+            Style::default()
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -330,15 +341,17 @@ fn draw_modal_text_input(frame: &mut Frame, area: Rect, input: &str) {
         inner,
     );
 
-    let cursor_offset = input.chars().count() as u16;
-    let max_offset = inner.width.saturating_sub(1);
-    frame.set_cursor_position((
-        inner.x.saturating_add(cursor_offset.min(max_offset)),
-        inner.y,
-    ));
+    if active {
+        let cursor_offset = input.chars().count() as u16;
+        let max_offset = inner.width.saturating_sub(1);
+        frame.set_cursor_position((
+            inner.x.saturating_add(cursor_offset.min(max_offset)),
+            inner.y,
+        ));
+    }
 }
 
-fn draw_repository_modal(frame: &mut Frame, input: &str) {
+fn draw_issue_modal(frame: &mut Frame, input: &str) {
     let area = centered_rect_fixed(
         CREATE_MODAL_WIDTH.max(72),
         CREATE_MODAL_HEIGHT,
@@ -346,7 +359,7 @@ fn draw_repository_modal(frame: &mut Frame, input: &str) {
     );
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(" Assign repository ")
+        .title(" Assign issue ")
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -355,11 +368,11 @@ fn draw_repository_modal(frame: &mut Frame, input: &str) {
         .constraints([Constraint::Length(2), Constraint::Length(3)])
         .split(inner);
     frame.render_widget(
-        Paragraph::new("GitHub repository (owner/repo or URL). Leave empty to clear.")
+        Paragraph::new("Issue number or GitHub issue URL. Leave empty to clear.")
             .wrap(Wrap { trim: true }),
         vertical[0],
     );
-    draw_modal_text_input(frame, vertical[1], input);
+    draw_modal_text_input(frame, vertical[1], input, true);
 }
 
 pub(crate) fn selected_link_tooltip_area(
@@ -493,7 +506,12 @@ fn status_icon_cell(kind: StatusIconKind, color: Color, reversed: bool) -> Cell<
     Cell::from(format!("{} ", icon_glyph(kind))).style(style)
 }
 
-pub(crate) fn draw_create_modal(frame: &mut Frame, input: &str) {
+pub(crate) fn draw_create_modal(
+    frame: &mut Frame,
+    key_input: &str,
+    repository_input: &str,
+    active_field: CreateModalField,
+) {
     let area = centered_rect_fixed(CREATE_MODAL_WIDTH, CREATE_MODAL_HEIGHT, frame.area());
     frame.render_widget(Clear, area);
 
@@ -507,26 +525,40 @@ pub(crate) fn draw_create_modal(frame: &mut Frame, input: &str) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Fill(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new("Enter a workspace key")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::DarkGray)),
-        rows[1],
+        Paragraph::new("Workspace key").style(Style::default().fg(Color::DarkGray)),
+        rows[0],
     );
-    draw_modal_text_input(frame, rows[2], input);
+    draw_modal_text_input(
+        frame,
+        rows[1],
+        key_input,
+        active_field == CreateModalField::Key,
+    );
     frame.render_widget(
-        Paragraph::new("Enter to create · Esc to cancel")
+        Paragraph::new("GitHub repository (owner/repo or URL)")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
+    draw_modal_text_input(
+        frame,
+        rows[3],
+        repository_input,
+        active_field == CreateModalField::Repository,
+    );
+    frame.render_widget(
+        Paragraph::new("Tab to switch fields · Enter to create · Esc to cancel")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
-        rows[3],
+        rows[4],
     );
 }
 
@@ -621,7 +653,7 @@ pub(crate) fn draw_custom_link_modal(
             .style(Style::default().fg(Color::DarkGray)),
         rows[1],
     );
-    draw_modal_text_input(frame, rows[2], input);
+    draw_modal_text_input(frame, rows[2], input, true);
     frame.render_widget(
         Paragraph::new(footer)
             .alignment(Alignment::Center)

@@ -20,6 +20,8 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub autonomous: AutonomousConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default = "default_opencode_commands")]
     pub opencode: Vec<String>,
     #[serde(default)]
@@ -42,6 +44,79 @@ pub struct AutonomousConfig {
     pub issue_scan_delay_seconds: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProvider {
+    #[default]
+    Opencode,
+    Codex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub provider: AgentProvider,
+    #[serde(default)]
+    pub opencode: OpencodeAgentConfig,
+    #[serde(default)]
+    pub codex: CodexAgentConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OpencodeAgentConfig {
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CodexAgentConfig {
+    #[serde(default = "default_codex_commands")]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub approval_policy: CodexApprovalPolicy,
+    #[serde(default)]
+    pub sandbox_mode: CodexSandboxMode,
+    #[serde(default)]
+    pub network_access: CodexNetworkAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    Untrusted,
+    OnFailure,
+    #[default]
+    OnRequest,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
+    ExternalSandbox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexNetworkAccess {
+    Restricted,
+    #[default]
+    Enabled,
+}
+
 impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
@@ -57,6 +132,19 @@ pub struct RuntimeConfig {
     pub backend: RuntimeBackend,
     #[serde(default)]
     pub image: Option<String>,
+    #[serde(default)]
+    pub opencode_image: Option<String>,
+    #[serde(default)]
+    pub codex_image: Option<String>,
+}
+
+impl RuntimeConfig {
+    pub fn resolved_image(&self, provider: AgentProvider) -> Option<&str> {
+        self.image.as_deref().or(match provider {
+            AgentProvider::Opencode => self.opencode_image.as_deref(),
+            AgentProvider::Codex => self.codex_image.as_deref(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -129,6 +217,10 @@ impl Default for HandlerConfig {
 
 fn default_opencode_commands() -> Vec<String> {
     vec!["opencode-cli".to_string(), "opencode".to_string()]
+}
+
+fn default_codex_commands() -> Vec<String> {
+    vec!["codex".to_string()]
 }
 
 fn default_remote_sync_interval_seconds() -> u64 {
@@ -296,9 +388,7 @@ pub async fn read_config(config_path: &Path) -> Result<Config, CombinedServiceEr
     Ok(toml::from_str(&raw)?)
 }
 
-pub(super) fn resolve_opencode_command(
-    candidates: &[String],
-) -> Result<String, CombinedServiceError> {
+pub(super) fn resolve_agent_command(candidates: &[String]) -> Result<String, CombinedServiceError> {
     let normalized = candidates
         .iter()
         .map(|candidate| candidate.trim())
@@ -312,7 +402,7 @@ pub(super) fn resolve_opencode_command(
         }
     }
 
-    Err(CombinedServiceError::OpencodeCommandNotFound {
+    Err(CombinedServiceError::AgentCommandNotFound {
         candidates: normalized,
     })
 }

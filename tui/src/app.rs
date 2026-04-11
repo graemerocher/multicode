@@ -5,6 +5,7 @@ use multicode_lib::services::GithubTokenConfig;
 use std::os::unix::fs::FileTypeExt;
 
 const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
+const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
 
 pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     let url = Url::parse(target).ok()?;
@@ -29,6 +30,13 @@ pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
 pub(crate) fn should_request_autonomous_issue_scan(snapshot: &WorkspaceSnapshot) -> bool {
     snapshot.persistent.assigned_repository.is_some()
         && snapshot.persistent.automation_issue.is_none()
+}
+
+pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
+    snapshot: &WorkspaceSnapshot,
+) -> bool {
+    snapshot.persistent.assigned_repository.is_some()
+        && snapshot.persistent.automation_issue.is_some()
 }
 
 impl TuiState {
@@ -67,8 +75,10 @@ impl TuiState {
             selected_link_target_index: 0,
             mode: UiMode::Normal,
             create_input: String::new(),
-            edit_input: String::new(),
             repository_input: String::new(),
+            create_field: CreateModalField::Key,
+            edit_input: String::new(),
+            issue_input: String::new(),
             custom_link_input: String::new(),
             custom_link_kind: None,
             custom_link_action: None,
@@ -185,9 +195,9 @@ impl TuiState {
                     self.mode = UiMode::Normal;
                     self.edit_input.clear();
                 }
-                UiMode::EditRepository => {
+                UiMode::EditIssue => {
                     self.mode = UiMode::Normal;
-                    self.repository_input.clear();
+                    self.issue_input.clear();
                 }
                 UiMode::EditCustomLink => {
                     self.mode = UiMode::Normal;
@@ -654,6 +664,24 @@ impl TuiState {
             .and_then(workspace_attach_target)
     }
 
+    fn attach_env_for_workspace(&self, key: &str) -> Vec<(String, String)> {
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return Vec::new();
+        }
+
+        vec![(
+            "CODEX_HOME".to_string(),
+            self.service
+                .workspace_directory_path()
+                .join(".multicode")
+                .join("codex")
+                .join(key)
+                .join("home")
+                .to_string_lossy()
+                .into_owned(),
+        )]
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -667,7 +695,7 @@ impl TuiState {
             UiMode::Normal => self.handle_normal_key(terminal, key).await,
             UiMode::CreateModal => self.handle_create_modal_key(key).await,
             UiMode::EditDescription => self.handle_edit_key(key),
-            UiMode::EditRepository => self.handle_repository_key(key).await,
+            UiMode::EditIssue => self.handle_issue_key(key).await,
             UiMode::EditCustomLink => self.handle_custom_link_key(key),
             UiMode::ConfirmDelete => self.handle_confirm_delete_key(key).await,
             UiMode::StartingModal => {}
@@ -696,15 +724,16 @@ impl TuiState {
                     .unwrap_or_default();
                 match attach_in_tmux(
                     terminal,
-                    self.service.opencode_command(),
+                    self.service.agent_command(),
                     &target,
+                    &self.attach_env_for_workspace(&key),
                     &key,
                     &custom_description,
                 )
                 .await
                 {
                     Ok(_) => {
-                        self.status = format!("Detached from workspace '{key}' opencode client");
+                        self.handle_attach_exit(&key).await;
                     }
                     Err(err) => {
                         self.status = format!("Failed to attach to workspace '{key}': {err}");
@@ -715,6 +744,51 @@ impl TuiState {
                 self.status = format!("Failed to attach to workspace '{key}': {err}");
             }
         }
+    }
+
+    async fn handle_attach_exit(&mut self, key: &str) {
+        if self.maybe_resume_autonomous_codex_after_attach(key).await {
+            return;
+        }
+        self.status = format!("Detached from workspace '{key}' agent session");
+    }
+
+    async fn maybe_resume_autonomous_codex_after_attach(&mut self, key: &str) -> bool {
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return false;
+        }
+
+        for _ in 0..10 {
+            self.sync_from_manager();
+            let snapshot = self.snapshots.get(key).cloned();
+            let Some(snapshot) = snapshot else {
+                return false;
+            };
+
+            if should_auto_resume_autonomous_codex_after_attach(&snapshot) {
+                match self
+                    .service
+                    .prompt_root_session(&snapshot, CODEX_AUTO_RESUME_PROMPT)
+                    .await
+                {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Detached from workspace '{key}'; autonomous Codex work was no longer running interactively, so multicode resumed it automatically"
+                        );
+                    }
+                    Err(err) => {
+                        self.status = format!(
+                            "Detached from workspace '{key}'; autonomous Codex work stopped after attach, but multicode failed to resume it automatically: {err}"
+                        );
+                    }
+                }
+                return true;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        false
     }
 
     pub(crate) fn poll_running_prompt_tool(&mut self) {
@@ -939,16 +1013,6 @@ impl TuiState {
         tool_name: &str,
         prompt: &str,
     ) {
-        let Some(opencode_client) = snapshot.opencode_client.as_ref() else {
-            self.status = format!(
-                "Tool '{}' requires a started workspace with a healthy client",
-                tool_name
-            );
-            return;
-        };
-
-        let client = opencode_client.client.clone();
-        let events = opencode_client.events.clone();
         let Some(root_session_id) = snapshot.root_session_id.clone() else {
             self.status = format!(
                 "Tool '{}' requires a known root session ID for workspace '{}'",
@@ -963,11 +1027,33 @@ impl TuiState {
         let (progress_tx, progress_rx) =
             watch::channel(format!("Preparing tool '{}'...", tool_name_owned));
         let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let snapshot = snapshot.clone();
+        let task_tool_name = tool_name_owned.clone();
 
         tokio::spawn(async move {
             let result =
-                run_prompt_tool_workflow(client, events, root_session_id, prompt_text, progress_tx)
-                    .await;
+                if service.agent_provider() == multicode_lib::services::AgentProvider::Opencode {
+                    let Some(opencode_client) = snapshot.opencode_client.as_ref() else {
+                        let _ = result_tx
+                            .send(Err("workspace has no healthy opencode client".to_string()));
+                        return;
+                    };
+                    run_prompt_tool_workflow(
+                        opencode_client.client.clone(),
+                        opencode_client.events.clone(),
+                        root_session_id,
+                        prompt_text,
+                        progress_tx,
+                    )
+                    .await
+                } else {
+                    let _ = progress_tx.send(format!("Starting tool '{}'...", task_tool_name));
+                    service
+                        .prompt_root_session(&snapshot, &prompt_text)
+                        .await
+                        .map_err(|err| err.to_string())
+                };
             let _ = result_tx.send(result);
         });
 
@@ -1138,6 +1224,8 @@ impl TuiState {
             }
             KeyCode::Enter if self.selected_row == 0 => {
                 self.create_input.clear();
+                self.repository_input.clear();
+                self.create_field = CreateModalField::Key;
                 self.mode = UiMode::CreateModal;
             }
             KeyCode::Enter => {
@@ -1171,17 +1259,16 @@ impl TuiState {
                                         .unwrap_or_default();
                                     match attach_in_tmux(
                                         terminal,
-                                        self.service.opencode_command(),
+                                        self.service.agent_command(),
                                         &target,
+                                        &self.attach_env_for_workspace(&key),
                                         &key,
                                         &custom_description,
                                     )
                                     .await
                                     {
                                         Ok(_) => {
-                                            self.status = format!(
-                                                "Detached from workspace '{key}' opencode client"
-                                            )
+                                            self.handle_attach_exit(&key).await;
                                         }
                                         Err(err) => {
                                             self.status = format!(
@@ -1294,7 +1381,7 @@ impl TuiState {
                     self.mode = UiMode::EditDescription;
                 }
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('i') => {
                 if link_selected {
                     return;
                 }
@@ -1305,12 +1392,16 @@ impl TuiState {
                     if !workspace_is_usable(snapshot) {
                         return;
                     }
-                    self.repository_input = snapshot
+                    if snapshot.persistent.assigned_repository.is_none() {
+                        return;
+                    }
+                    self.issue_input = snapshot
                         .persistent
-                        .assigned_repository
+                        .automation_issue
                         .clone()
+                        .and_then(|issue| issue.rsplit('/').next().map(ToOwned::to_owned))
                         .unwrap_or_default();
-                    self.mode = UiMode::EditRepository;
+                    self.mode = UiMode::EditIssue;
                 }
             }
             KeyCode::Char('s') => {
@@ -1382,25 +1473,48 @@ impl TuiState {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
                 self.create_input.clear();
+                self.repository_input.clear();
+                self.create_field = CreateModalField::Key;
             }
             KeyCode::Backspace => {
-                self.create_input.pop();
+                self.active_create_modal_input_mut().pop();
             }
             KeyCode::Char(ch) => {
-                self.create_input.push(ch);
+                self.active_create_modal_input_mut().push(ch);
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                self.create_field = CreateModalField::Repository;
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.create_field = CreateModalField::Key;
             }
             KeyCode::Enter => {
                 let key = self.create_input.trim().to_string();
+                let repository = self.repository_input.trim().to_string();
                 if key.is_empty() {
                     self.status = "Workspace key cannot be empty".to_string();
+                    self.create_field = CreateModalField::Key;
+                    return;
+                }
+                if repository.is_empty() {
+                    self.status = "Repository cannot be empty".to_string();
+                    self.create_field = CreateModalField::Repository;
                     return;
                 }
 
-                match self.service.create_workspace(&key).await {
-                    Ok(_) => {
-                        self.status = format!("Created workspace '{key}'");
+                match self
+                    .service
+                    .create_workspace_with_repository(&key, &repository)
+                    .await
+                {
+                    Ok(normalized_repository) => {
+                        self.status = format!(
+                            "Created workspace '{key}' for repository '{normalized_repository}'"
+                        );
                         self.mode = UiMode::Normal;
                         self.create_input.clear();
+                        self.repository_input.clear();
+                        self.create_field = CreateModalField::Key;
                         self.sync_from_manager();
                         if let Some(position) =
                             self.ordered_keys.iter().position(|item| item == &key)
@@ -1409,11 +1523,18 @@ impl TuiState {
                         }
                     }
                     Err(err) => {
-                        self.status = format!("Failed to create workspace: {err:?}");
+                        self.status = format!("Failed to create workspace: {}", err.summary());
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn active_create_modal_input_mut(&mut self) -> &mut String {
+        match self.create_field {
+            CreateModalField::Key => &mut self.create_input,
+            CreateModalField::Repository => &mut self.repository_input,
         }
     }
 
@@ -1456,43 +1577,42 @@ impl TuiState {
         }
     }
 
-    async fn handle_repository_key(&mut self, key: KeyEvent) {
+    async fn handle_issue_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
                 self.mode = UiMode::Normal;
-                self.repository_input.clear();
+                self.issue_input.clear();
             }
             KeyCode::Backspace => {
-                self.repository_input.pop();
+                self.issue_input.pop();
             }
             KeyCode::Char(ch) => {
-                self.repository_input.push(ch);
+                self.issue_input.push(ch);
             }
             KeyCode::Enter => {
                 let Some(key) = self.selected_workspace_key().map(str::to_string) else {
                     return;
                 };
-                let repository = self.repository_input.trim().to_string();
-                let repository = (!repository.is_empty()).then_some(repository);
+                let issue = self.issue_input.trim().to_string();
+                let issue = (!issue.is_empty()).then_some(issue);
                 match self
                     .service
-                    .assign_workspace_repository(&key, repository.as_deref())
+                    .assign_workspace_issue(&key, issue.as_deref())
                     .await
                 {
                     Ok(Some(normalized)) => {
-                        self.status =
-                            format!("Assigned repository '{normalized}' to workspace '{key}'");
+                        self.status = format!("Assigned issue '{normalized}' to workspace '{key}'");
                         self.mode = UiMode::Normal;
-                        self.repository_input.clear();
+                        self.issue_input.clear();
                     }
                     Ok(None) => {
                         self.status =
-                            format!("Cleared repository assignment for workspace '{key}'");
+                            format!("Cleared direct issue assignment for workspace '{key}'");
                         self.mode = UiMode::Normal;
-                        self.repository_input.clear();
+                        self.issue_input.clear();
                     }
                     Err(err) => {
-                        self.status = format!("Failed to update repository assignment: {err:?}");
+                        self.status = format!("Failed to update issue assignment: {err:?}");
                     }
                 }
             }

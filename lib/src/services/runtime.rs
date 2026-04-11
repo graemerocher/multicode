@@ -10,13 +10,20 @@ use uuid::Uuid;
 
 use super::{
     combined::{CombinedServiceError, SpawnCommand},
-    config::{ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file},
+    config::{
+        AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexSandboxMode,
+        ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file,
+    },
 };
 use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 
 pub(super) const RUNTIME_SPEC_METADATA_KEY: &str = "runtime-spec";
 const APPLE_GITCONFIG_DIR: &str = "/multicode-host/git";
 const APPLE_GITCONFIG_FILE_NAME: &str = ".gitconfig";
+const SYNTHETIC_CODEX_HOME: &str = "/multicode-agent/codex-home";
+pub(crate) const AUTOMATION_STATE_DIR: &str = "/multicode-agent/automation";
+pub(crate) const AUTOMATION_STATE_ENV: &str = "MULTICODE_AUTONOMOUS_STATE_PATH";
+pub(crate) const AUTOMATION_STATE_FILE_NAME: &str = "state";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeActivity {
@@ -49,8 +56,10 @@ struct RuntimeContext {
     runtime: RuntimeConfig,
     workspace_directory_path: PathBuf,
     expanded_isolation: ExpandedIsolationConfig,
-    host_opencode_command: String,
-    container_opencode_command: String,
+    agent_provider: AgentProvider,
+    host_agent_command: String,
+    container_agent_command: String,
+    codex: CodexAgentConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -59,20 +68,228 @@ pub(super) enum WorkspaceRuntime {
     AppleContainer(AppleContainerRuntime),
 }
 
+fn append_agent_env(context: &RuntimeContext, env: &mut Vec<(String, String)>, password: &str) {
+    env.push((
+        AUTOMATION_STATE_ENV.to_string(),
+        format!("{AUTOMATION_STATE_DIR}/{AUTOMATION_STATE_FILE_NAME}"),
+    ));
+    match context.agent_provider {
+        AgentProvider::Opencode => {
+            env.push((
+                "OPENCODE_SERVER_USERNAME".to_string(),
+                "opencode".to_string(),
+            ));
+            env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
+        }
+        AgentProvider::Codex => {
+            env.push(("CODEX_HOME".to_string(), SYNTHETIC_CODEX_HOME.to_string()));
+        }
+    }
+}
+
+fn start_command_args(
+    context: &RuntimeContext,
+    command: &str,
+    host: &str,
+    port: u16,
+) -> Vec<String> {
+    match context.agent_provider {
+        AgentProvider::Opencode => vec![
+            command.to_string(),
+            "serve".to_string(),
+            "--hostname".to_string(),
+            host.to_string(),
+            "--port".to_string(),
+            port.to_string(),
+        ],
+        AgentProvider::Codex => {
+            vec![
+                command.to_string(),
+                "app-server".to_string(),
+                "--listen".to_string(),
+                format!("ws://{host}:{port}"),
+            ]
+        }
+    }
+}
+
+fn server_uri(context: &RuntimeContext, password: &str, port: u16) -> String {
+    match context.agent_provider {
+        AgentProvider::Opencode => format!("http://opencode:{password}@127.0.0.1:{port}/"),
+        AgentProvider::Codex => format!("ws://127.0.0.1:{port}"),
+    }
+}
+
+fn synthetic_codex_home_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
+    workspace_directory_path
+        .join(".multicode")
+        .join("codex")
+        .join(key)
+        .join("home")
+}
+
+pub(crate) fn automation_state_dir_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
+    workspace_directory_path
+        .join(".multicode")
+        .join("automation")
+        .join(key)
+}
+
+pub(crate) fn automation_state_file_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
+    automation_state_dir_source(workspace_directory_path, key).join(AUTOMATION_STATE_FILE_NAME)
+}
+
+async fn prepare_synthetic_codex_home(
+    source_root: &Path,
+    added_skills: &[super::config::AddedSkillMount],
+    config: &CodexAgentConfig,
+) -> Result<(), CombinedServiceError> {
+    tokio::fs::create_dir_all(source_root).await?;
+    let host_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        CombinedServiceError::ShellExpand("HOME environment variable not found".to_string())
+    })?;
+    let host_codex_home = host_home.join(".codex");
+    let target_config = source_root.join("config.toml");
+
+    copy_optional_host_file(&host_codex_home.join("config.toml"), &target_config).await?;
+    write_synthetic_codex_config(&target_config, config).await?;
+    copy_optional_host_file(
+        &host_codex_home.join("auth.json"),
+        &source_root.join("auth.json"),
+    )
+    .await?;
+    copy_optional_host_file(
+        &host_codex_home.join("AGENTS.md"),
+        &source_root.join("AGENTS.md"),
+    )
+    .await?;
+
+    let target_skills_root = source_root.join("skills");
+    clear_directory_contents(&target_skills_root).await?;
+    let host_skills_root = host_codex_home.join("skills");
+    if tokio::fs::metadata(&host_skills_root)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        copy_directory_tree(&host_skills_root, &target_skills_root).await?;
+    }
+    for skill in added_skills {
+        let Some(skill_name) = skill.target.file_name() else {
+            return Err(CombinedServiceError::InvalidRuntimeConfig {
+                field: "isolation.add-skills-from".to_string(),
+                message: format!(
+                    "added skill target '{}' is missing a terminal directory name",
+                    skill.target.display()
+                ),
+            });
+        };
+        copy_directory_tree(&skill.source, &target_skills_root.join(skill_name)).await?;
+    }
+
+    Ok(())
+}
+
+async fn write_synthetic_codex_config(
+    target: &Path,
+    config: &CodexAgentConfig,
+) -> Result<(), std::io::Error> {
+    let mut contents = match tokio::fs::read_to_string(target).await {
+        Ok(existing) => existing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&render_multicode_codex_config_overrides(config));
+    tokio::fs::write(target, contents).await
+}
+
+fn render_multicode_codex_config_overrides(config: &CodexAgentConfig) -> String {
+    let mut lines = vec!["# Managed by multicode".to_string()];
+
+    if let Some(profile) = config.profile.as_deref() {
+        lines.push(format!(
+            "profile = {}",
+            toml::Value::String(profile.to_string())
+        ));
+    }
+    if let Some(model) = config.model.as_deref() {
+        lines.push(format!(
+            "model = {}",
+            toml::Value::String(model.to_string())
+        ));
+    }
+    if let Some(model_provider) = config.model_provider.as_deref() {
+        lines.push(format!(
+            "model_provider = {}",
+            toml::Value::String(model_provider.to_string())
+        ));
+    }
+    lines.push(format!(
+        "approval_policy = {}",
+        toml::Value::String(codex_approval_policy_config_value(config.approval_policy).to_string())
+    ));
+    lines.push(format!(
+        "sandbox_mode = {}",
+        toml::Value::String(codex_sandbox_mode_config_value(config.sandbox_mode).to_string())
+    ));
+
+    lines.join("\n") + "\n"
+}
+
+fn codex_approval_policy_config_value(policy: CodexApprovalPolicy) -> &'static str {
+    match policy {
+        CodexApprovalPolicy::Untrusted => "untrusted",
+        CodexApprovalPolicy::OnFailure => "on-failure",
+        CodexApprovalPolicy::OnRequest => "on-request",
+        CodexApprovalPolicy::Never => "never",
+    }
+}
+
+fn codex_sandbox_mode_config_value(mode: CodexSandboxMode) -> &'static str {
+    match mode {
+        CodexSandboxMode::ReadOnly => "read-only",
+        CodexSandboxMode::WorkspaceWrite => "workspace-write",
+        CodexSandboxMode::DangerFullAccess => "danger-full-access",
+        CodexSandboxMode::ExternalSandbox => "danger-full-access",
+    }
+}
+
+async fn copy_optional_host_file(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    let Ok(metadata) = tokio::fs::metadata(source).await else {
+        return Ok(());
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::copy(source, target).await?;
+    Ok(())
+}
+
 impl WorkspaceRuntime {
     pub(super) fn new(
         runtime: RuntimeConfig,
         workspace_directory_path: PathBuf,
         expanded_isolation: ExpandedIsolationConfig,
-        host_opencode_command: String,
-        container_opencode_command: String,
+        agent_provider: AgentProvider,
+        host_agent_command: String,
+        container_agent_command: String,
+        codex: CodexAgentConfig,
     ) -> Self {
         let context = RuntimeContext {
             runtime: runtime.clone(),
             workspace_directory_path,
             expanded_isolation,
-            host_opencode_command,
-            container_opencode_command,
+            agent_provider,
+            host_agent_command,
+            container_agent_command,
+            codex,
         };
         match runtime.backend {
             RuntimeBackend::LinuxSystemdBwrap => Self::Linux(LinuxSystemdBwrapRuntime { context }),
@@ -186,12 +403,13 @@ impl WorkspaceRuntime {
 
         let mut parts = vec![
             format!("backend={:?}", context.runtime.backend),
+            format!("agent-provider={:?}", context.agent_provider),
             format!(
                 "image={}",
                 context.runtime.image.as_deref().unwrap_or_default()
             ),
-            format!("host-opencode={}", context.host_opencode_command),
-            format!("container-opencode={}", context.container_opencode_command),
+            format!("host-agent={}", context.host_agent_command),
+            format!("container-agent={}", context.container_agent_command),
             format!(
                 "readable={}",
                 format_path_list(&context.expanded_isolation.readable)
@@ -285,7 +503,7 @@ impl LinuxSystemdBwrapRuntime {
 
         Ok(RuntimeStartResult {
             transient: TransientWorkspaceSnapshot {
-                uri: format!("http://opencode:{password}@127.0.0.1:{port}/"),
+                uri: server_uri(&self.context, &password, port),
                 runtime: RuntimeHandleSnapshot {
                     backend: RuntimeBackend::LinuxSystemdBwrap,
                     id: unit,
@@ -330,13 +548,17 @@ impl LinuxSystemdBwrapRuntime {
         command: Vec<String>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
         let unit = generate_linux_runtime_id();
+        let mut env = inherited_env.to_vec();
+        if self.context.agent_provider == AgentProvider::Codex {
+            env.push(("CODEX_HOME".to_string(), SYNTHETIC_CODEX_HOME.to_string()));
+        }
         let mut args = vec![
             "--user".to_string(),
             "--wait".to_string(),
             "--collect".to_string(),
             "--pty".to_string(),
         ];
-        append_systemd_run_inherit_env(&mut args, inherited_env);
+        append_systemd_run_inherit_env(&mut args, &env);
         args.push("--unit".to_string());
         args.push(unit);
         self.append_systemd_limits(&mut args);
@@ -346,7 +568,7 @@ impl LinuxSystemdBwrapRuntime {
         Ok(SpawnCommand {
             program: "systemd-run".to_string(),
             args,
-            inherited_env: inherited_env.to_vec(),
+            inherited_env: env,
         })
     }
 
@@ -360,23 +582,19 @@ impl LinuxSystemdBwrapRuntime {
     ) -> Result<SpawnCommand, CombinedServiceError> {
         let mut args = vec!["--user".to_string(), "--no-block".to_string()];
         let mut env = inherited_env.to_vec();
-        env.push((
-            "OPENCODE_SERVER_USERNAME".to_string(),
-            "opencode".to_string(),
-        ));
-        env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
+        append_agent_env(&self.context, &mut env, password);
         append_systemd_run_inherit_env(&mut args, &env);
         args.push("--unit".to_string());
         args.push(unit.to_string());
         self.append_systemd_limits(&mut args);
 
         self.append_bwrap_sandbox_args(&mut args, key).await?;
-        args.push(self.context.host_opencode_command.clone());
-        args.push("serve".to_string());
-        args.push("--hostname".to_string());
-        args.push("127.0.0.1".to_string());
-        args.push("--port".to_string());
-        args.push(port.to_string());
+        args.extend(start_command_args(
+            &self.context,
+            &self.context.host_agent_command,
+            "127.0.0.1",
+            port,
+        ));
 
         Ok(SpawnCommand {
             program: "systemd-run".to_string(),
@@ -467,6 +685,28 @@ impl LinuxSystemdBwrapRuntime {
                 .cloned()
                 .map(|mount| MountSpec::new(mount.target, Some(mount.source), MountKind::Readable)),
         );
+        mount_specs.push(MountSpec::new(
+            PathBuf::from(AUTOMATION_STATE_DIR),
+            Some(automation_state_dir_source(
+                &self.context.workspace_directory_path,
+                key,
+            )),
+            MountKind::Writable,
+        ));
+        if self.context.agent_provider == AgentProvider::Codex {
+            let source = synthetic_codex_home_source(&self.context.workspace_directory_path, key);
+            prepare_synthetic_codex_home(
+                &source,
+                &self.context.expanded_isolation.added_skills,
+                &self.context.codex,
+            )
+            .await?;
+            mount_specs.push(MountSpec::new(
+                PathBuf::from(SYNTHETIC_CODEX_HOME),
+                Some(source),
+                MountKind::Writable,
+            ));
+        }
         mount_specs.sort_by(|a, b| {
             a.depth()
                 .cmp(&b.depth())
@@ -622,7 +862,7 @@ impl AppleContainerRuntime {
 
         Ok(RuntimeStartResult {
             transient: TransientWorkspaceSnapshot {
-                uri: format!("http://opencode:{password}@127.0.0.1:{port}/"),
+                uri: server_uri(&self.context, &password, port),
                 runtime: RuntimeHandleSnapshot {
                     backend: RuntimeBackend::AppleContainer,
                     id: container_name,
@@ -726,12 +966,20 @@ impl AppleContainerRuntime {
                 .await;
         }
 
-        let image = self.context.runtime.image.as_deref().ok_or_else(|| {
-            CombinedServiceError::InvalidRuntimeConfig {
+        let image = self
+            .context
+            .runtime
+            .resolved_image(self.context.agent_provider)
+            .ok_or_else(|| CombinedServiceError::InvalidRuntimeConfig {
                 field: "runtime.image".to_string(),
-                message: "apple-container backend requires a runtime image".to_string(),
-            }
-        })?;
+                message: format!(
+                    "apple-container backend requires a runtime image for provider '{}'",
+                    match self.context.agent_provider {
+                        AgentProvider::Opencode => "opencode",
+                        AgentProvider::Codex => "codex",
+                    }
+                ),
+            })?;
         let mut env = inherited_env.to_vec();
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
         self.append_implicit_env(&mut env, host_gitconfig.as_deref())
@@ -852,18 +1100,22 @@ impl AppleContainerRuntime {
         port: u16,
         inherited_env: &[(String, String)],
     ) -> Result<SpawnCommand, CombinedServiceError> {
-        let image = self.context.runtime.image.as_deref().ok_or_else(|| {
-            CombinedServiceError::InvalidRuntimeConfig {
+        let image = self
+            .context
+            .runtime
+            .resolved_image(self.context.agent_provider)
+            .ok_or_else(|| CombinedServiceError::InvalidRuntimeConfig {
                 field: "runtime.image".to_string(),
-                message: "apple-container backend requires a runtime image".to_string(),
-            }
-        })?;
+                message: format!(
+                    "apple-container backend requires a runtime image for provider '{}'",
+                    match self.context.agent_provider {
+                        AgentProvider::Opencode => "opencode",
+                        AgentProvider::Codex => "codex",
+                    }
+                ),
+            })?;
         let mut env = inherited_env.to_vec();
-        env.push((
-            "OPENCODE_SERVER_USERNAME".to_string(),
-            "opencode".to_string(),
-        ));
-        env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
+        append_agent_env(&self.context, &mut env, password);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
         self.append_implicit_env(&mut env, host_gitconfig.as_deref())
             .await?;
@@ -889,12 +1141,12 @@ impl AppleContainerRuntime {
         self.append_container_mounts(&mut args, key, host_gitconfig.as_deref())
             .await?;
         args.push(image.to_string());
-        args.push(self.context.container_opencode_command.clone());
-        args.push("serve".to_string());
-        args.push("--hostname".to_string());
-        args.push("0.0.0.0".to_string());
-        args.push("--port".to_string());
-        args.push(port.to_string());
+        args.extend(start_command_args(
+            &self.context,
+            &self.context.container_agent_command,
+            "0.0.0.0",
+            port,
+        ));
 
         Ok(SpawnCommand {
             program: container_program(),
@@ -995,6 +1247,28 @@ impl AppleContainerRuntime {
         if let Some(implicit_gitconfig_mount) = implicit_gitconfig_mount {
             mount_specs.push(implicit_gitconfig_mount);
         }
+        mount_specs.push(MountSpec::new(
+            PathBuf::from(AUTOMATION_STATE_DIR),
+            Some(automation_state_dir_source(
+                &self.context.workspace_directory_path,
+                key,
+            )),
+            MountKind::Writable,
+        ));
+        if self.context.agent_provider == AgentProvider::Codex {
+            let source = synthetic_codex_home_source(&self.context.workspace_directory_path, key);
+            prepare_synthetic_codex_home(
+                &source,
+                &self.context.expanded_isolation.added_skills,
+                &self.context.codex,
+            )
+            .await?;
+            mount_specs.push(MountSpec::new(
+                PathBuf::from(SYNTHETIC_CODEX_HOME),
+                Some(source),
+                MountKind::Writable,
+            ));
+        }
         mount_specs.sort_by(|a, b| {
             a.depth()
                 .cmp(&b.depth())
@@ -1034,6 +1308,13 @@ impl AppleContainerRuntime {
         env: &mut Vec<(String, String)>,
         host_gitconfig: Option<&Path>,
     ) -> Result<(), CombinedServiceError> {
+        env.push((
+            AUTOMATION_STATE_ENV.to_string(),
+            format!("{AUTOMATION_STATE_DIR}/{AUTOMATION_STATE_FILE_NAME}"),
+        ));
+        if self.context.agent_provider == AgentProvider::Codex {
+            env.push(("CODEX_HOME".to_string(), SYNTHETIC_CODEX_HOME.to_string()));
+        }
         if host_gitconfig.is_some() {
             env.push((
                 "GIT_CONFIG_GLOBAL".to_string(),
@@ -1587,7 +1868,10 @@ impl ResolvedMountSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{AddedSkillMount, IsolationConfig};
+    use crate::services::config::{
+        AddedSkillMount, AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess,
+        CodexSandboxMode, IsolationConfig,
+    };
     use std::fs;
 
     struct TestDir {
@@ -1624,11 +1908,40 @@ mod tests {
                 runtime: RuntimeConfig {
                     backend: RuntimeBackend::AppleContainer,
                     image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                    opencode_image: None,
+                    codex_image: None,
                 },
                 workspace_directory_path: root.path().join("workspaces"),
                 expanded_isolation,
-                host_opencode_command: "/opt/opencode/bin/opencode".to_string(),
-                container_opencode_command: "opencode".to_string(),
+                agent_provider: AgentProvider::Opencode,
+                host_agent_command: "/opt/opencode/bin/opencode".to_string(),
+                container_agent_command: "opencode".to_string(),
+                codex: CodexAgentConfig::default(),
+            },
+        }
+    }
+
+    fn apple_codex_runtime(
+        root: &TestDir,
+        isolation: IsolationConfig,
+        codex: CodexAgentConfig,
+    ) -> AppleContainerRuntime {
+        let expanded_isolation =
+            ExpandedIsolationConfig::from_config(&isolation, None).expect("config should expand");
+        AppleContainerRuntime {
+            context: RuntimeContext {
+                runtime: RuntimeConfig {
+                    backend: RuntimeBackend::AppleContainer,
+                    image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                    opencode_image: None,
+                    codex_image: None,
+                },
+                workspace_directory_path: root.path().join("workspaces"),
+                expanded_isolation,
+                agent_provider: AgentProvider::Codex,
+                host_agent_command: "/opt/homebrew/bin/codex".to_string(),
+                container_agent_command: "codex".to_string(),
+                codex,
             },
         }
     }
@@ -1764,6 +2077,155 @@ mod tests {
                 ]
             ));
         });
+    }
+
+    #[test]
+    fn apple_container_run_command_supports_codex_provider() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let home = root.path().join("home");
+            let host_codex = home.join(".codex");
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(host_codex.join("skills"))
+                .expect("host codex skills directory should exist");
+            fs::write(host_codex.join("config.toml"), "model = \"gpt-5-codex\"\n")
+                .expect("codex config should exist");
+            fs::write(host_codex.join("auth.json"), r#"{"token":"codex"}"#)
+                .expect("codex auth should exist");
+            fs::write(host_codex.join("skills/example.md"), "# example")
+                .expect("codex skill should exist");
+
+            let previous_home = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", &home);
+            }
+
+            let runtime = apple_codex_runtime(
+                &root,
+                IsolationConfig::default(),
+                CodexAgentConfig {
+                    commands: vec!["codex".to_string()],
+                    profile: Some("default".to_string()),
+                    model: Some("gpt-5-codex".to_string()),
+                    model_provider: Some("openai".to_string()),
+                    approval_policy: CodexApprovalPolicy::Never,
+                    sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                    network_access: CodexNetworkAccess::Enabled,
+                },
+            );
+            let command = runtime
+                .build_run_command(
+                    "alpha",
+                    "multicode-alpha",
+                    "secret",
+                    31337,
+                    &[("HOME".to_string(), home.to_string_lossy().into_owned())],
+                )
+                .await
+                .expect("command should build");
+            let server_env = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("server.env");
+
+            if let Some(previous_home) = previous_home {
+                unsafe {
+                    std::env::set_var("HOME", previous_home);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("HOME");
+                }
+            }
+
+            assert!(contains_sequence(
+                &command.args,
+                &[
+                    "ghcr.io/example/multicode-java25:latest",
+                    "codex",
+                    "app-server",
+                    "--listen",
+                    "ws://0.0.0.0:31337",
+                ]
+            ));
+            assert!(
+                command.args.iter().any(|arg| {
+                    arg.contains("type=bind")
+                        && arg.contains(&format!("target={SYNTHETIC_CODEX_HOME}"))
+                }),
+                "apple backend should mount a synthetic CODEX_HOME"
+            );
+            assert!(
+                command.args.iter().any(|arg| {
+                    arg.contains("type=bind")
+                        && arg.contains(&format!("target={AUTOMATION_STATE_DIR}"))
+                }),
+                "apple backend should mount the automation state directory"
+            );
+
+            let env_contents =
+                fs::read_to_string(&server_env).expect("server env file should be written");
+            assert!(
+                env_contents.contains(&format!("CODEX_HOME={SYNTHETIC_CODEX_HOME}")),
+                "apple backend should export CODEX_HOME for codex"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "{AUTOMATION_STATE_ENV}={AUTOMATION_STATE_DIR}/{AUTOMATION_STATE_FILE_NAME}"
+                )),
+                "apple backend should export the automation state file path"
+            );
+            assert_eq!(
+                fs::read_to_string(
+                    workspace_root
+                        .join(".multicode")
+                        .join("codex")
+                        .join("alpha")
+                        .join("home")
+                        .join("config.toml")
+                )
+                .expect("synthetic codex config should exist"),
+                concat!(
+                    "model = \"gpt-5-codex\"\n",
+                    "# Managed by multicode\n",
+                    "profile = \"default\"\n",
+                    "model = \"gpt-5-codex\"\n",
+                    "model_provider = \"openai\"\n",
+                    "approval_policy = \"never\"\n",
+                    "sandbox_mode = \"danger-full-access\"\n",
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn synthetic_codex_config_overrides_external_sandbox_with_dangerous_access() {
+        assert_eq!(
+            render_multicode_codex_config_overrides(&CodexAgentConfig {
+                commands: vec!["codex".to_string()],
+                profile: Some("default".to_string()),
+                model: Some("gpt-5-codex".to_string()),
+                model_provider: Some("openai".to_string()),
+                approval_policy: CodexApprovalPolicy::Never,
+                sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                network_access: CodexNetworkAccess::Enabled,
+            }),
+            concat!(
+                "# Managed by multicode\n",
+                "profile = \"default\"\n",
+                "model = \"gpt-5-codex\"\n",
+                "model_provider = \"openai\"\n",
+                "approval_policy = \"never\"\n",
+                "sandbox_mode = \"danger-full-access\"\n",
+            )
+        );
     }
 
     #[test]
@@ -2045,6 +2507,8 @@ mod tests {
                     runtime: RuntimeConfig {
                         backend: RuntimeBackend::AppleContainer,
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                        opencode_image: None,
+                        codex_image: None,
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -2067,8 +2531,10 @@ mod tests {
                         memory_max_bytes: None,
                         cpu: None,
                     },
-                    host_opencode_command: "/opt/opencode/bin/opencode".to_string(),
-                    container_opencode_command: "opencode".to_string(),
+                    agent_provider: AgentProvider::Opencode,
+                    host_agent_command: "/opt/opencode/bin/opencode".to_string(),
+                    container_agent_command: "opencode".to_string(),
+                    codex: CodexAgentConfig::default(),
                 },
             };
 
@@ -2139,6 +2605,8 @@ mod tests {
                     runtime: RuntimeConfig {
                         backend: RuntimeBackend::AppleContainer,
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                        opencode_image: None,
+                        codex_image: None,
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -2155,8 +2623,10 @@ mod tests {
                         memory_max_bytes: None,
                         cpu: None,
                     },
-                    host_opencode_command: "/opt/opencode/bin/opencode".to_string(),
-                    container_opencode_command: "opencode".to_string(),
+                    agent_provider: AgentProvider::Opencode,
+                    host_agent_command: "/opt/opencode/bin/opencode".to_string(),
+                    container_agent_command: "opencode".to_string(),
+                    codex: CodexAgentConfig::default(),
                 },
             };
 
@@ -2218,6 +2688,8 @@ mod tests {
                     runtime: RuntimeConfig {
                         backend: RuntimeBackend::AppleContainer,
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
+                        opencode_image: None,
+                        codex_image: None,
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -2234,8 +2706,10 @@ mod tests {
                         memory_max_bytes: None,
                         cpu: None,
                     },
-                    host_opencode_command: "/opt/opencode/bin/opencode".to_string(),
-                    container_opencode_command: "opencode".to_string(),
+                    agent_provider: AgentProvider::Opencode,
+                    host_agent_command: "/opt/opencode/bin/opencode".to_string(),
+                    container_agent_command: "opencode".to_string(),
+                    codex: CodexAgentConfig::default(),
                 },
             };
 

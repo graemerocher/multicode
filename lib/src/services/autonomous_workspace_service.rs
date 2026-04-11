@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashSet, time::Duration};
 
 use serde::Deserialize;
 use tokio::{
@@ -10,9 +7,14 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use super::{CombinedService, GithubStatus, workspace_watch::monitor_workspace_snapshots};
+use super::{
+    CombinedService, GithubStatus,
+    runtime::{AUTOMATION_STATE_ENV, automation_state_file_source},
+    workspace_watch::monitor_workspace_snapshots,
+};
 use crate::{
-    RootSessionStatus, WorkspaceManagerError, WorkspaceSnapshot, manager::Workspace, opencode,
+    AutomationAgentState, RootSessionStatus, WorkspaceManagerError, WorkspaceSnapshot,
+    manager::Workspace,
 };
 
 const ISSUE_PRIORITY_LABELS: [&str; 4] = [
@@ -81,6 +83,7 @@ async fn watch_workspace(
             next_scan_at = None;
             blocked_start_scan_request_nonce = None;
             previous_root_status = snapshot.root_session_status;
+            clear_automation_runtime_state(&workspace);
             set_automation_status(&workspace, None);
             if workspace_rx.changed().await.is_err() {
                 break;
@@ -90,6 +93,19 @@ async fn watch_workspace(
 
         let assigned_repository = assigned_repository.expect("checked above");
         let repository_label = compact_repository_label(&assigned_repository);
+        if snapshot.persistent.automation_paused {
+            watched_issue_url = None;
+            issue_status_rx = None;
+            next_scan_at = None;
+            blocked_start_scan_request_nonce = None;
+            previous_root_status = snapshot.root_session_status;
+            clear_automation_runtime_state(&workspace);
+            set_automation_status(&workspace, Some(format!("Stopped {repository_label}")));
+            if workspace_rx.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
         if scan_requested {
             blocked_start_scan_request_nonce = None;
         }
@@ -140,7 +156,16 @@ async fn watch_workspace(
             continue;
         }
 
-        if snapshot.opencode_client.is_none() || snapshot.root_session_id.is_none() {
+        let agent_ready = snapshot
+            .transient
+            .as_ref()
+            .and_then(|transient| url::Url::parse(&transient.uri).ok())
+            .map(|uri| match uri.scheme() {
+                "ws" | "wss" => snapshot.root_session_id.is_some(),
+                _ => snapshot.opencode_client.is_some() && snapshot.root_session_id.is_some(),
+            })
+            .unwrap_or(false);
+        if !agent_ready {
             set_automation_status(&workspace, Some(format!("Wait server {repository_label}")));
             previous_root_status = snapshot.root_session_status;
             if workspace_rx.changed().await.is_err() {
@@ -151,11 +176,92 @@ async fn watch_workspace(
 
         let current_issue_url = snapshot.persistent.automation_issue.clone();
         if let Some(current_issue_url) = current_issue_url {
+            let root_status = snapshot.root_session_status.unwrap_or(RootSessionStatus::Idle);
+            let should_resume_assigned_issue = matches!(root_status, RootSessionStatus::Idle)
+                && (scan_requested
+                    || (previous_root_status.is_none()
+                        && snapshot.automation_agent_state.is_none()
+                        && snapshot.automation_session_status.is_none()));
+
+            if !should_resume_assigned_issue
+                && snapshot.automation_session_id.is_none()
+                && snapshot.root_session_id.is_some()
+                && !matches!(root_status, RootSessionStatus::Idle)
+            {
+                set_automation_runtime_state(
+                    &workspace,
+                    snapshot.root_session_id.clone(),
+                    snapshot.root_session_status,
+                );
+            }
             if watched_issue_url.as_deref() != Some(current_issue_url.as_str()) {
                 watched_issue_url = Some(current_issue_url.clone());
                 issue_status_rx = service
                     .github_status_service()
                     .watch_status(&current_issue_url);
+            }
+
+            if should_resume_assigned_issue {
+                tracing::info!(
+                    workspace_key,
+                    issue_url = %current_issue_url,
+                    "starting autonomous work for assigned issue"
+                );
+                match start_assigned_issue_work(
+                    &service,
+                    &workspace,
+                    &workspace_key,
+                    &snapshot,
+                    &assigned_repository,
+                    &current_issue_url,
+                )
+                .await
+                {
+                    Ok(Some(issue)) => {
+                        watched_issue_url = Some(issue.url.clone());
+                        issue_status_rx = service.github_status_service().watch_status(&issue.url);
+                        set_automation_status(
+                            &workspace,
+                            Some(format!("Working {}", issue.display_reference())),
+                        );
+                    }
+                    Ok(None) => {
+                        clear_automation_issue_claim(&workspace, &current_issue_url);
+                        watched_issue_url = None;
+                        issue_status_rx = None;
+                        next_scan_at = Some(Instant::now() + issue_scan_delay);
+                        set_automation_status(
+                            &workspace,
+                            Some(format!(
+                                "Issue unavailable {repository_label}; next {}m",
+                                (issue_scan_delay.as_secs() + 59) / 60
+                            )),
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            workspace_key,
+                            issue_url = %current_issue_url,
+                            error = %err,
+                            "failed to resume assigned autonomous issue work"
+                        );
+                        set_automation_status(
+                            &workspace,
+                            Some(format!("Issue start failed {repository_label}: {err}")),
+                        );
+                    }
+                }
+                previous_root_status = snapshot.root_session_status;
+                if !wait_for_workspace_change_until(
+                    &mut workspace_rx,
+                    &mut issue_status_rx,
+                    next_scan_at,
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
             }
 
             if snapshot.root_session_status == Some(RootSessionStatus::Idle)
@@ -168,14 +274,23 @@ async fn watch_workspace(
 
             if issue_is_closed(issue_status_rx.as_ref()) {
                 workspace.update(|next| {
+                    let mut changed = false;
                     if next.persistent.automation_issue.as_deref()
                         == Some(current_issue_url.as_str())
                     {
                         next.persistent.automation_issue = None;
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
+                    if next.automation_session_id.take().is_some() {
+                        changed = true;
+                    }
+                    if next.automation_agent_state.take().is_some() {
+                        changed = true;
+                    }
+                    if next.automation_session_status.take().is_some() {
+                        changed = true;
+                    }
+                    changed
                 });
                 watched_issue_url = None;
                 issue_status_rx = None;
@@ -190,7 +305,7 @@ async fn watch_workspace(
                 Some(issue_progress_status(
                     &assigned_repository,
                     &current_issue_url,
-                    snapshot.root_session_status,
+                    effective_automation_agent_state(&snapshot),
                 )),
             );
             previous_root_status = snapshot.root_session_status;
@@ -310,8 +425,9 @@ async fn claim_next_issue(
         Some(format!("Claiming {}", issue.display_reference())),
     );
     persist_automation_issue_claim(workspace, assigned_repository, &issue);
+    clear_automation_state_file(service, workspace_key).await;
 
-    if let Err(err) = prompt_root_session(snapshot, assigned_repository, &issue).await {
+    if let Err(err) = prompt_root_session(service, snapshot, assigned_repository, &issue).await {
         clear_automation_issue_claim(workspace, &issue.url);
         tracing::warn!(
             workspace_key,
@@ -321,6 +437,12 @@ async fn claim_next_issue(
         );
         return Err(err);
     }
+
+    set_automation_runtime_state(
+        workspace,
+        snapshot.root_session_id.clone(),
+        Some(RootSessionStatus::Busy),
+    );
 
     if let Err(err) =
         add_work_started_comment(assigned_repository, &issue, workspace_key, &token).await
@@ -349,6 +471,68 @@ async fn claim_next_issue(
     Ok(Some(issue))
 }
 
+async fn start_assigned_issue_work(
+    service: &CombinedService,
+    workspace: &Workspace,
+    workspace_key: &str,
+    snapshot: &WorkspaceSnapshot,
+    assigned_repository: &str,
+    issue_url: &str,
+) -> Result<Option<SelectedIssue>, String> {
+    let token = resolved_gh_token(service).await?;
+    let Some(issue) = fetch_issue(assigned_repository, issue_url, &token).await? else {
+        return Ok(None);
+    };
+
+    set_automation_status(
+        workspace,
+        Some(format!("Claiming {}", issue.display_reference())),
+    );
+    clear_automation_state_file(service, workspace_key).await;
+
+    if let Err(err) = prompt_root_session(service, snapshot, assigned_repository, &issue).await {
+        tracing::warn!(
+            workspace_key,
+            issue_url = %issue.url,
+            error = %err,
+            "failed to start manually assigned issue work"
+        );
+        return Err(err);
+    }
+
+    set_automation_runtime_state(
+        workspace,
+        snapshot.root_session_id.clone(),
+        Some(RootSessionStatus::Busy),
+    );
+
+    if let Err(err) =
+        add_work_started_comment(assigned_repository, &issue, workspace_key, &token).await
+    {
+        tracing::warn!(
+            workspace_key,
+            issue_url = %issue.url,
+            error = %err,
+            "manual issue prompt started but adding work-started comment failed"
+        );
+        return Err(err);
+    }
+
+    if let Err(err) = add_issue_label(assigned_repository, &issue, IN_PROGRESS_LABEL, &token).await
+    {
+        tracing::warn!(
+            workspace_key,
+            issue_url = %issue.url,
+            label = IN_PROGRESS_LABEL,
+            error = %err,
+            "manual issue prompt started but adding in-progress label failed"
+        );
+        return Err(err);
+    }
+
+    Ok(Some(issue))
+}
+
 fn persist_automation_issue_claim(
     workspace: &Workspace,
     assigned_repository: &str,
@@ -370,12 +554,65 @@ fn persist_automation_issue_claim(
 
 fn clear_automation_issue_claim(workspace: &Workspace, issue_url: &str) {
     workspace.update(|next| {
+        let mut changed = false;
         if next.persistent.automation_issue.as_deref() == Some(issue_url) {
             next.persistent.automation_issue = None;
-            true
-        } else {
-            false
+            changed = true;
         }
+        if next.automation_session_id.take().is_some() {
+            changed = true;
+        }
+        if next.automation_agent_state.take().is_some() {
+            changed = true;
+        }
+        if next.automation_session_status.take().is_some() {
+            changed = true;
+        }
+        changed
+    });
+}
+
+fn clear_automation_runtime_state(workspace: &Workspace) {
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        if snapshot.automation_session_id.take().is_some() {
+            changed = true;
+        }
+        if snapshot.automation_agent_state.take().is_some() {
+            changed = true;
+        }
+        if snapshot.automation_session_status.take().is_some() {
+            changed = true;
+        }
+        changed
+    });
+}
+
+fn set_automation_runtime_state(
+    workspace: &Workspace,
+    session_id: Option<String>,
+    session_status: Option<RootSessionStatus>,
+) {
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        if snapshot.automation_session_id != session_id {
+            snapshot.automation_session_id = session_id.clone();
+            changed = true;
+        }
+        let next_agent_state = session_status.map(|status| match status {
+            RootSessionStatus::Busy => AutomationAgentState::Working,
+            RootSessionStatus::Question => AutomationAgentState::Question,
+            RootSessionStatus::Idle => AutomationAgentState::Idle,
+        });
+        if snapshot.automation_agent_state != next_agent_state {
+            snapshot.automation_agent_state = next_agent_state;
+            changed = true;
+        }
+        if snapshot.automation_session_status != session_status {
+            snapshot.automation_session_status = session_status;
+            changed = true;
+        }
+        changed
     });
 }
 
@@ -410,17 +647,29 @@ fn set_automation_status(workspace: &Workspace, next_status: Option<String>) {
     });
 }
 
+fn effective_automation_agent_state(snapshot: &WorkspaceSnapshot) -> Option<AutomationAgentState> {
+    snapshot.automation_agent_state.or_else(|| {
+        snapshot.root_session_status.map(|status| match status {
+            RootSessionStatus::Busy => AutomationAgentState::Working,
+            RootSessionStatus::Question => AutomationAgentState::Question,
+            RootSessionStatus::Idle => AutomationAgentState::Idle,
+        })
+    })
+}
+
 fn issue_progress_status(
     assigned_repository: &str,
     issue_url: &str,
-    root_status: Option<RootSessionStatus>,
+    agent_state: Option<AutomationAgentState>,
 ) -> String {
     let issue_ref = issue_reference(issue_url).unwrap_or_else(|| issue_url.to_string());
     let _ = assigned_repository;
-    match root_status.unwrap_or(RootSessionStatus::Idle) {
-        RootSessionStatus::Busy => format!("Working {issue_ref}"),
-        RootSessionStatus::Question => format!("Question {issue_ref}"),
-        RootSessionStatus::Idle => format!("Wait close {issue_ref}"),
+    match agent_state.unwrap_or(AutomationAgentState::Idle) {
+        AutomationAgentState::Working => format!("Working {issue_ref}"),
+        AutomationAgentState::Question => format!("Question {issue_ref}"),
+        AutomationAgentState::Review => format!("Review {issue_ref}"),
+        AutomationAgentState::Idle => format!("Wait close {issue_ref}"),
+        AutomationAgentState::Stale => format!("Stalled {issue_ref}"),
     }
 }
 
@@ -469,50 +718,24 @@ async fn wait_for_workspace_change_until(
 }
 
 async fn prompt_root_session(
+    service: &CombinedService,
     snapshot: &WorkspaceSnapshot,
     assigned_repository: &str,
     issue: &SelectedIssue,
 ) -> Result<(), String> {
-    let opencode_client = snapshot
-        .opencode_client
-        .as_ref()
-        .ok_or_else(|| "workspace has no healthy opencode client".to_string())?;
-    let root_session_id = snapshot
-        .root_session_id
-        .clone()
-        .ok_or_else(|| "workspace has no root session id".to_string())?;
-    let session_id = root_session_id
-        .parse::<opencode::client::types::SessionPromptAsyncSessionId>()
-        .map_err(|err| format!("invalid root session id '{root_session_id}': {err}"))?;
     let prompt = build_issue_prompt(assigned_repository, issue);
-    let prompt_body = opencode::client::types::SessionPromptAsyncBody {
-        agent: None,
-        format: None,
-        message_id: None,
-        model: None,
-        no_reply: None,
-        parts: vec![
-            opencode::client::types::TextPartInput {
-                id: None,
-                ignored: None,
-                metadata: Default::default(),
-                synthetic: None,
-                text: prompt,
-                time: None,
-                type_: opencode::client::types::TextPartInputType::Text,
-            }
-            .into(),
-        ],
-        system: None,
-        tools: HashMap::new(),
-        variant: None,
-    };
-    opencode_client
-        .client
-        .session_prompt_async(&session_id, None, None, &prompt_body)
-        .await
-        .map_err(|err| format!("failed to send autonomous issue prompt: {err}"))?;
-    Ok(())
+    service.prompt_root_session(snapshot, &prompt).await
+}
+
+async fn clear_automation_state_file(service: &CombinedService, workspace_key: &str) {
+    let path = automation_state_file_source(service.workspace_directory_path(), workspace_key);
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(workspace_key, error = %err, "failed to clear automation state file");
+        }
+    }
 }
 
 fn build_issue_prompt(assigned_repository: &str, issue: &SelectedIssue) -> String {
@@ -520,14 +743,19 @@ fn build_issue_prompt(assigned_repository: &str, issue: &SelectedIssue) -> Strin
         "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
 Start work on GitHub issue {issue_url}.\n\
 Issue title: {issue_title}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+The environment variable `{automation_state_env}` points to a multicode-owned state file. Maintain it throughout the run using the `autonomous-state` skill so multicode can track whether you are working, waiting for a question, or ready for review.\n\
 Your job is to:\n\
 1. Ensure the repository is available in this workspace.\n\
 2. Understand and reproduce the issue, creating a minimal reproducer or failing test when possible.\n\
 3. Implement the fix.\n\
 4. Run focused verification and summarize the evidence.\n\
-5. Open or update a pull request, request review, and emit the machine-readable repository / issue / PR tags while you work.\n\
+5. Emit the machine-readable repository / issue / PR tags while you work.\n\
+6. Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission.\n\
+7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing. When the change is ready, stop and ask for permission.\n\
 \n\
 Prefer an upstream pull request if you have write access. Keep going until the workspace is ready for review or you need human feedback.",
+        automation_state_env = AUTOMATION_STATE_ENV,
         issue_url = issue.url,
         issue_title = issue.title
     )
@@ -587,6 +815,39 @@ async fn list_issues_for_label(
                 .collect()
         })
         .map_err(|err| format!("failed to parse gh search issues output: {err}"))
+}
+
+async fn fetch_issue(
+    assigned_repository: &str,
+    issue_url: &str,
+    token: &str,
+) -> Result<Option<SelectedIssue>, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "view",
+            issue_url,
+            "--repo",
+            assigned_repository,
+            "--json",
+            "number,title,createdAt,labels,url,state",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue view for {issue_url}: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh issue view failed for {issue_url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let issue = serde_json::from_slice::<SelectedIssue>(&output.stdout)
+        .map_err(|err| format!("failed to parse gh issue view output: {err}"))?;
+    Ok(issue.is_open_issue_candidate().then_some(issue))
 }
 
 fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
@@ -727,7 +988,7 @@ fn normalize_github_repository_path(path: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
-fn issue_reference(url: &str) -> Option<String> {
+pub(crate) fn issue_reference(url: &str) -> Option<String> {
     let stripped = url.strip_prefix("https://github.com/")?;
     let segments = stripped.split('/').collect::<Vec<_>>();
     if segments.len() < 4 {
@@ -737,6 +998,70 @@ fn issue_reference(url: &str) -> Option<String> {
     let repo = segments[1];
     let number = segments[3];
     Some(format!("{owner}/{repo}#{number}"))
+}
+
+pub(crate) fn normalize_github_issue_spec(
+    assigned_repository: &str,
+    input: &str,
+) -> Option<String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('#')
+        && let Ok(number) = rest.parse::<u64>()
+    {
+        return Some(format!(
+            "https://github.com/{assigned_repository}/issues/{number}"
+        ));
+    }
+
+    if let Ok(number) = trimmed.parse::<u64>() {
+        return Some(format!(
+            "https://github.com/{assigned_repository}/issues/{number}"
+        ));
+    }
+
+    if let Some((repository, issue_number)) = trimmed.split_once('#')
+        && normalize_github_repository_spec(repository)? == assigned_repository
+    {
+        let number = issue_number.trim().parse::<u64>().ok()?;
+        return Some(format!(
+            "https://github.com/{assigned_repository}/issues/{number}"
+        ));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        return normalize_github_issue_path(assigned_repository, rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://github.com/") {
+        return normalize_github_issue_path(assigned_repository, rest);
+    }
+
+    normalize_github_issue_path(assigned_repository, trimmed)
+}
+
+fn normalize_github_issue_path(assigned_repository: &str, path: &str) -> Option<String> {
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim())
+        .collect::<Vec<_>>();
+    let [owner, repo, kind, number, ..] = segments.as_slice() else {
+        return None;
+    };
+    if *kind != "issues" {
+        return None;
+    }
+    let repository = normalize_github_repository_spec(&format!("{owner}/{repo}"))?;
+    if repository != assigned_repository {
+        return None;
+    }
+    let number = number.parse::<u64>().ok()?;
+    Some(format!(
+        "https://github.com/{assigned_repository}/issues/{number}"
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -822,6 +1147,37 @@ mod tests {
             Some("micronaut-projects/micronaut-core".to_string())
         );
         assert_eq!(normalize_github_repository_spec("invalid"), None);
+    }
+
+    #[test]
+    fn normalize_github_issue_spec_accepts_numbers_refs_and_urls_for_assigned_repo() {
+        let repository = "micronaut-projects/micronaut-core";
+        assert_eq!(
+            normalize_github_issue_spec(repository, "42"),
+            Some("https://github.com/micronaut-projects/micronaut-core/issues/42".to_string())
+        );
+        assert_eq!(
+            normalize_github_issue_spec(repository, "#42"),
+            Some("https://github.com/micronaut-projects/micronaut-core/issues/42".to_string())
+        );
+        assert_eq!(
+            normalize_github_issue_spec(repository, "micronaut-projects/micronaut-core#42"),
+            Some("https://github.com/micronaut-projects/micronaut-core/issues/42".to_string())
+        );
+        assert_eq!(
+            normalize_github_issue_spec(
+                repository,
+                "https://github.com/micronaut-projects/micronaut-core/issues/42",
+            ),
+            Some("https://github.com/micronaut-projects/micronaut-core/issues/42".to_string())
+        );
+        assert_eq!(
+            normalize_github_issue_spec(
+                repository,
+                "https://github.com/micronaut-projects/micronaut-test/issues/42",
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1050,5 +1406,57 @@ mod tests {
             cleared.persistent.assigned_repository.as_deref(),
             Some("example/repo")
         );
+    }
+
+    #[test]
+    fn issue_progress_status_uses_explicit_automation_states() {
+        assert_eq!(
+            issue_progress_status(
+                "example/repo",
+                "https://github.com/example/repo/issues/42",
+                Some(AutomationAgentState::Working),
+            ),
+            "Working example/repo#42"
+        );
+        assert_eq!(
+            issue_progress_status(
+                "example/repo",
+                "https://github.com/example/repo/issues/42",
+                Some(AutomationAgentState::Review),
+            ),
+            "Review example/repo#42"
+        );
+        assert_eq!(
+            issue_progress_status(
+                "example/repo",
+                "https://github.com/example/repo/issues/42",
+                Some(AutomationAgentState::Idle),
+            ),
+            "Wait close example/repo#42"
+        );
+    }
+
+    #[test]
+    fn build_issue_prompt_requires_skills_and_publish_approval() {
+        let issue = SelectedIssue {
+            number: 980,
+            title: "candidate".to_string(),
+            url: "https://github.com/example/repo/issues/980".to_string(),
+            created_at: "2026-04-09T10:00:00Z".to_string(),
+            state: Some("OPEN".to_string()),
+            is_pull_request: Some(false),
+            labels: vec![],
+        };
+
+        let prompt = build_issue_prompt("example/repo", &issue);
+
+        assert!(prompt.contains("`independent-fix`"));
+        assert!(prompt.contains("`machine-readable-pr`"));
+        assert!(prompt.contains("`autonomous-state`"));
+        assert!(prompt.contains(AUTOMATION_STATE_ENV));
+        assert!(prompt.contains(
+            "Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission."
+        ));
+        assert!(prompt.contains("Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing."));
     }
 }

@@ -1,6 +1,6 @@
 # multicode
 
-… runs isolated [opencode](https://opencode.ai/) instances in parallel.
+… runs isolated AI coding agent instances in parallel.
 
 The [Micronaut Project](https://micronaut.io/) gets hundreds of issue reports from users. Many of them are easy to 
 solve, but still take time to understand, debug and fix. AI agents can solve many of these issues on their own. 
@@ -20,8 +20,51 @@ cargo run --bin multicode-tui config.toml
 ## Workspaces
 
 *multicode* parallelizes work in **workspaces**. They are short-lived and isolated. Typically, a workspace is used for
-a single issue report. A workspace gets its own working directory and OpenCode session, so you can work from a blank 
+a single issue report. A workspace gets its own working directory and agent session, so you can work from a blank
 slate.
+
+## Agent configuration
+
+The agent used inside workspaces is configured globally in `config.toml` with the `[agent]` section.
+
+OpenCode remains the default:
+
+```toml
+[agent]
+provider = "opencode"
+
+# Backwards-compatible top-level command list.
+opencode = ["opencode-cli", "opencode"]
+
+[agent.opencode]
+commands = ["opencode-cli", "opencode"]
+```
+
+To use Codex instead:
+
+```toml
+[agent]
+provider = "codex"
+
+[agent.codex]
+commands = ["codex"]
+model = "gpt-5-codex"
+model-provider = "openai"
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+```
+
+Notes:
+
+- `provider` is global for the whole multicode instance. A single TUI session uses either OpenCode or Codex for all workspaces.
+- `commands` is the host-side command resolution order. The first installed command is used.
+- OpenCode keeps the existing top-level `opencode = [...]` setting for backwards compatibility. If `[agent.opencode].commands` is omitted, multicode falls back to that list.
+- Codex workspaces use `codex app-server` inside the isolate/container and `codex resume --remote ...` when attaching from the TUI.
+- `profile` is optional for Codex. If you set it, it must name a real profile from your host `~/.codex/config.toml`.
+- For Codex, `approval-policy = "never"` suppresses approval prompts, `sandbox-mode = "workspace-write"` keeps Codex's own sandbox active, and `sandbox-mode = "external-sandbox"` tells Codex to trust the outer multicode sandbox such as the Apple container runtime.
+- `network-access = "enabled"` is the practical setting for issue fixing workflows that need GitHub, dependency downloads, or web access. With `external-sandbox`, this is sent as Codex app-server `sandboxPolicy.networkAccess`.
+- `runtime.image` is still the global image override. If you want separate images, use `runtime.opencode-image` and `runtime.codex-image`.
 
 ## Isolation
 
@@ -39,12 +82,17 @@ Isolation is implemented using `systemd-run` (for resource constraints) and
 
 On newer Apple Silicon Macs, there is also an experimental Apple `container` runtime backend. It
 reuses the existing `[isolation]` configuration for readable, writable, isolated, and `tmpfs`
-paths, and maps CPU / memory limits onto container allocation settings:
+paths, and maps CPU / memory limits onto container allocation settings.
+
+OpenCode example:
 
 ```toml
+[agent]
+provider = "opencode"
+
 [runtime]
 backend = "apple-container"
-image = "ghcr.io/example/multicode-java25:latest"
+opencode-image = "ghcr.io/example/multicode-opencode-java25:latest"
 
 [isolation]
 writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
@@ -60,6 +108,72 @@ Mounting `~/.config/opencode` read-only lets the container see the same profiles
 skills, and other OpenCode configuration as the host. This is useful if you manage local
 profiles with tools like `ocp`. Keep `~/.local/share/opencode` and `~/.local/state/opencode`
 isolated so session state remains per-workspace.
+
+Codex example:
+
+```toml
+[agent]
+provider = "codex"
+
+[agent.codex]
+commands = ["codex"]
+model = "gpt-5-codex"
+model-provider = "openai"
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+
+[runtime]
+backend = "apple-container"
+codex-image = "ghcr.io/example/multicode-codex-java25:latest"
+
+[isolation]
+add-skills-from = ["./workspace-skills"]
+writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
+inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
+memory-max = "16 GiB"
+cpu = "300%"
+```
+
+For Codex, multicode prepares a synthetic per-workspace `CODEX_HOME` inside the isolate/container.
+It copies the host `~/.codex/config.toml`, `~/.codex/auth.json`, `~/.codex/AGENTS.md`, and
+`~/.codex/skills`, then merges in any `add-skills-from` mounts. This keeps Codex session state
+isolated per workspace while still reusing your host configuration and credentials.
+
+If you want Codex to behave more autonomously inside an Apple container, prefer:
+
+```toml
+[agent.codex]
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+```
+
+That combination keeps multicode's Apple container as the real isolation boundary while avoiding repeated Codex approval prompts for normal shell execution.
+
+If you maintain two images, the practical split is:
+
+```toml
+[runtime]
+backend = "apple-container"
+opencode-image = "ghcr.io/example/multicode-opencode-java25:latest"
+codex-image = "ghcr.io/example/multicode-codex-java25:latest"
+```
+
+Use the OpenCode image for the existing OpenCode workflow and a Codex image that includes the `codex` CLI and any Codex-specific bootstrap you need.
+
+To build both local Apple-container images from this repository:
+
+```bash
+./apple-container/build-local.sh
+```
+
+That script produces:
+
+- `multicode-java25:latest` and `multicode-opencode-java25:latest` for the OpenCode workflow
+- `multicode-codex-java25:latest` for the Codex workflow
+
+The split keeps the existing OpenCode image compatible while allowing the Codex image to install Codex-specific tooling without changing the OpenCode bootstrap path.
 
 Apple workspaces also expose the host `~/.gitconfig` automatically. The runtime mounts it through
 an internal read-only path and sets `GIT_CONFIG_GLOBAL` so git can use your host global identity
@@ -141,8 +255,8 @@ be moved to the bottom of the UI. You can unarchive it again when needed.
 
 *multicode-remote* is a helper tool to run a multicode instance on a remote machine. Features:
 
-* Dependency installation (bubblewrap, opencode, ...)
-* Synchronization of local opencode configuration (including authentication details)
+* Dependency installation (bubblewrap, opencode, codex, ...)
+* Synchronization of local agent configuration (including authentication details)
 * Synchronization of GitHub credentials
 * Bi-directional synchronization of the agent workspace
 * Opening links in the local browser or git diff viewer

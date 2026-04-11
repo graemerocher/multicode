@@ -1,0 +1,53 @@
+workspace-directory = "/tmp/multicode-codex-workspaces"
+opencode = ["opencode-cli", "opencode"]
+
+[agent]
+provider = "codex"
+
+[agent.codex]
+commands = ["codex"]
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+
+[runtime]
+backend = "apple-container"
+codex-image = "multicode-codex-java25:latest"
+
+[github]
+token = {env = "GITHUB_MCP_TOKEN"}
+populate-git-credentials = true
+
+[isolation]
+add-skills-from = ["./workspace-skills"]
+writable = [
+    "~/.codex",
+    "~/.gradle",
+    "~/.m2/repository",
+    "~/.config/gh",
+    "$XDG_RUNTIME_DIR",
+]
+tmpfs = ["/tmp"]
+inherit-env = [
+    "XDG_RUNTIME_DIR",
+    "HOME",
+    "PATH",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "GITHUB_MCP_TOKEN",
+]
+memory-high = "6 GiB"
+memory-max = "8 GiB"
+cpu = "300%"
+
+[handler]
+review = "/usr/bin/open ."
+review-pty = false
+web = "/usr/bin/open {}"
+
+[[tool]]
+type = "exec"
+name = "bash"
+key = "b"
+exec = "/bin/bash"

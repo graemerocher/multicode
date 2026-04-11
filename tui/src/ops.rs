@@ -39,6 +39,13 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
     let mut parsed = Url::parse(uri)
         .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
 
+    if matches!(parsed.scheme(), "ws" | "wss") {
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: snapshot.root_session_id.clone(),
+        });
+    }
+
     let username = parsed.username().to_string();
     if username.is_empty() {
         return Err(io::Error::other(
@@ -57,7 +64,7 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
         .set_password(None)
         .map_err(|_| io::Error::other("failed to sanitize workspace attach URI password"))?;
 
-    Ok(AttachTarget {
+    Ok(AttachTarget::Opencode {
         uri: parsed.to_string(),
         username,
         password,
@@ -156,14 +163,34 @@ pub(crate) async fn validate_workspace_link_target(
     }
 }
 
-pub(crate) fn attach_cli_args(opencode_command: &str, target: &AttachTarget) -> Vec<String> {
-    let mut args = vec![opencode_command.to_string(), "attach".to_string()];
-    if let Some(session_id) = target.session_id.as_deref() {
-        args.push("--session".to_string());
-        args.push(session_id.to_string());
+pub(crate) fn attach_cli_args(agent_command: &str, target: &AttachTarget) -> Vec<String> {
+    match target {
+        AttachTarget::Opencode {
+            uri, session_id, ..
+        } => {
+            let mut args = vec![agent_command.to_string(), "attach".to_string()];
+            if let Some(session_id) = session_id.as_deref() {
+                args.push("--session".to_string());
+                args.push(session_id.to_string());
+            }
+            args.push(uri.clone());
+            args
+        }
+        AttachTarget::Codex { uri, thread_id } => {
+            let mut args = vec![
+                agent_command.to_string(),
+                "resume".to_string(),
+                "--remote".to_string(),
+                uri.clone(),
+            ];
+            // Remote Codex resumes are more reliable when the app-server picks the
+            // latest thread instead of trusting a cached local snapshot id.
+            if thread_id.is_some() {
+                args.push("--last".to_string());
+            }
+            args
+        }
     }
-    args.push(target.uri.clone());
-    args
 }
 
 pub(crate) fn tmux_session_command(
@@ -181,18 +208,26 @@ pub(crate) fn tmux_session_command(
 
 pub(crate) async fn attach_in_tmux(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    opencode_command: &str,
+    agent_command: &str,
     target: &AttachTarget,
+    extra_env: &[(String, String)],
     workspace_key: &str,
     custom_description: &str,
 ) -> io::Result<()> {
     let original_term = std::env::var("TERM").ok();
-    let attach_command = vec![
-        format!("OPENCODE_SERVER_USERNAME={}", target.username),
-        format!("OPENCODE_SERVER_PASSWORD={}", target.password),
-    ];
-    let mut attach_command = tmux_session_command(attach_command, original_term.as_deref());
-    attach_command.extend(attach_cli_args(opencode_command, target));
+    let mut attach_env = extra_env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    if let AttachTarget::Opencode {
+        username, password, ..
+    } = target
+    {
+        attach_env.push(format!("OPENCODE_SERVER_USERNAME={username}"));
+        attach_env.push(format!("OPENCODE_SERVER_PASSWORD={password}"));
+    }
+    let mut attach_command = tmux_session_command(attach_env, original_term.as_deref());
+    attach_command.extend(attach_cli_args(agent_command, target));
     run_tmux_new_session_command(
         terminal,
         &[],
@@ -315,9 +350,11 @@ pub(crate) async fn run_tmux_new_session_command(
         {
             Ok(status) if status.success() => {}
             Ok(status) => {
-                run_error = Some(io::Error::other(format!(
-                    "tmux attach-session exited with status {status}"
-                )));
+                if tmux_session_exists(&session_name).await? {
+                    run_error = Some(io::Error::other(format!(
+                        "tmux attach-session exited with status {status}"
+                    )));
+                }
             }
             Err(err) => {
                 run_error = Some(err);
@@ -422,6 +459,19 @@ pub(crate) async fn set_tmux_session_option(
             "tmux set-option {option} exited with status {status}"
         )))
     }
+}
+
+async fn tmux_session_exists(session_name: &str) -> io::Result<bool> {
+    let status = Command::new("tmux")
+        .arg("has-session")
+        .arg("-t")
+        .arg(session_name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    Ok(status.success())
 }
 
 pub(crate) fn generate_tmux_session_name(workspace_key: &str) -> String {

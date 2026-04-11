@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -17,15 +18,19 @@ pub struct SpawnCommand {
 
 use crate::{
     WorkspaceArchiveFormat, WorkspaceManager, WorkspaceManagerError, database::Database, logging,
+    opencode,
 };
 
 use super::{
     GithubStatusService, GithubStatusServiceError, WorkspaceDirectoryError,
+    automation_state_file_service::automation_state_file_service,
     autonomous_workspace_service::autonomous_workspace_service,
+    codex_app_server::CodexAppServerClient,
+    codex_root_session_service::codex_root_session_service,
     config::{
-        AddedSkillMount, Config, ExpandedIsolationConfig, expand_shell_path, inherited_env_value,
-        read_config, resolve_opencode_command, validate_handler_config, validate_remote_config,
-        validate_tool_config_entries, validate_workspace_key,
+        AddedSkillMount, AgentProvider, Config, ExpandedIsolationConfig, expand_shell_path,
+        inherited_env_value, read_config, resolve_agent_command, validate_handler_config,
+        validate_remote_config, validate_tool_config_entries, validate_workspace_key,
     },
     multicode_metadata_service, opencode_client_service, persistent_storage,
     resource_usage_service, root_session_service,
@@ -44,7 +49,8 @@ pub struct CombinedService {
     github_status_service: GithubStatusService,
     workspace_directory_path: PathBuf,
     expanded_isolation: ExpandedIsolationConfig,
-    opencode_command: String,
+    agent_command: String,
+    agent_provider: AgentProvider,
     runtime: WorkspaceRuntime,
     github_git_credentials_env: Option<GithubGitCredentialsEnv>,
 }
@@ -75,9 +81,10 @@ impl CombinedService {
         validate_tool_config_entries(&config.tool)?;
         validate_handler_config(&config.handler)?;
         validate_remote_config(config.remote.as_ref())?;
-        let opencode_command = resolve_opencode_command(&config.opencode)?;
-        let container_opencode_command =
-            resolve_container_opencode_command(config.runtime.backend, &config.opencode);
+        let agent_provider = config.agent.provider;
+        let agent_command = resolve_agent_command(&agent_command_candidates(&config))?;
+        let container_agent_command =
+            resolve_container_agent_command(agent_provider, config.runtime.backend, &config);
         let workspace_directory_path = expand_shell_path(&config.workspace_directory)?;
         if let Err(err) = logging::enable_workspace_file_logging(&workspace_directory_path).await {
             logging::log_file_enable_failed(
@@ -108,8 +115,10 @@ impl CombinedService {
             config.runtime.clone(),
             workspace_directory_path.clone(),
             expanded_isolation.clone(),
-            opencode_command.clone(),
-            container_opencode_command,
+            agent_provider,
+            agent_command.clone(),
+            container_agent_command,
+            config.agent.codex.clone(),
         );
 
         let persistent_path = workspace_directory_path
@@ -126,11 +135,20 @@ impl CombinedService {
         );
         spawn_transient_storage(manager.clone(), transient_link);
         spawn_runtime_reconciliation_service(manager.clone(), runtime.clone());
-        spawn_opencode_client_service(manager.clone());
-        spawn_root_session_service(manager.clone());
+        if agent_provider == AgentProvider::Opencode {
+            spawn_opencode_client_service(manager.clone());
+            spawn_root_session_service(manager.clone());
+        } else {
+            spawn_codex_root_session_service(
+                manager.clone(),
+                workspace_directory_path.clone(),
+                config.agent.codex.clone(),
+            );
+        }
         spawn_multicode_metadata_service(manager.clone());
         spawn_usage_aggregation_service(manager.clone());
         spawn_resource_usage_service(manager.clone());
+        spawn_automation_state_file_service(manager.clone(), workspace_directory_path.clone());
 
         let service = Self {
             config,
@@ -139,7 +157,8 @@ impl CombinedService {
             github_status_service,
             workspace_directory_path,
             expanded_isolation,
-            opencode_command,
+            agent_command,
+            agent_provider,
             runtime,
             github_git_credentials_env,
         };
@@ -178,6 +197,17 @@ impl CombinedService {
         Ok(())
     }
 
+    pub async fn create_workspace_with_repository(
+        &self,
+        key: &str,
+        repository: &str,
+    ) -> Result<String, CombinedServiceError> {
+        let normalized = normalize_repository_spec(repository)?;
+        self.create_workspace(key).await?;
+        self.set_workspace_repository(key, Some(normalized.clone()))?;
+        Ok(normalized)
+    }
+
     pub async fn start_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
 
@@ -201,6 +231,11 @@ impl CombinedService {
         workspace.update(|snapshot| {
             if snapshot.transient.is_none() {
                 snapshot.transient = Some(start.transient.clone());
+                snapshot.persistent.automation_paused = false;
+                if snapshot.persistent.assigned_repository.is_some() {
+                    snapshot.automation_scan_request_nonce =
+                        snapshot.automation_scan_request_nonce.saturating_add(1);
+                }
                 replaced = true;
                 true
             } else {
@@ -224,31 +259,46 @@ impl CombinedService {
         repository: Option<&str>,
     ) -> Result<Option<String>, CombinedServiceError> {
         let key = validate_workspace_key(key)?;
-        let normalized = repository
-            .map(|repository| {
-                super::autonomous_workspace_service::normalize_github_repository_spec(repository)
-                    .ok_or_else(|| {
-                        CombinedServiceError::InvalidRepositorySpec(repository.trim().to_string())
-                    })
-            })
+        let normalized = repository.map(normalize_repository_spec).transpose()?;
+        self.set_workspace_repository(&key, normalized.clone())?;
+        Ok(normalized)
+    }
+
+    pub async fn assign_workspace_issue(
+        &self,
+        key: &str,
+        issue: Option<&str>,
+    ) -> Result<Option<String>, CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        let assigned_repository = workspace
+            .subscribe()
+            .borrow()
+            .persistent
+            .assigned_repository
+            .clone()
+            .ok_or_else(|| CombinedServiceError::WorkspaceRepositoryRequired(key.clone()))?;
+        let normalized = issue
+            .map(|issue| normalize_issue_spec(&assigned_repository, issue))
             .transpose()?;
 
-        let workspace = self.manager.get_workspace(&key)?;
         workspace.update(|snapshot| {
-            if snapshot.persistent.assigned_repository == normalized {
-                return false;
-            }
-            snapshot.persistent.assigned_repository = normalized.clone();
-            snapshot.persistent.automation_issue = None;
-            snapshot.automation_status = normalized
-                .as_ref()
-                .map(|repository| format!("Repository assigned; scan queued for {repository}"));
-            if normalized.is_some() {
-                snapshot.automation_scan_request_nonce =
-                    snapshot.automation_scan_request_nonce.saturating_add(1);
-            }
+            snapshot.persistent.automation_issue = normalized.clone();
+            snapshot.persistent.automation_paused = false;
+            snapshot.automation_status = Some(match normalized.as_ref() {
+                Some(issue_url) => format!(
+                    "Issue assigned; start queued for {}",
+                    format_issue_reference(issue_url)
+                ),
+                None => {
+                    format!("Issue cleared; scan queued for {assigned_repository}")
+                }
+            });
+            snapshot.automation_scan_request_nonce =
+                snapshot.automation_scan_request_nonce.saturating_add(1);
             true
         });
+
         Ok(normalized)
     }
 
@@ -261,8 +311,34 @@ impl CombinedService {
                     snapshot.automation_status = Some(format!("Scan requested for {repository}"));
                 }
             }
+            snapshot.persistent.automation_paused = false;
             snapshot.automation_scan_request_nonce =
                 snapshot.automation_scan_request_nonce.saturating_add(1);
+            true
+        });
+        Ok(())
+    }
+
+    fn set_workspace_repository(
+        &self,
+        key: &str,
+        repository: Option<String>,
+    ) -> Result<(), CombinedServiceError> {
+        let workspace = self.manager.get_workspace(key)?;
+        workspace.update(|snapshot| {
+            if snapshot.persistent.assigned_repository == repository {
+                return false;
+            }
+            snapshot.persistent.assigned_repository = repository.clone();
+            snapshot.persistent.automation_issue = None;
+            snapshot.persistent.automation_paused = false;
+            snapshot.automation_status = repository
+                .as_ref()
+                .map(|repository| format!("Repository assigned; scan queued for {repository}"));
+            if repository.is_some() {
+                snapshot.automation_scan_request_nonce =
+                    snapshot.automation_scan_request_nonce.saturating_add(1);
+            }
             true
         });
         Ok(())
@@ -283,6 +359,12 @@ impl CombinedService {
         workspace.update(|snapshot| {
             if snapshot.transient.is_some() {
                 snapshot.transient = None;
+                snapshot.persistent.automation_paused = true;
+                snapshot.automation_status = snapshot
+                    .persistent
+                    .assigned_repository
+                    .as_ref()
+                    .map(|repository| format!("Stopped {repository}"));
                 true
             } else {
                 false
@@ -499,8 +581,98 @@ impl CombinedService {
         Ok(())
     }
 
-    pub fn opencode_command(&self) -> &str {
-        &self.opencode_command
+    pub fn agent_command(&self) -> &str {
+        &self.agent_command
+    }
+
+    pub fn agent_provider(&self) -> AgentProvider {
+        self.agent_provider
+    }
+
+    pub async fn prompt_root_session(
+        &self,
+        snapshot: &crate::WorkspaceSnapshot,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let root_session_id = snapshot
+            .root_session_id
+            .clone()
+            .ok_or_else(|| "workspace has no root session id".to_string())?;
+
+        match self.agent_provider {
+            AgentProvider::Opencode => {
+                let opencode_client = snapshot
+                    .opencode_client
+                    .as_ref()
+                    .ok_or_else(|| "workspace has no healthy opencode client".to_string())?;
+                let session_id = root_session_id
+                    .parse::<opencode::client::types::SessionPromptAsyncSessionId>()
+                    .map_err(|err| format!("invalid root session id '{root_session_id}': {err}"))?;
+                let prompt_body = opencode::client::types::SessionPromptAsyncBody {
+                    agent: None,
+                    format: None,
+                    message_id: None,
+                    model: None,
+                    no_reply: None,
+                    parts: vec![
+                        opencode::client::types::TextPartInput {
+                            id: None,
+                            ignored: None,
+                            metadata: Default::default(),
+                            synthetic: None,
+                            text: prompt.to_string(),
+                            time: None,
+                            type_: opencode::client::types::TextPartInputType::Text,
+                        }
+                        .into(),
+                    ],
+                    system: None,
+                    tools: HashMap::new(),
+                    variant: None,
+                };
+                opencode_client
+                    .client
+                    .session_prompt_async(&session_id, None, None, &prompt_body)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("failed to send prompt: {err}"))
+            }
+            AgentProvider::Codex => {
+                let uri = snapshot
+                    .transient
+                    .as_ref()
+                    .map(|transient| transient.uri.clone())
+                    .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
+                tracing::info!(
+                    root_session_id,
+                    uri = %uri,
+                    prompt_len = prompt.len(),
+                    "dispatching codex root-session prompt"
+                );
+                let response = CodexAppServerClient::new(uri.clone())
+                    .turn_start(&root_session_id, prompt, &self.config.agent.codex)
+                    .await;
+                match response {
+                    Ok(_) => {
+                        tracing::info!(
+                            root_session_id,
+                            uri = %uri,
+                            "codex root-session prompt dispatched"
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            root_session_id,
+                            uri = %uri,
+                            error = %err,
+                            "codex root-session prompt dispatch failed"
+                        );
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -719,10 +891,29 @@ impl CombinedService {
     }
 }
 
-fn resolve_container_opencode_command(
+fn agent_command_candidates(config: &Config) -> Vec<String> {
+    match config.agent.provider {
+        AgentProvider::Opencode => {
+            if config.agent.opencode.commands.is_empty() {
+                config.opencode.clone()
+            } else {
+                config.agent.opencode.commands.clone()
+            }
+        }
+        AgentProvider::Codex => config.agent.codex.commands.clone(),
+    }
+}
+
+fn resolve_container_agent_command(
+    provider: AgentProvider,
     backend: crate::RuntimeBackend,
-    candidates: &[String],
+    config: &Config,
 ) -> String {
+    let candidates = agent_command_candidates(config);
+    if provider == AgentProvider::Codex {
+        return "codex".to_string();
+    }
+
     if backend == crate::RuntimeBackend::AppleContainer {
         return candidates
             .iter()
@@ -954,7 +1145,9 @@ pub enum CombinedServiceError {
     },
     InvalidToolExecution(String),
     InvalidRepositorySpec(String),
+    InvalidIssueSpec(String),
     UnsupportedRuntimeBackend(String),
+    WorkspaceRepositoryRequired(String),
     WorkspaceArchived(String),
     WorkspaceNotArchived(String),
     ArchiveWorkspaceRunning(String),
@@ -967,7 +1160,7 @@ pub enum CombinedServiceError {
         key: String,
         status: Option<i32>,
     },
-    OpencodeCommandNotFound {
+    AgentCommandNotFound {
         candidates: Vec<String>,
     },
 }
@@ -984,6 +1177,24 @@ impl CombinedServiceError {
             _ => format!("{self:?}"),
         }
     }
+}
+
+fn normalize_repository_spec(repository: &str) -> Result<String, CombinedServiceError> {
+    super::autonomous_workspace_service::normalize_github_repository_spec(repository)
+        .ok_or_else(|| CombinedServiceError::InvalidRepositorySpec(repository.trim().to_string()))
+}
+
+fn normalize_issue_spec(
+    assigned_repository: &str,
+    issue: &str,
+) -> Result<String, CombinedServiceError> {
+    super::autonomous_workspace_service::normalize_github_issue_spec(assigned_repository, issue)
+        .ok_or_else(|| CombinedServiceError::InvalidIssueSpec(issue.trim().to_string()))
+}
+
+fn format_issue_reference(issue_url: &str) -> String {
+    super::autonomous_workspace_service::issue_reference(issue_url)
+        .unwrap_or_else(|| issue_url.to_string())
 }
 
 pub fn summarize_workspace_start_failure(status: Option<i32>, stderr: &str) -> String {
@@ -1123,6 +1334,20 @@ fn spawn_root_session_service(manager: Arc<WorkspaceManager>) {
     });
 }
 
+fn spawn_codex_root_session_service(
+    manager: Arc<WorkspaceManager>,
+    workspace_directory_path: PathBuf,
+    config: super::config::CodexAgentConfig,
+) {
+    tokio::spawn(async move {
+        if let Err(err) =
+            codex_root_session_service(manager, workspace_directory_path, config).await
+        {
+            tracing::error!(error = ?err, "codex root session service exited with error");
+        }
+    });
+}
+
 fn spawn_multicode_metadata_service(manager: Arc<WorkspaceManager>) {
     tokio::spawn(async move {
         if let Err(err) = multicode_metadata_service(manager).await {
@@ -1147,6 +1372,17 @@ fn spawn_resource_usage_service(manager: Arc<WorkspaceManager>) {
     });
 }
 
+fn spawn_automation_state_file_service(
+    manager: Arc<WorkspaceManager>,
+    workspace_directory_path: PathBuf,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = automation_state_file_service(manager, workspace_directory_path).await {
+            tracing::error!(error = ?err, "automation state file service terminated");
+        }
+    });
+}
+
 fn spawn_autonomous_workspace_service(service: CombinedService) {
     tokio::spawn(async move {
         if let Err(err) = autonomous_workspace_service(service).await {
@@ -1160,6 +1396,7 @@ mod tests {
     use super::*;
     use crate::services::{
         GithubTokenConfig, ToolType,
+        config::{CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode},
         runtime::{MountKind, MountSpec},
     };
     use crate::test_support::ENV_VAR_LOCK;
@@ -1269,6 +1506,21 @@ mod tests {
         )
     }
 
+    fn default_config() -> Config {
+        Config {
+            workspace_directory: "/tmp/workspaces".to_string(),
+            isolation: Default::default(),
+            runtime: Default::default(),
+            autonomous: Default::default(),
+            agent: Default::default(),
+            opencode: vec!["opencode-cli".to_string(), "opencode".to_string()],
+            tool: Vec::new(),
+            handler: Default::default(),
+            remote: None,
+            github: Default::default(),
+        }
+    }
+
     #[test]
     fn config_parses_github_token_env_source() {
         let config: Config = toml::from_str(
@@ -1293,29 +1545,140 @@ token = { env = "GITHUB_TOKEN" }
     }
 
     #[test]
-    fn resolve_container_opencode_command_prefers_opencode_for_apple_backend() {
+    fn config_parses_codex_agent_provider_settings() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[agent]
+provider = "codex"
+
+[agent.codex]
+commands = ["codex-nightly", "codex"]
+profile = "default"
+model = "gpt-5-codex"
+model-provider = "openai"
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.agent.provider, AgentProvider::Codex);
+        assert_eq!(config.agent.codex.commands, vec!["codex-nightly", "codex"]);
+        assert_eq!(config.agent.codex.profile.as_deref(), Some("default"));
+        assert_eq!(config.agent.codex.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(config.agent.codex.model_provider.as_deref(), Some("openai"));
         assert_eq!(
-            resolve_container_opencode_command(
+            config.agent.codex.approval_policy,
+            CodexApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            config.agent.codex.sandbox_mode,
+            CodexSandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            config.agent.codex.network_access,
+            CodexNetworkAccess::Enabled
+        );
+    }
+
+    #[test]
+    fn config_parses_codex_autonomy_settings() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[agent]
+provider = "codex"
+
+[agent.codex]
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.agent.provider, AgentProvider::Codex);
+        assert_eq!(
+            config.agent.codex.approval_policy,
+            CodexApprovalPolicy::Never
+        );
+        assert_eq!(
+            config.agent.codex.sandbox_mode,
+            CodexSandboxMode::ExternalSandbox
+        );
+        assert_eq!(
+            config.agent.codex.network_access,
+            CodexNetworkAccess::Enabled
+        );
+    }
+
+    #[test]
+    fn runtime_config_prefers_provider_specific_images_when_global_override_is_absent() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[runtime]
+backend = "apple-container"
+opencode-image = "example/opencode:latest"
+codex-image = "example/codex:latest"
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.runtime.resolved_image(AgentProvider::Opencode),
+            Some("example/opencode:latest")
+        );
+        assert_eq!(
+            config.runtime.resolved_image(AgentProvider::Codex),
+            Some("example/codex:latest")
+        );
+    }
+
+    #[test]
+    fn resolve_container_agent_command_prefers_opencode_for_apple_backend() {
+        assert_eq!(
+            resolve_container_agent_command(
+                AgentProvider::Opencode,
                 crate::RuntimeBackend::AppleContainer,
-                &["opencode-cli".to_string(), "opencode".to_string()]
+                &Config {
+                    opencode: vec!["opencode-cli".to_string(), "opencode".to_string()],
+                    ..default_config()
+                }
             ),
             "opencode"
         );
         assert_eq!(
-            resolve_container_opencode_command(
+            resolve_container_agent_command(
+                AgentProvider::Opencode,
                 crate::RuntimeBackend::AppleContainer,
-                &["/opt/homebrew/bin/opencode-cli".to_string()]
+                &Config {
+                    opencode: vec!["/opt/homebrew/bin/opencode-cli".to_string()],
+                    ..default_config()
+                }
             ),
             "opencode"
         );
     }
 
     #[test]
-    fn resolve_container_opencode_command_keeps_first_candidate_for_linux_backend() {
+    fn resolve_container_agent_command_keeps_first_candidate_for_linux_backend() {
         assert_eq!(
-            resolve_container_opencode_command(
+            resolve_container_agent_command(
+                AgentProvider::Opencode,
                 crate::RuntimeBackend::LinuxSystemdBwrap,
-                &["opencode-cli".to_string(), "opencode".to_string()]
+                &Config {
+                    opencode: vec!["opencode-cli".to_string(), "opencode".to_string()],
+                    ..default_config()
+                }
             ),
             "opencode-cli"
         );
@@ -1670,7 +2033,7 @@ populate-git-credentials = true
     }
 
     #[test]
-    fn combined_service_resolves_first_available_opencode_command() {
+    fn combined_service_resolves_first_available_agent_command() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1713,12 +2076,12 @@ populate-git-credentials = true
                 .expect("combined service should start");
 
             assert_eq!(service.config.opencode, vec!["opencode-cli", "opencode"]);
-            assert_eq!(service.opencode_command(), fallback.to_string_lossy());
+            assert_eq!(service.agent_command(), fallback.to_string_lossy());
         });
     }
 
     #[test]
-    fn combined_service_fails_when_no_opencode_command_is_available() {
+    fn combined_service_fails_when_no_agent_command_is_available() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1757,7 +2120,7 @@ populate-git-credentials = true
                 .expect_err("missing commands should fail");
 
             match err {
-                CombinedServiceError::OpencodeCommandNotFound { candidates } => {
+                CombinedServiceError::AgentCommandNotFound { candidates } => {
                     assert_eq!(candidates, vec!["missing-a", "missing-b"]);
                 }
                 other => panic!("unexpected error: {other:?}"),
@@ -1929,6 +2292,166 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
                 .clone();
             assert!(cleared_snapshot.persistent.assigned_repository.is_none());
             assert_eq!(cleared_snapshot.automation_scan_request_nonce, 1);
+        });
+    }
+
+    #[test]
+    fn assign_workspace_issue_normalizes_and_requests_autonomous_start() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            let normalized = service
+                .assign_workspace_issue("alpha", Some("#42"))
+                .await
+                .expect("issue assignment should succeed");
+            assert_eq!(
+                normalized.as_deref(),
+                Some("https://github.com/example/repo/issues/42")
+            );
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+            assert_eq!(
+                snapshot.persistent.automation_issue.as_deref(),
+                Some("https://github.com/example/repo/issues/42")
+            );
+            assert_eq!(snapshot.automation_scan_request_nonce, 2);
+
+            let cleared = service
+                .assign_workspace_issue("alpha", None)
+                .await
+                .expect("clearing issue assignment should succeed");
+            assert!(cleared.is_none());
+
+            let cleared_snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+            assert!(cleared_snapshot.persistent.automation_issue.is_none());
+            assert_eq!(cleared_snapshot.automation_scan_request_nonce, 3);
+        });
+    }
+
+    #[test]
+    fn request_workspace_issue_scan_clears_manual_pause() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .update(|snapshot| {
+                    snapshot.persistent.automation_paused = true;
+                    true
+                });
+
+            service
+                .request_workspace_issue_scan("alpha")
+                .expect("scan request should succeed");
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+
+            assert!(!snapshot.persistent.automation_paused);
+            assert_eq!(snapshot.automation_scan_request_nonce, 2);
         });
     }
 
@@ -2298,7 +2821,7 @@ cpu = "400%"
             assert!(contains_sequence(
                 &args,
                 &[
-                    service.opencode_command(),
+                    service.agent_command(),
                     "serve",
                     "--hostname",
                     "127.0.0.1",

@@ -2,10 +2,24 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+
+container build \
+  -t multicode-java25:latest \
+  -t multicode-opencode-java25:latest \
+  -f "$SCRIPT_DIR/Containerfile" \
+  --build-arg "HOST_UID=$HOST_UID" \
+  --build-arg "HOST_GID=$HOST_GID" \
+  --build-arg "INSTALL_OPENCODE=1" \
+  --build-arg "INSTALL_CODEX=0" \
+  "$SCRIPT_DIR"
 
 exec container build \
-  -t multicode-java25:latest \
+  -t multicode-codex-java25:latest \
   -f "$SCRIPT_DIR/Containerfile" \
-  --build-arg "HOST_UID=$(id -u)" \
-  --build-arg "HOST_GID=$(id -g)" \
+  --build-arg "HOST_UID=$HOST_UID" \
+  --build-arg "HOST_GID=$HOST_GID" \
+  --build-arg "INSTALL_OPENCODE=0" \
+  --build-arg "INSTALL_CODEX=1" \
   "$SCRIPT_DIR"

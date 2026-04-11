@@ -1410,8 +1410,7 @@ fn remote_tui_sync_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use multicode_lib::services::config::IsolationConfig;
-    use multicode_lib::services::config::RemoteConfig;
+    use multicode_lib::services::config::{AgentConfig, IsolationConfig, RemoteConfig};
     use std::fs;
 
     #[test]
@@ -1493,6 +1492,7 @@ mod tests {
             isolation: Default::default(),
             runtime: Default::default(),
             autonomous: Default::default(),
+            agent: AgentConfig::default(),
             opencode: vec!["opencode-cli".to_string()],
             tool: Vec::new(),
             handler: Default::default(),
@@ -1661,6 +1661,7 @@ mod tests {
                 isolation: Default::default(),
                 runtime: Default::default(),
                 autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -1715,6 +1716,7 @@ mod tests {
                 },
                 runtime: Default::default(),
                 autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -1752,6 +1754,7 @@ mod tests {
                 },
                 runtime: Default::default(),
                 autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),
@@ -2317,6 +2320,7 @@ mod tests {
                 isolation: Default::default(),
                 runtime: Default::default(),
                 autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
                 tool: Vec::new(),
                 handler: Default::default(),

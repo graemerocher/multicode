@@ -7,7 +7,7 @@ use std::{
 use tokio::{process::Command, sync::watch};
 
 use super::{
-    runtime::{RuntimeUsageSample, RuntimeUsageState, WorkspaceRuntime},
+    runtime::{RuntimeActivity, RuntimeUsageSample, RuntimeUsageState, WorkspaceRuntime},
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{WorkspaceManager, WorkspaceManagerError, WorkspaceSnapshot, manager::Workspace};
@@ -69,6 +69,20 @@ async fn watch_workspace_snapshot(
 
         let now = Instant::now();
         if should_sample_usage(now, next_sample_at) {
+            match WorkspaceRuntime::read_activity(&transient.runtime).await {
+                RuntimeActivity::Stopped => {
+                    previous_cpu_sample = None;
+                    clear_stale_runtime_for_unit(&workspace, &transient.runtime.id);
+                    next_sample_at = Some(now + RESOURCE_MONITOR_INTERVAL);
+                    let wait_timeout = next_poll_timeout(Instant::now(), next_sample_at);
+                    if !wait_for_change_or_timeout(&mut workspace_rx, wait_timeout).await {
+                        break;
+                    }
+                    continue;
+                }
+                RuntimeActivity::Active | RuntimeActivity::Unknown => {}
+            }
+
             match WorkspaceRuntime::read_usage(&transient.runtime).await {
                 RuntimeUsageSample {
                     state: Some(RuntimeUsageState::Active),
@@ -166,6 +180,62 @@ fn clear_resource_usage_for_unit(workspace: &Workspace, unit: &str) {
         } else {
             false
         }
+    });
+}
+
+fn clear_stale_runtime_for_unit(workspace: &Workspace, unit: &str) {
+    workspace.update(|snapshot| {
+        let still_tracking_same_unit = snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.runtime.id.as_str() == unit)
+            .unwrap_or(false);
+        if !still_tracking_same_unit {
+            return false;
+        }
+
+        let mut changed = false;
+        if snapshot.transient.is_some() {
+            snapshot.transient = None;
+            changed = true;
+        }
+        if snapshot.opencode_client.is_some() {
+            snapshot.opencode_client = None;
+            changed = true;
+        }
+        if snapshot.root_session_id.is_some() {
+            snapshot.root_session_id = None;
+            changed = true;
+        }
+        if snapshot.root_session_title.is_some() {
+            snapshot.root_session_title = None;
+            changed = true;
+        }
+        if snapshot.root_session_status.is_some() {
+            snapshot.root_session_status = None;
+            changed = true;
+        }
+        if snapshot.automation_session_id.is_some() {
+            snapshot.automation_session_id = None;
+            changed = true;
+        }
+        if snapshot.automation_session_status.is_some() {
+            snapshot.automation_session_status = None;
+            changed = true;
+        }
+        if snapshot.automation_agent_state.is_some() {
+            snapshot.automation_agent_state = None;
+            changed = true;
+        }
+        if snapshot.usage_cpu_percent.is_some() {
+            snapshot.usage_cpu_percent = None;
+            changed = true;
+        }
+        if snapshot.usage_ram_bytes.is_some() {
+            snapshot.usage_ram_bytes = None;
+            changed = true;
+        }
+        changed
     });
 }
 
@@ -358,6 +428,37 @@ mod tests {
 
         assert_eq!(cpu_percent, None);
         assert_eq!(next_sample, None);
+    }
+
+    #[test]
+    fn clear_stale_runtime_for_unit_clears_matching_runtime_state() {
+        let workspace = crate::manager::Workspace::new(crate::WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.transient = Some(crate::TransientWorkspaceSnapshot {
+                uri: "ws://127.0.0.1:1234".to_string(),
+                runtime: crate::RuntimeHandleSnapshot {
+                    backend: crate::RuntimeBackend::AppleContainer,
+                    id: "runtime-1".to_string(),
+                    metadata: Default::default(),
+                },
+            });
+            snapshot.root_session_id = Some("thread-1".to_string());
+            snapshot.root_session_title = Some("Codex".to_string());
+            snapshot.root_session_status = Some(crate::RootSessionStatus::Busy);
+            snapshot.usage_cpu_percent = Some(25);
+            snapshot.usage_ram_bytes = Some(1024);
+            true
+        });
+
+        clear_stale_runtime_for_unit(&workspace, "runtime-1");
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        assert!(snapshot.transient.is_none());
+        assert!(snapshot.root_session_id.is_none());
+        assert!(snapshot.root_session_title.is_none());
+        assert!(snapshot.root_session_status.is_none());
+        assert!(snapshot.usage_cpu_percent.is_none());
+        assert!(snapshot.usage_ram_bytes.is_none());
     }
 
     #[test]
