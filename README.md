@@ -168,6 +168,17 @@ To build both local Apple-container images from this repository:
 ./apple-container/build-local.sh
 ```
 
+The Codex image build pins the installed Codex CLI to the version declared in
+[`apple-container/Containerfile`](/Users/graemerocher/dev/micronaut/multicode/apple-container/Containerfile)
+via `CODEX_VERSION` so container behavior stays reproducible across rebuilds. Update that build arg
+when you intentionally want to move the image to a newer Codex release.
+
+You can also override the pinned version at build time without editing the file:
+
+```bash
+CODEX_VERSION=0.120 ./apple-container/build-local.sh
+```
+
 That script produces:
 
 - `multicode-java25:latest` and `multicode-opencode-java25:latest` for the OpenCode workflow
