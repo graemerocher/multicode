@@ -150,23 +150,30 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_after_attach_requires_autonomous_issue_workspace() {
+    fn auto_resume_after_attach_only_resumes_active_autonomous_work() {
         let mut snapshot = WorkspaceSnapshot::default();
         snapshot.persistent.assigned_repository = Some("example/repo".to_string());
         snapshot.persistent.automation_issue =
             Some("https://github.com/example/repo/issues/42".to_string());
-        snapshot.root_session_status = Some(RootSessionStatus::Question);
+        snapshot.automation_agent_state = Some(AutomationAgentState::Working);
 
         assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
 
-        snapshot.root_session_status = Some(RootSessionStatus::Idle);
-        assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
+        snapshot.automation_agent_state = Some(AutomationAgentState::Review);
+        assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
 
+        snapshot.automation_agent_state = Some(AutomationAgentState::Question);
+        assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
+
+        snapshot.automation_agent_state = None;
         snapshot.root_session_status = Some(RootSessionStatus::Busy);
         assert!(should_auto_resume_autonomous_codex_after_attach(&snapshot));
 
-        snapshot.root_session_status = Some(RootSessionStatus::Question);
+        snapshot.root_session_status = Some(RootSessionStatus::Idle);
+        assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
+
         snapshot.persistent.automation_issue = None;
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
         assert!(!should_auto_resume_autonomous_codex_after_attach(&snapshot));
     }
 

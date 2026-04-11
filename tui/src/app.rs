@@ -35,8 +35,25 @@ pub(crate) fn should_request_autonomous_issue_scan(snapshot: &WorkspaceSnapshot)
 pub(crate) fn should_auto_resume_autonomous_codex_after_attach(
     snapshot: &WorkspaceSnapshot,
 ) -> bool {
-    snapshot.persistent.assigned_repository.is_some()
-        && snapshot.persistent.automation_issue.is_some()
+    if snapshot.persistent.assigned_repository.is_none()
+        || snapshot.persistent.automation_issue.is_none()
+    {
+        return false;
+    }
+
+    match snapshot.automation_agent_state {
+        Some(AutomationAgentState::Working) => true,
+        Some(
+            AutomationAgentState::Question
+            | AutomationAgentState::Review
+            | AutomationAgentState::Idle
+            | AutomationAgentState::Stale,
+        ) => false,
+        None => matches!(
+            snapshot.automation_session_status.or(snapshot.root_session_status),
+            Some(RootSessionStatus::Busy)
+        ),
+    }
 }
 
 impl TuiState {
