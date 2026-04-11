@@ -981,6 +981,7 @@ impl AppleContainerRuntime {
                 ),
             })?;
         let mut env = inherited_env.to_vec();
+        ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
         self.append_implicit_env(&mut env, host_gitconfig.as_deref())
             .await?;
@@ -1017,6 +1018,7 @@ impl AppleContainerRuntime {
         command: Vec<String>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
         let mut env = inherited_env.to_vec();
+        ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
         self.append_implicit_env(&mut env, host_gitconfig.as_deref())
             .await?;
@@ -1452,6 +1454,21 @@ impl AppleContainerRuntime {
 
     fn generate_runtime_id(&self, key: &str) -> String {
         format!("multicode-{key}-{}", Uuid::new_v4().as_simple())
+    }
+}
+
+fn ensure_pty_terminal_env(env: &mut Vec<(String, String)>) {
+    upsert_env(env, "TERM", "xterm-256color");
+    if env.iter().all(|(name, _)| name != "COLORTERM") {
+        env.push(("COLORTERM".to_string(), "truecolor".to_string()));
+    }
+}
+
+fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if let Some((_, current)) = env.iter_mut().find(|(candidate, _)| candidate == name) {
+        *current = value.to_string();
+    } else {
+        env.push((name.to_string(), value.to_string()));
     }
 }
 
@@ -2332,7 +2349,12 @@ mod tests {
                 &command.args,
                 &["run", "--rm", "--tty", "--interactive"]
             ));
-            assert!(command.args.iter().any(|arg| arg.ends_with("exec.env")));
+            let env_file = command
+                .args
+                .iter()
+                .find(|arg| arg.ends_with("exec.env"))
+                .expect("exec env file should be present")
+                .clone();
             assert!(
                 command
                     .args
@@ -2340,6 +2362,16 @@ mod tests {
                     .any(|arg| arg == "ghcr.io/example/multicode-java25:latest")
             );
             assert!(command.args.iter().any(|arg| arg == "/bin/bash"));
+            let env_contents =
+                fs::read_to_string(env_file).expect("exec env file should be written");
+            assert!(
+                env_contents.contains("TERM=xterm-256color\n"),
+                "apple PTY runs should normalize TERM for container shells"
+            );
+            assert!(
+                env_contents.contains("COLORTERM=truecolor\n"),
+                "apple PTY runs should set a portable COLORTERM for container shells"
+            );
             assert!(command.inherited_env.is_empty());
         });
     }
@@ -2380,7 +2412,12 @@ mod tests {
                 &command.args,
                 &["exec", "--tty", "--interactive", "--env-file",]
             ));
-            assert!(command.args.iter().any(|arg| arg.ends_with("exec.env")));
+            let env_file = command
+                .args
+                .iter()
+                .find(|arg| arg.ends_with("exec.env"))
+                .expect("exec env file should be present")
+                .clone();
             assert!(contains_sequence(
                 &command.args,
                 &[
@@ -2393,6 +2430,16 @@ mod tests {
             assert!(
                 !command.args.iter().any(|arg| arg == "run"),
                 "running workspaces should reuse the active container"
+            );
+            let env_contents =
+                fs::read_to_string(env_file).expect("exec env file should be written");
+            assert!(
+                env_contents.contains("TERM=xterm-256color\n"),
+                "apple PTY exec should normalize TERM for container shells"
+            );
+            assert!(
+                env_contents.contains("COLORTERM=truecolor\n"),
+                "apple PTY exec should set a portable COLORTERM for container shells"
             );
             assert!(command.inherited_env.is_empty());
         });
