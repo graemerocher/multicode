@@ -289,6 +289,43 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         },
                     )
                 };
+                let cost = task_cost_cell_label(task_state);
+                let cost = right_align_cell_text(&cost, cost_width);
+                let (build_cell, review_status_cell) =
+                    if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
+                        (
+                            pr_build_icon_color(*pr_status).map_or_else(
+                                Cell::default,
+                                |build_color| {
+                                    status_icon_cell(
+                                        StatusIconKind::Server,
+                                        if archived {
+                                            Color::DarkGray
+                                        } else {
+                                            build_color
+                                        },
+                                        false,
+                                    )
+                                },
+                            ),
+                            pr_review_icon_color(*pr_status).map_or_else(
+                                Cell::default,
+                                |review_color| {
+                                    status_icon_cell(
+                                        StatusIconKind::Eye,
+                                        if archived {
+                                            Color::DarkGray
+                                        } else {
+                                            review_color
+                                        },
+                                        false,
+                                    )
+                                },
+                            ),
+                        )
+                    } else {
+                        (Cell::default(), Cell::default())
+                    };
                 rows.push(
                     Row::new(vec![
                         Cell::from(task_row_label(task)),
@@ -296,12 +333,12 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                             .style(task_server_style(task_state, archived)),
                         Cell::from(""),
                         Cell::from(""),
-                        Cell::from(""),
+                        Cell::from(cost),
                         Cell::from(""),
                         issue_cell,
                         pr_cell,
-                        Cell::from(""),
-                        Cell::from(""),
+                        build_cell,
+                        review_status_cell,
                         Cell::from(task_description(task, task_state)),
                     ])
                     .style(workspace_row_style(snapshot)),

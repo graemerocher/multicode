@@ -1476,6 +1476,81 @@ struct CodexTaskMetadata {
     prs: Vec<String>,
 }
 
+fn codex_session_log_root(workspace_directory_path: &Path, workspace_key: &str) -> PathBuf {
+    workspace_directory_path
+        .join(".multicode")
+        .join("codex")
+        .join(workspace_key)
+        .join("home")
+        .join("sessions")
+}
+
+fn find_codex_session_log_path(
+    workspace_directory_path: &Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let root = codex_session_log_root(workspace_directory_path, workspace_key);
+    let mut stack = vec![root];
+    let suffix = format!("{session_id}.jsonl");
+    while let Some(path) = stack.pop() {
+        let entries = std::fs::read_dir(&path).ok()?;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry_path);
+                continue;
+            }
+            if file_type.is_file()
+                && entry_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            {
+                return Some(entry_path);
+            }
+        }
+    }
+    None
+}
+
+fn codex_usage_total_tokens_from_session_log_contents(contents: &str) -> Option<u64> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            let payload = value.get("payload")?;
+            if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
+                return None;
+            }
+            payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+                .and_then(|usage| usage.get("total_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .last()
+}
+
+async fn read_codex_task_usage_total_tokens(
+    workspace_directory_path: PathBuf,
+    workspace_key: String,
+    session_id: String,
+) -> Option<u64> {
+    spawn_blocking(move || {
+        let path =
+            find_codex_session_log_path(&workspace_directory_path, &workspace_key, &session_id)?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        codex_usage_total_tokens_from_session_log_contents(&contents)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn recover_codex_task_sessions(
     service: &CombinedService,
     workspace: &Workspace,
@@ -1617,6 +1692,7 @@ async fn reconcile_codex_task_runtime_states(
                             issues: vec![task.issue_url.clone()],
                             ..Default::default()
                         }),
+                        None,
                     );
                     write_authoritative_task_state_file(
                         service.workspace_directory_path(),
@@ -1673,6 +1749,12 @@ async fn reconcile_codex_task_runtime_states(
         } else {
             codex_runtime_state_for_task(status, task_state)
         };
+        let usage_total_tokens = read_codex_task_usage_total_tokens(
+            service.workspace_directory_path().to_path_buf(),
+            workspace_key.to_string(),
+            task_session_id.clone(),
+        )
+        .await;
         tracing::warn!(
             workspace_key,
             task_id = %task.id,
@@ -1702,6 +1784,7 @@ async fn reconcile_codex_task_runtime_states(
             next_session_status,
             next_agent_state,
             Some(metadata),
+            usage_total_tokens,
         );
         write_authoritative_task_state_file(
             service.workspace_directory_path(),
@@ -1793,12 +1876,14 @@ fn recover_latest_codex_thread_candidate_for_cwd(
     codex_home: &Path,
     cwd: &str,
 ) -> Option<CodexRecoveredThreadCandidate> {
-    let mut candidate = recover_codex_thread_candidates_from_state_db(codex_home, &[cwd.to_string()])
-        .ok()
-        .and_then(|mut entries| entries.remove(cwd));
+    let mut candidate =
+        recover_codex_thread_candidates_from_state_db(codex_home, &[cwd.to_string()])
+            .ok()
+            .and_then(|mut entries| entries.remove(cwd));
 
-    let log_candidate = recover_codex_thread_candidates_from_session_logs(codex_home, &[cwd.to_string()])
-        .remove(cwd);
+    let log_candidate =
+        recover_codex_thread_candidates_from_session_logs(codex_home, &[cwd.to_string()])
+            .remove(cwd);
     if should_prefer_recovered_candidate(log_candidate.as_ref(), candidate.as_ref()) {
         candidate = log_candidate;
     }
@@ -1892,10 +1977,13 @@ fn recover_codex_thread_candidates_from_session_logs(
                 stack.push(entry.path());
                 continue;
             }
-            if !file_type.is_file() || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            if !file_type.is_file()
+                || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+            {
                 continue;
             }
-            let Some(candidate) = recover_codex_thread_candidate_from_session_log(&entry.path()) else {
+            let Some(candidate) = recover_codex_thread_candidate_from_session_log(&entry.path())
+            else {
                 continue;
             };
             if !task_cwds.iter().any(|cwd| cwd == &candidate.cwd) {
@@ -1923,8 +2011,14 @@ fn recover_codex_thread_candidate_from_session_log(
         return None;
     }
     let payload = value.get("payload")?;
-    let id = payload.get("id").and_then(serde_json::Value::as_str)?.to_string();
-    let cwd = payload.get("cwd").and_then(serde_json::Value::as_str)?.to_string();
+    let id = payload
+        .get("id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let cwd = payload
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
     let timestamp = payload
         .get("timestamp")
         .and_then(serde_json::Value::as_str)
@@ -1963,10 +2057,9 @@ async fn recover_latest_codex_task_session_id(
     let cwd = task_cwd.to_string_lossy().into_owned();
     let current_session_id = current_session_id.map(ToOwned::to_owned);
     spawn_blocking(move || {
-        recover_latest_codex_thread_candidate_for_cwd(&codex_home, &cwd)
-            .and_then(|candidate| {
-                (current_session_id.as_deref() != Some(candidate.id.as_str())).then_some(candidate.id)
-            })
+        recover_latest_codex_thread_candidate_for_cwd(&codex_home, &cwd).and_then(|candidate| {
+            (current_session_id.as_deref() != Some(candidate.id.as_str())).then_some(candidate.id)
+        })
     })
     .await
     .ok()
@@ -2063,11 +2156,13 @@ fn set_task_runtime_state_from_codex(
     session_status: RootSessionStatus,
     agent_state: AutomationAgentState,
     metadata: Option<CodexTaskMetadata>,
+    usage_total_tokens: Option<u64>,
 ) {
     workspace.update(|snapshot| {
         let mut changed = false;
         let is_active = snapshot.active_task_id.as_deref() == Some(task_id);
-        let next_status_text = codex_task_status_text(agent_state, metadata.as_ref(), task_id, snapshot);
+        let next_status_text =
+            codex_task_status_text(agent_state, metadata.as_ref(), task_id, snapshot);
         if is_active {
             if snapshot.automation_session_id.as_deref() != Some(session_id) {
                 snapshot.automation_session_id = Some(session_id.to_string());
@@ -2102,6 +2197,10 @@ fn set_task_runtime_state_from_codex(
         let should_wait = task_should_wait_on_vm(is_active, Some(agent_state));
         if task_state.waiting_on_vm != should_wait {
             task_state.waiting_on_vm = should_wait;
+            changed = true;
+        }
+        if task_state.usage_total_tokens != usage_total_tokens {
+            task_state.usage_total_tokens = usage_total_tokens;
             changed = true;
         }
         if let Some(metadata) = metadata {
@@ -3553,10 +3652,8 @@ mod tests {
         )
         .expect("unrelated session log should be written");
 
-        let recovered = recover_codex_thread_candidates_from_session_logs(
-            &codex_home,
-            &[cwd.to_string()],
-        );
+        let recovered =
+            recover_codex_thread_candidates_from_session_logs(&codex_home, &[cwd.to_string()]);
 
         assert_eq!(
             recovered.get(cwd).map(|candidate| candidate.id.as_str()),
@@ -4007,8 +4104,16 @@ mod tests {
             true
         });
 
-        assert!(task_session_id_is_current(&workspace, "task-39", "thread-new"));
-        assert!(!task_session_id_is_current(&workspace, "task-39", "thread-old"));
+        assert!(task_session_id_is_current(
+            &workspace,
+            "task-39",
+            "thread-new"
+        ));
+        assert!(!task_session_id_is_current(
+            &workspace,
+            "task-39",
+            "thread-old"
+        ));
     }
 
     #[test]
@@ -4768,6 +4873,7 @@ mod tests {
                 prs: vec!["https://github.com/example/repo/pull/11".to_string()],
                 ..Default::default()
             }),
+            Some(54_611),
         );
 
         let snapshot = workspace.subscribe().borrow().clone();
@@ -4797,6 +4903,7 @@ mod tests {
             task_state.pr,
             vec!["https://github.com/example/repo/pull/11".to_string()]
         );
+        assert_eq!(task_state.usage_total_tokens, Some(54_611));
         assert!(active_task_can_yield_vm(&snapshot));
     }
 
@@ -4838,6 +4945,7 @@ mod tests {
             "task-session-2",
             RootSessionStatus::Busy,
             AutomationAgentState::Working,
+            None,
             None,
         );
 
@@ -4884,6 +4992,7 @@ mod tests {
                 prs: vec!["https://github.com/example/repo/pull/56".to_string()],
                 ..Default::default()
             }),
+            None,
         );
 
         let snapshot = workspace.subscribe().borrow().clone();
@@ -4923,6 +5032,7 @@ mod tests {
             RootSessionStatus::Busy,
             AutomationAgentState::Working,
             Some(CodexTaskMetadata::default()),
+            None,
         );
 
         let snapshot = workspace.subscribe().borrow().clone();
@@ -4971,6 +5081,18 @@ mod tests {
         assert_eq!(
             metadata.prs,
             vec!["https://github.com/graemerocher/multicode-test/pull/8".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_usage_total_tokens_from_session_log_contents_reads_latest_token_count() {
+        let contents = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":123}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":456789}}}}
+"#;
+
+        assert_eq!(
+            codex_usage_total_tokens_from_session_log_contents(contents),
+            Some(456_789)
         );
     }
 

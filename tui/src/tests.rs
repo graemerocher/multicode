@@ -2343,6 +2343,40 @@ mod tests {
     }
 
     #[test]
+    fn task_cost_cell_label_uses_task_tokens() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            usage_total_tokens: Some(987_654),
+            ..Default::default()
+        };
+
+        assert_eq!(task_cost_cell_label(Some(&task_state)), "987 654");
+        assert_eq!(task_cost_cell_label(None), "");
+    }
+
+    #[test]
+    fn workspace_cost_cell_label_sums_task_tokens_before_workspace_usage() {
+        let mut snapshot = snapshot(true, Some("http://example"));
+        snapshot.usage_total_cost = Some(2.5);
+        snapshot.usage_total_tokens = Some(1_234_567);
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                usage_total_tokens: Some(111),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                usage_total_tokens: Some(222),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(cost_cell_label(&snapshot), "333");
+    }
+
+    #[test]
     fn cpu_and_ram_cell_labels_format_usage_values() {
         let mut snapshot = snapshot(true, Some("http://example"));
         snapshot.usage_cpu_percent = Some(7);
@@ -2616,6 +2650,41 @@ mod tests {
             review_width,
             content_width("R").max(REVIEW_STATUS_COLUMN_WIDTH)
         );
+    }
+
+    #[test]
+    fn table_column_widths_include_task_cost_and_server_labels() {
+        let mut workspace = snapshot(true, Some("http://example"));
+        workspace
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-39".to_string(),
+                "https://github.com/graemerocher/multicode-test/issues/39".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            ));
+        workspace.task_states.insert(
+            "task-39".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                usage_total_tokens: Some(123_456_789),
+                waiting_on_vm: true,
+                ..Default::default()
+            },
+        );
+        let mut snapshots = HashMap::new();
+        snapshots.insert("e2e-test".to_string(), workspace);
+        let ordered_keys = vec!["e2e-test".to_string()];
+
+        let (_, server_width, _, _, cost_width, _, _, _, _, _) = table_column_widths(
+            &ordered_keys,
+            &snapshots,
+            "Machine:",
+            "2200%",
+            &machine_ram_cell_label(Some(0)),
+        );
+
+        assert!(server_width >= content_width("Waiting on VM"));
+        assert!(cost_width >= content_width("123 456 789"));
     }
 
     #[test]

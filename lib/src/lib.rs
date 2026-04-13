@@ -104,6 +104,7 @@ pub struct WorkspaceTaskRuntimeSnapshot {
     pub session_status: Option<services::root_session_service::RootSessionStatus>,
     pub agent_state: Option<AutomationAgentState>,
     pub status: Option<String>,
+    pub usage_total_tokens: Option<u64>,
     pub waiting_on_vm: bool,
     pub repository: Vec<String>,
     pub issue: Vec<String>,

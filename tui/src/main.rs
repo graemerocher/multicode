@@ -534,14 +534,36 @@ fn format_price(cost: f64) -> String {
     format!("${cost:.2}")
 }
 
+fn task_cost_cell_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> String {
+    if let Some(tokens) = task_state.and_then(|state| state.usage_total_tokens) {
+        return format_tokens_spaced(tokens);
+    }
+    String::new()
+}
+
+fn workspace_usage_totals(snapshot: &WorkspaceSnapshot) -> (Option<f64>, Option<u64>) {
+    let task_tokens = snapshot
+        .task_states
+        .values()
+        .filter_map(|task_state| task_state.usage_total_tokens)
+        .reduce(|sum, tokens| sum.saturating_add(tokens));
+    if task_tokens.is_some() {
+        return (None, task_tokens);
+    }
+    (
+        snapshot
+            .usage_total_cost
+            .filter(|cost| cost.is_finite() && *cost > 0.0),
+        snapshot.usage_total_tokens,
+    )
+}
+
 fn cost_cell_label(snapshot: &WorkspaceSnapshot) -> String {
-    if let Some(cost) = snapshot
-        .usage_total_cost
-        .filter(|cost| cost.is_finite() && *cost > 0.0)
-    {
+    let (cost, tokens) = workspace_usage_totals(snapshot);
+    if let Some(cost) = cost {
         return format_price(cost);
     }
-    if let Some(tokens) = snapshot.usage_total_tokens {
+    if let Some(tokens) = tokens {
         return format_tokens_spaced(tokens);
     }
     String::new()
@@ -1098,6 +1120,15 @@ fn table_column_widths(
             server_width = server_width.max(content_width(server_cell_label(snapshot)));
             cpu_width = cpu_width.max(content_width(&cpu_cell_label(snapshot)));
             cost_width = cost_width.max(content_width(&cost_cell_label(snapshot)));
+            for task in &snapshot.persistent.tasks {
+                workspace_width = workspace_width.max(content_width(&task_row_label(task)));
+                server_width = server_width.max(content_width(task_server_label(
+                    task_runtime_snapshot(snapshot, &task.id),
+                )));
+                cost_width = cost_width.max(content_width(&task_cost_cell_label(
+                    task_runtime_snapshot(snapshot, &task.id),
+                )));
+            }
         }
     }
     (
