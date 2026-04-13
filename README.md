@@ -84,6 +84,72 @@ On newer Apple Silicon Macs, there is also an experimental Apple `container` run
 reuses the existing `[isolation]` configuration for readable, writable, isolated, and `tmpfs`
 paths, and maps CPU / memory limits onto container allocation settings.
 
+### macOS setup for Apple containers
+
+If you want to run *multicode* on macOS with `backend = "apple-container"`, the practical
+requirements are:
+
+- An Apple Silicon Mac. The Apple container backend is intended for newer Apple Silicon systems.
+- The Apple `container` CLI installed and working on the host. `multicode` shells out to
+  `container run`, `container exec`, `container list`, and `container build`.
+- A working Rust toolchain on the host so you can run `cargo run --bin multicode-tui ...`.
+- `tmux` on the host. The TUI uses it for interactive attach sessions.
+- The host-side agent CLI installed for the provider you choose:
+  - OpenCode: `opencode-cli` or `opencode`
+  - Codex: `codex`
+- A local Apple container image for the selected provider.
+- GitHub authentication on the host if you want issue scanning, PR creation, builds, review
+  status, or authenticated git pushes.
+
+There are also image-level requirements. The container image must contain the tools the agent uses
+inside the isolated workspace, not just on the host:
+
+- `git`
+- `gh`
+- the provider CLI you selected:
+  - OpenCode image: `opencode`
+  - Codex image: `codex`
+- the language/toolchain your repositories need, for example Java / Gradle for Micronaut work
+
+This repository already contains an Apple-container build recipe. To build the local images:
+
+```bash
+./apple-container/build-local.sh
+```
+
+That script expects the host `container` CLI to be available and produces:
+
+- `multicode-java25:latest` and `multicode-opencode-java25:latest` for OpenCode
+- `multicode-codex-java25:latest` for Codex
+
+Host configuration also matters because Apple-container workspaces deliberately reuse some host
+state:
+
+- OpenCode reuses host config from `~/.config/opencode` and authentication from
+  `~/.local/share/opencode/auth.json` when you mount them.
+- Codex workspaces synthesize a per-workspace `CODEX_HOME` from the host `~/.codex`
+  configuration, including `config.toml`, `auth.json`, `AGENTS.md`, and `skills`.
+- Git uses your host `~/.gitconfig`, which multicode exposes automatically inside Apple
+  containers via `GIT_CONFIG_GLOBAL`.
+- If you want GitHub integration or MCP access inside the container, configure `[github]` and
+  pass through any required token env vars with `[isolation].inherit-env`.
+
+The minimum setup flow on macOS is therefore:
+
+1. Install and verify the Apple `container` CLI on the host.
+2. Install Rust and `tmux` on the host.
+3. Install the host agent CLI you want to use (`opencode` or `codex`).
+4. Authenticate that agent on the host so the reused host config files actually contain valid
+   credentials.
+5. Build an Apple container image, or provide your own compatible image.
+6. Set `[runtime].backend = "apple-container"` and point `image`, `opencode-image`, or
+   `codex-image` at that image.
+7. Configure `[isolation]` mounts for caches and credentials you want the workspace to reuse, such
+   as `~/.gradle`, `~/.m2/repository`, `~/.config/gh`, and provider-specific config paths.
+
+If `container` is missing, the image does not include the selected agent CLI, or the host does not
+have the matching CLI for TUI attach, Apple-container workspaces will start or attach incorrectly.
+
 OpenCode example:
 
 ```toml
