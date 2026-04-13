@@ -2336,20 +2336,20 @@ mod tests {
         assert_eq!(cost_cell_label(&snapshot), "$2.50");
 
         snapshot.usage_total_cost = Some(0.0);
-        assert_eq!(cost_cell_label(&snapshot), "1 234 567");
+        assert_eq!(cost_cell_label(&snapshot), "1234k");
 
         snapshot.usage_total_cost = None;
-        assert_eq!(cost_cell_label(&snapshot), "1 234 567");
+        assert_eq!(cost_cell_label(&snapshot), "1234k");
     }
 
     #[test]
-    fn task_cost_cell_label_uses_task_tokens() {
+    fn task_cost_cell_label_uses_compact_task_tokens() {
         let task_state = WorkspaceTaskRuntimeSnapshot {
             usage_total_tokens: Some(987_654),
             ..Default::default()
         };
 
-        assert_eq!(task_cost_cell_label(Some(&task_state)), "987 654");
+        assert_eq!(task_cost_cell_label(Some(&task_state)), "987k");
         assert_eq!(task_cost_cell_label(None), "");
     }
 
@@ -2684,7 +2684,7 @@ mod tests {
         );
 
         assert!(server_width >= content_width("Waiting on VM"));
-        assert!(cost_width >= content_width("123 456 789"));
+        assert!(cost_width >= content_width("123456k"));
     }
 
     #[test]

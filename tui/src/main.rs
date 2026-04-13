@@ -518,16 +518,11 @@ fn effective_server_status(snapshot: &WorkspaceSnapshot) -> RootSessionStatus {
         .unwrap_or(RootSessionStatus::Idle)
 }
 
-fn format_tokens_spaced(tokens: u64) -> String {
-    let digits = tokens.to_string();
-    let mut reversed = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, ch) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            reversed.push(' ');
-        }
-        reversed.push(ch);
+fn format_tokens_compact(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
     }
-    reversed.chars().rev().collect()
+    format!("{}k", tokens / 1_000)
 }
 
 fn format_price(cost: f64) -> String {
@@ -536,7 +531,7 @@ fn format_price(cost: f64) -> String {
 
 fn task_cost_cell_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> String {
     if let Some(tokens) = task_state.and_then(|state| state.usage_total_tokens) {
-        return format_tokens_spaced(tokens);
+        return format_tokens_compact(tokens);
     }
     String::new()
 }
@@ -564,7 +559,7 @@ fn cost_cell_label(snapshot: &WorkspaceSnapshot) -> String {
         return format_price(cost);
     }
     if let Some(tokens) = tokens {
-        return format_tokens_spaced(tokens);
+        return format_tokens_compact(tokens);
     }
     String::new()
 }
