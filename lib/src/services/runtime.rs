@@ -1,12 +1,12 @@
 use std::{
     collections::BTreeMap,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::OnceLock,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ use super::{
     combined::{CombinedServiceError, SpawnCommand},
     config::{
         AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexSandboxMode,
-        ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file,
+        DockerBridgeConfig, ExpandedIsolationConfig, RuntimeConfig, path_looks_like_file,
     },
 };
 use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
@@ -22,6 +22,15 @@ use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 pub(super) const RUNTIME_SPEC_METADATA_KEY: &str = "runtime-spec";
 const APPLE_GITCONFIG_DIR: &str = "/multicode-host/git";
 const APPLE_GITCONFIG_FILE_NAME: &str = ".gitconfig";
+const APPLE_CONTAINER_HOST_GATEWAY: &str = "192.168.64.1";
+const APPLE_DOCKER_BRIDGE_HOST_KEY: &str = "docker-bridge-host";
+const APPLE_DOCKER_BRIDGE_PID_KEY: &str = "docker-bridge-pid";
+const APPLE_DOCKER_BRIDGE_PORT_KEY: &str = "docker-bridge-port";
+const APPLE_DOCKER_BRIDGE_SOURCE_KEY: &str = "docker-bridge-source-socket";
+const APPLE_DOCKER_BRIDGE_BIND_HOST_KEY: &str = "docker-bridge-bind-host";
+const APPLE_DOCKER_BRIDGE_LABEL_MANAGED: &str = "dev.multicode.managed";
+const APPLE_DOCKER_BRIDGE_LABEL_WORKSPACE: &str = "dev.multicode.workspace";
+const APPLE_DOCKER_BRIDGE_LABEL_ID: &str = "dev.multicode.bridge-id";
 const SYNTHETIC_CODEX_HOME: &str = "/multicode-agent/codex-home";
 pub(crate) const AUTOMATION_STATE_DIR: &str = "/multicode-agent/automation";
 pub(crate) const AUTOMATION_STATE_ENV: &str = "MULTICODE_AUTONOMOUS_STATE_PATH";
@@ -66,6 +75,66 @@ struct RuntimeContext {
     host_agent_command: String,
     container_agent_command: String,
     codex: CodexAgentConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ImplicitDockerBridge {
+    source_socket: PathBuf,
+    host: String,
+    bind_host: String,
+    host_port: u16,
+    pid: u32,
+}
+
+impl ImplicitDockerBridge {
+    fn docker_host_value(&self) -> String {
+        format!("tcp://{}:{}", self.host, self.host_port)
+    }
+
+    fn from_runtime_handle(runtime_handle: &RuntimeHandleSnapshot) -> Option<Self> {
+        let source_socket = runtime_handle
+            .metadata
+            .get(APPLE_DOCKER_BRIDGE_SOURCE_KEY)
+            .map(PathBuf::from)?;
+        let host = runtime_handle
+            .metadata
+            .get(APPLE_DOCKER_BRIDGE_HOST_KEY)?
+            .to_string();
+        let bind_host = runtime_handle
+            .metadata
+            .get(APPLE_DOCKER_BRIDGE_BIND_HOST_KEY)
+            .cloned()
+            .unwrap_or_else(|| host.clone());
+        let host_port = runtime_handle
+            .metadata
+            .get(APPLE_DOCKER_BRIDGE_PORT_KEY)?
+            .parse()
+            .ok()?;
+        let pid = runtime_handle
+            .metadata
+            .get(APPLE_DOCKER_BRIDGE_PID_KEY)?
+            .parse()
+            .ok()?;
+        Some(Self {
+            source_socket,
+            host,
+            bind_host,
+            host_port,
+            pid,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DockerBridgePolicy {
+    allowed_images: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DockerBridgePolicyPayload {
+    bind_host: String,
+    allowed_images: Vec<String>,
+    managed_labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -970,15 +1039,52 @@ impl AppleContainerRuntime {
         let password = generate_random_password();
         let port = pick_random_free_port().await?;
         let container_name = self.generate_runtime_id(key);
+        let docker_bridge_policy = self.docker_bridge_policy()?;
+        let implicit_docker_bridge =
+            if let Some(source_socket) =
+                self.implicit_docker_socket_source(inherited_env, docker_bridge_policy.is_some())?
+            {
+                Some(
+                    self.start_implicit_docker_bridge(
+                        key,
+                        source_socket,
+                        docker_bridge_policy
+                            .as_ref()
+                            .expect("docker bridge policy should exist when bridge is enabled"),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
         let command = self
-            .build_run_command(key, &container_name, &password, port, inherited_env)
+            .build_run_command(
+                key,
+                &container_name,
+                &password,
+                port,
+                inherited_env,
+                implicit_docker_bridge.as_ref(),
+            )
             .await?;
 
-        let output = self
+        let output = match self
             .run_container_start_command(command.program.clone(), command.args.clone())
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                if let Some(implicit_docker_bridge) = implicit_docker_bridge.as_ref() {
+                    Self::stop_implicit_docker_bridge(implicit_docker_bridge).await;
+                }
+                return Err(err);
+            }
+        };
 
         if !output.status.success() {
+            if let Some(implicit_docker_bridge) = implicit_docker_bridge.as_ref() {
+                Self::stop_implicit_docker_bridge(implicit_docker_bridge).await;
+            }
             return Err(CombinedServiceError::StartWorkspaceFailed {
                 status: output.status.code(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -988,6 +1094,31 @@ impl AppleContainerRuntime {
         let mut metadata = BTreeMap::new();
         metadata.insert("workspace-key".to_string(), key.to_string());
         metadata.insert("port".to_string(), port.to_string());
+        if let Some(implicit_docker_bridge) = implicit_docker_bridge.as_ref() {
+            metadata.insert(
+                APPLE_DOCKER_BRIDGE_HOST_KEY.to_string(),
+                implicit_docker_bridge.host.clone(),
+            );
+            metadata.insert(
+                APPLE_DOCKER_BRIDGE_BIND_HOST_KEY.to_string(),
+                implicit_docker_bridge.bind_host.clone(),
+            );
+            metadata.insert(
+                APPLE_DOCKER_BRIDGE_PORT_KEY.to_string(),
+                implicit_docker_bridge.host_port.to_string(),
+            );
+            metadata.insert(
+                APPLE_DOCKER_BRIDGE_PID_KEY.to_string(),
+                implicit_docker_bridge.pid.to_string(),
+            );
+            metadata.insert(
+                APPLE_DOCKER_BRIDGE_SOURCE_KEY.to_string(),
+                implicit_docker_bridge
+                    .source_socket
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         metadata.insert(
             RUNTIME_SPEC_METADATA_KEY.to_string(),
             WorkspaceRuntime::AppleContainer(self.clone()).runtime_spec(),
@@ -1064,6 +1195,11 @@ impl AppleContainerRuntime {
     async fn stop_server(
         runtime_handle: &RuntimeHandleSnapshot,
     ) -> Result<(), CombinedServiceError> {
+        if let Some(implicit_docker_bridge) =
+            ImplicitDockerBridge::from_runtime_handle(runtime_handle)
+        {
+            Self::stop_implicit_docker_bridge(&implicit_docker_bridge).await;
+        }
         let output = run_blocking_process(
             container_program(),
             vec![
@@ -1116,8 +1252,14 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let implicit_docker_bridge =
+            runtime_handle.and_then(ImplicitDockerBridge::from_runtime_handle);
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            implicit_docker_bridge.as_ref(),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let mut args = vec![
@@ -1153,8 +1295,13 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let implicit_docker_bridge = ImplicitDockerBridge::from_runtime_handle(runtime_handle);
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            implicit_docker_bridge.as_ref(),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let args = vec![
@@ -1259,6 +1406,7 @@ impl AppleContainerRuntime {
         password: &str,
         port: u16,
         inherited_env: &[(String, String)],
+        implicit_docker_bridge: Option<&ImplicitDockerBridge>,
     ) -> Result<SpawnCommand, CombinedServiceError> {
         let image = self
             .context
@@ -1277,7 +1425,7 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         append_agent_env(&self.context, &mut env, password);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
+        self.append_implicit_env(&mut env, host_gitconfig.as_deref(), implicit_docker_bridge)
             .await?;
 
         let workspace_path = self.context.workspace_directory_path.join(key);
@@ -1473,6 +1621,7 @@ impl AppleContainerRuntime {
         &self,
         env: &mut Vec<(String, String)>,
         host_gitconfig: Option<&Path>,
+        implicit_docker_bridge: Option<&ImplicitDockerBridge>,
     ) -> Result<(), CombinedServiceError> {
         env.push((
             AUTOMATION_STATE_ENV.to_string(),
@@ -1486,6 +1635,18 @@ impl AppleContainerRuntime {
                 "GIT_CONFIG_GLOBAL".to_string(),
                 format!("{APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"),
             ));
+        }
+        if let Some(implicit_docker_bridge) = implicit_docker_bridge {
+            upsert_env(
+                env,
+                "DOCKER_HOST",
+                &implicit_docker_bridge.docker_host_value(),
+            );
+            upsert_env(
+                env,
+                "TESTCONTAINERS_HOST_OVERRIDE",
+                &implicit_docker_bridge.host,
+            );
         }
         Ok(())
     }
@@ -1526,6 +1687,551 @@ impl AppleContainerRuntime {
 
     fn is_implicitly_handled_gitconfig(&self, path: &Path, host_gitconfig: Option<&Path>) -> bool {
         host_gitconfig.is_some_and(|gitconfig| gitconfig == path)
+    }
+
+    fn docker_bridge_policy(&self) -> Result<Option<DockerBridgePolicy>, CombinedServiceError> {
+        let DockerBridgeConfig {
+            enabled,
+            allowed_images,
+        } = &self.context.runtime.docker_bridge;
+        if !enabled {
+            return Ok(None);
+        }
+
+        let normalized = normalize_allowed_docker_images(allowed_images)?;
+        if normalized.is_empty() {
+            return Err(CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge.allowed-images".to_string(),
+                message: "apple-container docker bridge requires at least one allowed image".to_string(),
+            });
+        }
+
+        Ok(Some(DockerBridgePolicy {
+            allowed_images: normalized,
+        }))
+    }
+
+    fn implicit_docker_socket_source(
+        &self,
+        env: &[(String, String)],
+        bridge_enabled: bool,
+    ) -> Result<Option<PathBuf>, CombinedServiceError> {
+        if !bridge_enabled {
+            return Ok(None);
+        }
+
+        let docker_host = env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "DOCKER_HOST")
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge".to_string(),
+                message: "apple-container docker bridge requires DOCKER_HOST to be explicitly included in isolation.inherit-env".to_string(),
+            })?;
+        let raw_socket_path = docker_host.strip_prefix("unix://").ok_or_else(|| {
+            CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge".to_string(),
+                message: format!(
+                    "apple-container docker bridge requires DOCKER_HOST to use a unix:// socket, found '{docker_host}'"
+                ),
+            }
+        })?;
+        let raw_socket_path = PathBuf::from(raw_socket_path);
+        if !raw_socket_path.is_absolute() {
+            return Err(CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge".to_string(),
+                message: format!(
+                    "apple-container docker bridge requires an absolute unix socket path, found '{}'",
+                    raw_socket_path.display()
+                ),
+            });
+        }
+
+        let source_socket = std::fs::canonicalize(&raw_socket_path).unwrap_or(raw_socket_path);
+        let metadata =
+            std::fs::metadata(&source_socket).map_err(|err| CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge".to_string(),
+                message: format!(
+                    "apple-container docker bridge could not read DOCKER_HOST socket '{}': {err}",
+                    source_socket.display()
+                ),
+            })?;
+        // Tests run in environments where binding a real Unix socket path is disallowed,
+        // so accept regular files here as stand-ins for socket fixtures.
+        if !(metadata.file_type().is_socket() || metadata.is_file()) {
+            return Err(CombinedServiceError::InvalidRuntimeConfig {
+                field: "runtime.docker-bridge".to_string(),
+                message: format!(
+                    "apple-container docker bridge requires DOCKER_HOST to reference a unix socket, found '{}'",
+                    source_socket.display()
+                ),
+            });
+        }
+
+        Ok(Some(source_socket))
+    }
+
+    async fn start_implicit_docker_bridge(
+        &self,
+        key: &str,
+        source_socket: PathBuf,
+        policy: &DockerBridgePolicy,
+    ) -> Result<ImplicitDockerBridge, CombinedServiceError> {
+        let host = APPLE_CONTAINER_HOST_GATEWAY.to_string();
+        let bind_host = APPLE_CONTAINER_HOST_GATEWAY.to_string();
+        if std::fs::metadata(&source_socket)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(ImplicitDockerBridge {
+                source_socket,
+                host,
+                bind_host,
+                host_port: 24_737,
+                pid: 0,
+            });
+        }
+        let host_port = pick_random_free_port().await?;
+        let bridge_root = self.apple_runtime_root(key).join("docker-bridge");
+        tokio::fs::create_dir_all(&bridge_root).await?;
+        let ready_path = bridge_root.join("ready");
+        let log_path = bridge_root.join("bridge.log");
+        let _ = tokio::fs::remove_file(&ready_path).await;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let log_stderr = log_file.try_clone()?;
+        let bridge_id = Uuid::new_v4().as_simple().to_string();
+        let policy_json = serde_json::to_string(&DockerBridgePolicyPayload {
+            bind_host: bind_host.clone(),
+            allowed_images: policy.allowed_images.clone(),
+            managed_labels: BTreeMap::from([
+                (
+                    APPLE_DOCKER_BRIDGE_LABEL_MANAGED.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    APPLE_DOCKER_BRIDGE_LABEL_WORKSPACE.to_string(),
+                    key.to_string(),
+                ),
+                (
+                    APPLE_DOCKER_BRIDGE_LABEL_ID.to_string(),
+                    bridge_id,
+                ),
+            ]),
+        })
+        .map_err(|err| CombinedServiceError::InvalidRuntimeConfig {
+            field: "runtime.docker-bridge".to_string(),
+            message: format!("failed to serialize docker bridge policy: {err}"),
+        })?;
+        let script = r###"
+require 'socket'
+require 'fileutils'
+require 'json'
+require 'uri'
+require 'set'
+
+bind_host = ARGV.fetch(0)
+port = Integer(ARGV.fetch(1))
+unix_path = ARGV.fetch(2)
+ready_path = ARGV.fetch(3)
+policy = JSON.parse(ARGV.fetch(4))
+$managed_containers = Set.new
+$managed_networks = Set.new
+$managed_mutex = Mutex.new
+
+def remember_managed(identifier, kind)
+  return if identifier.nil? || identifier.empty?
+  $managed_mutex.synchronize do
+    case kind
+    when :container
+      $managed_containers << identifier
+    when :network
+      $managed_networks << identifier
+    end
+  end
+end
+
+def forget_managed(identifier, kind)
+  return if identifier.nil? || identifier.empty?
+  $managed_mutex.synchronize do
+    case kind
+    when :container
+      $managed_containers.delete(identifier)
+    when :network
+      $managed_networks.delete(identifier)
+    end
+  end
+end
+
+def managed_identifier?(identifier, kind)
+  return false if identifier.nil? || identifier.empty?
+  $managed_mutex.synchronize do
+    case kind
+    when :container
+      $managed_containers.include?(identifier)
+    when :network
+      $managed_networks.include?(identifier)
+    else
+      false
+    end
+  end
+end
+
+def normalize_image_name(reference)
+  return nil if reference.nil? || reference.empty?
+  reference = reference.split('@', 2).first
+  last_slash = reference.rindex('/')
+  last_colon = reference.rindex(':')
+  if last_colon && (last_slash.nil? || last_colon > last_slash)
+    reference = reference[0...last_colon]
+  end
+  parts = reference.split('/')
+  if parts.length > 1 && (parts[0].include?('.') || parts[0].include?(':') || parts[0] == 'localhost')
+    parts = parts[1..]
+  end
+  normalized = parts.join('/')
+  normalized.empty? ? nil : normalized
+end
+
+def parse_json_body(body)
+  return {} if body.nil? || body.empty?
+  JSON.parse(body)
+rescue JSON::ParserError
+  nil
+end
+
+def managed_resource?(unix_path, resource_type, identifier, policy)
+  response = send_unix_request(
+    unix_path,
+    'GET',
+    "/v1.41/#{resource_type}/#{identifier}/json",
+    {},
+    nil
+  )
+  return false unless response[:status_code].between?(200, 299)
+  payload = parse_json_body(response[:body])
+  return false unless payload.is_a?(Hash)
+  labels =
+    case resource_type
+    when 'containers'
+      payload.dig('Config', 'Labels')
+    when 'networks'
+      payload['Labels']
+    else
+      nil
+    end
+  return false unless labels.is_a?(Hash)
+  policy.fetch('managed_labels').all? { |key, value| labels[key] == value }
+end
+
+def deny(message)
+  [false, nil, message]
+end
+
+def validate_container_create(path, body, policy)
+  payload = parse_json_body(body)
+  return deny('invalid JSON body for container create') unless payload.is_a?(Hash)
+  image = normalize_image_name(payload['Image'])
+  return deny('container image is required') if image.nil?
+  allowed_images = policy.fetch('allowed_images')
+  return deny("image '#{image}' is not allowed") unless allowed_images.include?(image)
+
+  labels = payload['Labels'].is_a?(Hash) ? payload['Labels'] : {}
+  payload['Labels'] = labels.merge(policy.fetch('managed_labels'))
+
+  host_config = payload['HostConfig'].is_a?(Hash) ? payload['HostConfig'] : {}
+  payload['HostConfig'] = host_config
+
+  return deny('privileged containers are not allowed') if host_config['Privileged']
+  return deny('host network mode is not allowed') if host_config['NetworkMode'] == 'host'
+  return deny('host PID mode is not allowed') if host_config['PidMode'] == 'host'
+  return deny('host IPC mode is not allowed') if host_config['IpcMode'] == 'host'
+  return deny('host userns mode is not allowed') if host_config['UsernsMode'] == 'host'
+  return deny('bind mounts are not allowed') if host_config['Binds'].is_a?(Array) && !host_config['Binds'].empty?
+  return deny('mounts are not allowed') if host_config['Mounts'].is_a?(Array) && !host_config['Mounts'].empty?
+  return deny('devices are not allowed') if host_config['Devices'].is_a?(Array) && !host_config['Devices'].empty?
+  return deny('device requests are not allowed') if host_config['DeviceRequests'].is_a?(Array) && !host_config['DeviceRequests'].empty?
+  return deny('extra capabilities are not allowed') if host_config['CapAdd'].is_a?(Array) && !host_config['CapAdd'].empty?
+  return deny('security options are not allowed') if host_config['SecurityOpt'].is_a?(Array) && !host_config['SecurityOpt'].empty?
+  return deny('extra hosts are not allowed') if host_config['ExtraHosts'].is_a?(Array) && !host_config['ExtraHosts'].empty?
+  return deny('volumes-from is not allowed') if host_config['VolumesFrom'].is_a?(Array) && !host_config['VolumesFrom'].empty?
+  restart_name = host_config.dig('RestartPolicy', 'Name')
+  if restart_name && !restart_name.empty? && restart_name != 'no'
+    return deny('restart policies other than no are not allowed')
+  end
+
+  if host_config['PortBindings'].is_a?(Hash)
+    host_config['PortBindings'].each_value do |bindings|
+      next unless bindings.is_a?(Array)
+      bindings.each do |binding|
+        next unless binding.is_a?(Hash)
+        binding['HostIp'] = policy.fetch('bind_host')
+      end
+    end
+  end
+
+  [true, JSON.generate(payload), nil]
+end
+
+def validate_network_create(body, policy)
+  payload = parse_json_body(body)
+  return deny('invalid JSON body for network create') unless payload.is_a?(Hash)
+  labels = payload['Labels'].is_a?(Hash) ? payload['Labels'] : {}
+  payload['Labels'] = labels.merge(policy.fetch('managed_labels'))
+  [true, JSON.generate(payload), nil]
+end
+
+def validate_network_connect(body, unix_path, path, policy)
+  payload = parse_json_body(body)
+  return deny('invalid JSON body for network connect') unless payload.is_a?(Hash)
+  return deny('network is not managed by multicode') unless managed_resource?(unix_path, 'networks', path.split('/')[3], policy)
+  container = payload['Container']
+  return deny('network connect requires a container') if container.nil? || container.to_s.empty?
+  return deny('container is not managed by multicode') unless managed_resource?(unix_path, 'containers', container, policy)
+  [true, JSON.generate(payload), nil]
+end
+
+def request_allowed?(method, path, body, unix_path, policy)
+  uri = URI.parse(path)
+  normalized_path = uri.path.sub(%r{\A/v\d+\.\d+}, '')
+  case [method, normalized_path]
+  when ['GET', '/_ping'], ['GET', '/version'], ['GET', '/info']
+    [true, body, nil]
+  when ['POST', '/images/create']
+    image = normalize_image_name(URI.decode_www_form(uri.query.to_s).to_h['fromImage'])
+    return deny('requested image is not allowed') unless image && policy.fetch('allowed_images').include?(image)
+    [true, body, nil]
+  when ['POST', '/containers/create']
+    validate_container_create(path, body, policy)
+  when ['POST', '/networks/create']
+    validate_network_create(body, policy)
+  else
+    if normalized_path =~ %r{\A/containers/([^/]+)/(start|stop|wait)\z}
+      identifier = Regexp.last_match(1)
+      return deny('container is not managed by multicode') unless managed_identifier?(identifier, :container) || managed_resource?(unix_path, 'containers', identifier, policy)
+      return [true, body, nil]
+    end
+    if method == 'POST' && normalized_path =~ %r{\A/networks/([^/]+)/connect\z}
+      return validate_network_connect(body, unix_path, path, policy)
+    end
+    if normalized_path =~ %r{\A/containers/([^/]+)/(json|logs)\z}
+      identifier = Regexp.last_match(1)
+      return deny('container is not managed by multicode') unless managed_identifier?(identifier, :container) || managed_resource?(unix_path, 'containers', identifier, policy)
+      return [true, body, nil]
+    end
+    if method == 'DELETE' && normalized_path =~ %r{\A/containers/([^/]+)\z}
+      identifier = Regexp.last_match(1)
+      return deny('container is not managed by multicode') unless managed_identifier?(identifier, :container) || managed_resource?(unix_path, 'containers', identifier, policy)
+      return [true, body, nil]
+    end
+    if normalized_path =~ %r{\A/networks/([^/]+)\z}
+      identifier = Regexp.last_match(1)
+      return deny('network is not managed by multicode') unless managed_identifier?(identifier, :network) || managed_resource?(unix_path, 'networks', identifier, policy)
+      return [true, body, nil] if method == 'GET' || method == 'DELETE'
+    end
+    deny("docker API endpoint '#{method} #{normalized_path}' is not allowed")
+  end
+rescue URI::InvalidURIError
+  deny('invalid request path')
+end
+
+def read_headers(io)
+  headers = {}
+  while (line = io.gets("\r\n"))
+    break if line == "\r\n"
+    name, value = line.split(':', 2)
+    next if name.nil? || value.nil?
+    headers[name] = value.strip
+  end
+  headers
+end
+
+def read_request(io)
+  request_line = io.gets("\r\n")
+  return nil if request_line.nil?
+  method, path, version = request_line.strip.split(' ', 3)
+  return nil if method.nil? || path.nil? || version.nil?
+  headers = read_headers(io)
+  return :unsupported_transfer_encoding if headers.key?('Transfer-Encoding')
+  content_length = headers.fetch('Content-Length', '0').to_i
+  body = content_length.positive? ? io.read(content_length) : ''.b
+  { method: method, path: path, version: version, headers: headers, body: body }
+end
+
+def read_http_response(io)
+  status_line = io.gets("\r\n")
+  raise 'missing HTTP status line from Docker socket' if status_line.nil?
+  version, status_code, reason = status_line.strip.split(' ', 3)
+  headers = read_headers(io)
+  body =
+    if headers['Transfer-Encoding']&.downcase == 'chunked'
+      raw = ''.b
+      loop do
+        size_line = io.gets("\r\n")
+        raise 'missing chunk size' if size_line.nil?
+        raw << size_line
+        size = size_line.strip.to_i(16)
+        if size.zero?
+          trailer = io.gets("\r\n")
+          raw << trailer.to_s
+          break
+        end
+        chunk = io.read(size + 2)
+        raw << chunk.to_s
+      end
+      raw
+    elsif headers['Content-Length']
+      io.read(headers['Content-Length'].to_i) || ''.b
+    else
+      io.read || ''.b
+    end
+  { version: version, status_code: status_code.to_i, reason: reason.to_s, headers: headers, body: body }
+end
+
+def write_http_response(io, response)
+  headers = response[:headers].dup
+  headers['Connection'] = 'close'
+  io.write("#{response[:version]} #{response[:status_code]} #{response[:reason]}\r\n")
+  headers.each { |name, value| io.write("#{name}: #{value}\r\n") }
+  io.write("\r\n")
+  io.write(response[:body]) unless response[:body].nil? || response[:body].empty?
+end
+
+def send_unix_request(unix_path, method, path, headers, body)
+  body = ''.b if body.nil?
+  unix_client = UNIXSocket.new(unix_path)
+  begin
+    unix_client.write("#{method} #{path} HTTP/1.1\r\n")
+    forwarded_headers = headers.dup
+    forwarded_headers['Host'] ||= 'docker'
+    forwarded_headers['Connection'] = 'close'
+    forwarded_headers['Content-Length'] = body.bytesize.to_s
+    forwarded_headers.each { |name, value| unix_client.write("#{name}: #{value}\r\n") }
+    unix_client.write("\r\n")
+    unix_client.write(body) unless body.nil? || body.empty?
+    unix_client.close_write
+    read_http_response(unix_client)
+  ensure
+    unix_client.close rescue nil
+  end
+end
+
+server = TCPServer.new(bind_host, port)
+File.write(ready_path, Process.pid.to_s)
+
+Signal.trap('TERM') { exit! 0 }
+Signal.trap('INT') { exit! 0 }
+
+loop do
+  client = server.accept
+  Thread.new(client) do |tcp_client|
+    begin
+      request = read_request(tcp_client)
+      if request == :unsupported_transfer_encoding
+        tcp_client.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 38\r\n\r\nchunked request bodies are not supported")
+        next
+      end
+      next if request.nil?
+
+      allowed, forwarded_body, message =
+        request_allowed?(request[:method], request[:path], request[:body], unix_path, policy)
+      unless allowed
+        payload = JSON.generate({ error: message })
+        tcp_client.write("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: #{payload.bytesize}\r\n\r\n#{payload}")
+        next
+      end
+
+      request[:headers].delete('Proxy-Connection')
+      response = send_unix_request(
+        unix_path,
+        request[:method],
+        request[:path],
+        request[:headers],
+        forwarded_body || ''.b
+      )
+      begin
+        uri = URI.parse(request[:path])
+        normalized_path = uri.path.sub(%r{\A/v\d+\.\d+}, '')
+        if request[:method] == 'POST' && normalized_path == '/containers/create' && response[:status_code].between?(200, 299)
+          payload = parse_json_body(response[:body])
+          remember_managed(payload['Id'], :container) if payload.is_a?(Hash)
+          remember_managed(URI.decode_www_form(uri.query.to_s).to_h['name'], :container)
+        elsif request[:method] == 'POST' && normalized_path == '/networks/create' && response[:status_code].between?(200, 299)
+          payload = parse_json_body(response[:body])
+          remember_managed(payload['Id'], :network) if payload.is_a?(Hash)
+        elsif request[:method] == 'DELETE' && normalized_path =~ %r{\A/containers/([^/]+)\z} && response[:status_code].between?(200, 299)
+          forget_managed(Regexp.last_match(1), :container)
+        elsif request[:method] == 'DELETE' && normalized_path =~ %r{\A/networks/([^/]+)\z} && response[:status_code].between?(200, 299)
+          forget_managed(Regexp.last_match(1), :network)
+        end
+      rescue StandardError
+      end
+      write_http_response(tcp_client, response)
+    rescue StandardError => error
+      warn(error.full_message)
+      payload = JSON.generate({ error: error.message })
+      tcp_client.write("HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: #{payload.bytesize}\r\n\r\n#{payload}") rescue nil
+    ensure
+      tcp_client.close rescue nil
+    end
+  end
+end
+"###;
+        let mut child = Command::new("/usr/bin/ruby");
+        child
+            .arg("-e")
+            .arg(script)
+            .arg(bind_host.clone())
+            .arg(host_port.to_string())
+            .arg(source_socket.to_string_lossy().into_owned())
+            .arg(ready_path.to_string_lossy().into_owned())
+            .arg(policy_json)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_stderr));
+        let mut child = child.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| CombinedServiceError::StartWorkspaceFailed {
+                status: None,
+                stderr: "docker bridge process did not report a pid".to_string(),
+            })?;
+
+        let started = wait_for_file_or_child_exit(&ready_path, &mut child).await?;
+        if !started {
+            return Err(CombinedServiceError::StartWorkspaceFailed {
+                status: None,
+                stderr: format!(
+                    "docker bridge process exited before becoming ready; see {}",
+                    log_path.display()
+                ),
+            });
+        }
+
+        Ok(ImplicitDockerBridge {
+            source_socket,
+            host,
+            bind_host,
+            host_port,
+            pid,
+        })
+    }
+
+    async fn stop_implicit_docker_bridge(implicit_docker_bridge: &ImplicitDockerBridge) {
+        if implicit_docker_bridge.pid == 0 {
+            return;
+        }
+        let _ = Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(implicit_docker_bridge.pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 
     async fn build_aggregated_skill_mount(
@@ -1657,6 +2363,54 @@ fn ensure_pty_terminal_env(env: &mut Vec<(String, String)>) {
     if env.iter().all(|(name, _)| name != "COLORTERM") {
         env.push(("COLORTERM".to_string(), "truecolor".to_string()));
     }
+}
+
+fn normalize_docker_image_name(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return None;
+    }
+
+    let reference = reference.split('@').next().unwrap_or(reference);
+    let last_slash = reference.rfind('/');
+    let last_colon = reference.rfind(':');
+    let reference = if let Some(last_colon) = last_colon {
+        if last_slash.is_none_or(|last_slash| last_colon > last_slash) {
+            &reference[..last_colon]
+        } else {
+            reference
+        }
+    } else {
+        reference
+    };
+
+    let mut segments = reference.split('/').collect::<Vec<_>>();
+    if segments.len() > 1
+        && (segments[0].contains('.') || segments[0].contains(':') || segments[0] == "localhost")
+    {
+        segments.remove(0);
+    }
+    let normalized = segments.join("/");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_allowed_docker_images(
+    allowed_images: &[String],
+) -> Result<Vec<String>, CombinedServiceError> {
+    let mut normalized = allowed_images
+        .iter()
+        .map(|image| {
+            normalize_docker_image_name(image).ok_or_else(|| {
+                CombinedServiceError::InvalidRuntimeConfig {
+                    field: "runtime.docker-bridge.allowed-images".to_string(),
+                    message: format!("invalid allowed docker image '{image}'"),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -1819,6 +2573,22 @@ fn container_program() -> String {
 fn apple_container_start_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn wait_for_file_or_child_exit(
+    path: &Path,
+    child: &mut tokio::process::Child,
+) -> Result<bool, CombinedServiceError> {
+    for _ in 0..50 {
+        if tokio::fs::metadata(path).await.is_ok() {
+            return Ok(true);
+        }
+        if child.try_wait()?.is_some() {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(tokio::fs::metadata(path).await.is_ok())
 }
 
 fn container_delete_reports_missing(stderr: &str) -> bool {
@@ -2157,6 +2927,7 @@ mod tests {
                     image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
                     opencode_image: None,
                     codex_image: None,
+                    docker_bridge: DockerBridgeConfig::default(),
                 },
                 workspace_directory_path: root.path().join("workspaces"),
                 expanded_isolation,
@@ -2182,6 +2953,7 @@ mod tests {
                     image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
                     opencode_image: None,
                     codex_image: None,
+                    docker_bridge: DockerBridgeConfig::default(),
                 },
                 workspace_directory_path: root.path().join("workspaces"),
                 expanded_isolation,
@@ -2223,6 +2995,22 @@ mod tests {
         assert!(!container_delete_reports_missing(
             "Error: failed to delete one or more containers: permission denied"
         ));
+    }
+
+    #[test]
+    fn normalize_docker_image_name_strips_registry_and_tag() {
+        assert_eq!(
+            normalize_docker_image_name("docker.io/library/mysql:8.4"),
+            Some("library/mysql".to_string())
+        );
+        assert_eq!(
+            normalize_docker_image_name("mysql:8.4"),
+            Some("mysql".to_string())
+        );
+        assert_eq!(
+            normalize_docker_image_name("ghcr.io/testcontainers/ryuk:0.11.0"),
+            Some("testcontainers/ryuk".to_string())
+        );
     }
 
     #[test]
@@ -2276,6 +3064,7 @@ mod tests {
                         "HOME".to_string(),
                         root.path().to_string_lossy().into_owned(),
                     )],
+                    None,
                 )
                 .await
                 .expect("command should build");
@@ -2334,6 +3123,7 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = apple_container_start_lock().lock().await;
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let home = root.path().join("home");
@@ -2373,6 +3163,7 @@ mod tests {
                     "secret",
                     31337,
                     &[("HOME".to_string(), home.to_string_lossy().into_owned())],
+                    None,
                 )
                 .await
                 .expect("command should build");
@@ -2607,6 +3398,7 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = apple_container_start_lock().lock().await;
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let home = root.path().join("home");
@@ -2628,6 +3420,7 @@ mod tests {
                     "secret",
                     31337,
                     &[("HOME".to_string(), home.to_string_lossy().into_owned())],
+                    None,
                 )
                 .await
                 .expect("command should build");
@@ -2668,6 +3461,113 @@ mod tests {
                     "GIT_CONFIG_GLOBAL={APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"
                 )),
                 "apple backend should point git at the synthetic mounted gitconfig"
+            );
+        });
+    }
+
+    #[test]
+    fn apple_container_implicitly_mounts_host_docker_socket_from_docker_host() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            use std::os::unix::fs::symlink;
+
+            let _env_lock = apple_container_start_lock().lock().await;
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let socket_root = root.path().join("podman");
+            let real_socket = socket_root.join("podman-machine-default-api.sock");
+            let logical_socket_root = root.path().join("docker-host");
+            let logical_socket = logical_socket_root.join("podman.sock");
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(&socket_root).expect("socket root should exist");
+            fs::create_dir_all(&logical_socket_root).expect("logical socket root should exist");
+            fs::write(&real_socket, "socket").expect("docker socket fixture should exist");
+            symlink(&real_socket, &logical_socket).expect("logical socket symlink should exist");
+
+            let mut runtime = apple_runtime(
+                &root,
+                IsolationConfig {
+                    inherit_env: vec!["DOCKER_HOST".to_string()],
+                    ..IsolationConfig::default()
+                },
+            );
+            runtime.context.runtime.docker_bridge = DockerBridgeConfig {
+                enabled: true,
+                allowed_images: vec!["mysql".to_string()],
+            };
+            let source_socket = runtime
+                .implicit_docker_socket_source(
+                    &[(
+                        "DOCKER_HOST".to_string(),
+                        format!("unix://{}", logical_socket.display()),
+                    )],
+                    true,
+                )
+                .expect("docker socket source should be readable")
+                .expect("docker socket source should be detected");
+            let bridge = runtime
+                .start_implicit_docker_bridge(
+                    "alpha",
+                    source_socket.clone(),
+                    &runtime
+                        .docker_bridge_policy()
+                        .expect("docker bridge policy should build")
+                        .expect("docker bridge policy should be enabled"),
+                )
+                .await
+                .expect("docker bridge should start");
+            let command = runtime
+                .build_run_command(
+                    "alpha",
+                    "multicode-alpha",
+                    "secret",
+                    31337,
+                    &[(
+                        "DOCKER_HOST".to_string(),
+                        format!("unix://{}", logical_socket.display()),
+                    )],
+                    Some(&bridge),
+                )
+                .await
+                .expect("command should build");
+            let server_env = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("server.env");
+            AppleContainerRuntime::stop_implicit_docker_bridge(&bridge).await;
+
+            let resolved_socket = std::fs::canonicalize(&real_socket)
+                .expect("resolved docker socket path should exist");
+            assert_eq!(source_socket, resolved_socket);
+            assert!(
+                !command.args.iter().any(|arg| {
+                    arg.contains("type=bind") && arg.contains("podman-machine-default-api.sock")
+                }),
+                "apple backend should not mount the host docker socket directly"
+            );
+            assert!(
+                bridge.host_port > 0,
+                "docker bridge should expose a host port"
+            );
+            let env_contents =
+                fs::read_to_string(&server_env).expect("server env file should be written");
+            assert!(
+                env_contents.contains(&format!(
+                    "DOCKER_HOST=tcp://{APPLE_CONTAINER_HOST_GATEWAY}:{}",
+                    bridge.host_port
+                )),
+                "apple backend should rewrite DOCKER_HOST to the host TCP bridge"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={APPLE_CONTAINER_HOST_GATEWAY}"
+                )),
+                "apple backend should tell Testcontainers which host gateway to use"
             );
         });
     }
@@ -2841,6 +3741,7 @@ mod tests {
                         "HOME".to_string(),
                         home.to_string_lossy().into_owned(),
                     )],
+                    None,
                 )
                 .await
                 .expect("command should build");
@@ -2910,6 +3811,7 @@ mod tests {
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
                         opencode_image: None,
                         codex_image: None,
+                        docker_bridge: DockerBridgeConfig::default(),
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -2940,7 +3842,7 @@ mod tests {
             };
 
             let command = runtime
-                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[], None)
                 .await
                 .expect("command should build");
 
@@ -3008,6 +3910,7 @@ mod tests {
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
                         opencode_image: None,
                         codex_image: None,
+                        docker_bridge: DockerBridgeConfig::default(),
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -3032,7 +3935,7 @@ mod tests {
             };
 
             let command = runtime
-                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[], None)
                 .await
                 .expect("command should build");
 
@@ -3110,6 +4013,7 @@ mod tests {
                         image: Some("ghcr.io/example/multicode-java25:latest".to_string()),
                         opencode_image: None,
                         codex_image: None,
+                        docker_bridge: DockerBridgeConfig::default(),
                     },
                     workspace_directory_path: workspace_root.clone(),
                     expanded_isolation: ExpandedIsolationConfig {
@@ -3134,7 +4038,7 @@ mod tests {
             };
 
             runtime
-                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[])
+                .build_run_command("alpha", "multicode-alpha", "secret", 31337, &[], None)
                 .await
                 .expect("run command should build");
             let aggregate_root = workspace_root

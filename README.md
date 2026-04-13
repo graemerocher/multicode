@@ -156,6 +156,62 @@ state:
 - If you want GitHub integration or MCP access inside the container, configure `[github]` and
   pass through any required token env vars with `[isolation].inherit-env`.
 
+If you want Docker-based integration tests such as Testcontainers to work inside Apple-container
+workspaces, there is one more important host requirement:
+
+- The host must expose a working Docker-compatible API over a Unix socket, and `DOCKER_HOST`
+  on the host must point to that socket with a `unix://...` URL.
+- On macOS with Podman, a working example is:
+
+```bash
+export DOCKER_HOST=unix://$HOME/.local/share/containers/podman/machine/podman.sock
+```
+
+- multicode only enables the Apple-container Docker bridge when `[runtime.docker-bridge].enabled`
+  is set to `true`.
+- When enabled, multicode detects that host Unix socket and starts a host-side TCP bridge for each
+  Apple workspace.
+- Inside the Apple container it then exports:
+  - `DOCKER_HOST=tcp://192.168.64.1:<ephemeral-port>`
+  - `TESTCONTAINERS_HOST_OVERRIDE=192.168.64.1`
+
+This matters because directly bind-mounting the host Unix socket into an Apple container is not
+sufficient for real Docker/Testcontainers traffic. The bridge is what makes the host Podman/Docker
+API reachable from inside the Apple container.
+
+The bridge is intentionally hardened:
+
+- It binds to the Apple-container gateway address instead of `0.0.0.0`.
+- It is disabled by default.
+- It only allows a configured image allowlist.
+- It rejects privileged containers, host network / host PID / host IPC modes, bind mounts, extra
+  capabilities, and other unsafe Docker options.
+
+To enable it, configure both the inherited host socket env var and an explicit allowlist:
+
+```toml
+[runtime.docker-bridge]
+enabled = true
+allowed-images = ["mysql", "postgres", "testcontainers/ryuk"]
+```
+
+Practical checklist for Docker/Testcontainers on Apple containers:
+
+1. Install and start Podman or Docker on the host.
+2. Verify the host socket works before starting multicode.
+3. Export `DOCKER_HOST=unix://...` in the shell that launches `multicode-tui`.
+4. Include `"DOCKER_HOST"` in `[isolation].inherit-env`.
+5. Configure `[runtime.docker-bridge]` with `enabled = true` and an `allowed-images` list.
+6. Use an Apple container image that includes the language/runtime your tests need.
+
+For example, with Podman:
+
+```bash
+podman system connection list
+export DOCKER_HOST=unix://$HOME/.local/share/containers/podman/machine/podman.sock
+cargo run --bin multicode-tui config.toml
+```
+
 The minimum setup flow on macOS is therefore:
 
 1. Install and verify the Apple `container` CLI on the host.

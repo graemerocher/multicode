@@ -139,6 +139,8 @@ pub struct RuntimeConfig {
     pub opencode_image: Option<String>,
     #[serde(default)]
     pub codex_image: Option<String>,
+    #[serde(default)]
+    pub docker_bridge: DockerBridgeConfig,
 }
 
 impl RuntimeConfig {
@@ -148,6 +150,15 @@ impl RuntimeConfig {
             AgentProvider::Codex => self.codex_image.as_deref(),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct DockerBridgeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_images: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
