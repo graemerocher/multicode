@@ -9,6 +9,7 @@ use std::os::unix::fs::FileTypeExt;
 
 const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
 const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
+const CODEX_CREATE_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing. Create or update the pull request now from this task checkout. Push the branch if needed, use the correct upstream base branch, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements, assign the pull request to yourself, request Copilot review, emit the <multicode:pr> link, and stop once the PR is ready for human review. If a PR already exists, update it instead of creating a duplicate. Do not merge the PR.";
 
 pub(crate) fn count_codex_session_turn_metrics(contents: &str) -> CodexSessionTurnMetrics {
     CodexSessionTurnMetrics {
@@ -1164,6 +1165,62 @@ impl TuiState {
         )
     }
 
+    fn selected_task_can_request_pr_creation(&self) -> bool {
+        if self.selected_link_index.is_some() {
+            return false;
+        }
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return false;
+        }
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
+            return false;
+        };
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        workspace_is_usable(snapshot)
+            && workspace_state(snapshot) == WorkspaceUiState::Started
+            && task_persistent_snapshot(snapshot, task_id).is_some()
+    }
+
+    async fn approve_selected_task_for_pr_creation(&mut self) {
+        if !self.selected_task_can_request_pr_creation() {
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            return;
+        };
+
+        match self
+            .service
+            .prompt_task_session(
+                &workspace_key,
+                &snapshot,
+                &task_id,
+                CODEX_CREATE_PR_APPROVAL_PROMPT,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.mark_task_resuming_in_background(&workspace_key, &task_id);
+                self.status = format!(
+                    "Approved local changes for '{task_id}' in workspace '{workspace_key}'; asked Codex to create or update the PR"
+                );
+            }
+            Err(err) => {
+                self.status = format!(
+                    "Failed to approve local changes for '{task_id}' in workspace '{workspace_key}': {err}"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn handle_key(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2035,6 +2092,7 @@ impl TuiState {
                     return;
                 }
                 if self.selected_task_id().is_some() {
+                    self.approve_selected_task_for_pr_creation().await;
                     return;
                 }
                 if let Some(key) = self.selected_workspace_key().map(str::to_string) {

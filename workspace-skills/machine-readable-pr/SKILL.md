@@ -23,6 +23,15 @@ If the PR resolves a specific issue, when writing the PR description, end it wit
 
 If you have write permission to the upstream repo, prefer pushing the PR branch there instead of in a fork.
 
+When creating or updating the PR, add an appropriate type label. Choose the closest match for the actual change, for example:
+
+- `type: docs` for documentation-only updates
+- `type: bug` for bug fixes
+- `type: improvement` for minor improvements
+- `type: enhancement` for broader enhancements
+
+Do not skip the label when the repository has a matching label available.
+
 Do not merge pull requests yourself. A PR should be merged by a human, not by the agent.
 
 The only exception is an explicit dependency-upgrade workflow where the user or repository policy already allows automated merging for that upgrade task. Outside that narrow case, stop at review-ready and leave the PR open.

@@ -239,6 +239,16 @@ fn workspace_supports_pause(snapshot: &WorkspaceSnapshot) -> bool {
             || !snapshot.persistent.tasks.is_empty())
 }
 
+fn workspace_supports_task_approval(snapshot: &WorkspaceSnapshot) -> bool {
+    workspace_is_usable(snapshot)
+        && workspace_state(snapshot) == WorkspaceUiState::Started
+        && snapshot
+            .transient
+            .as_ref()
+            .and_then(|transient| Url::parse(&transient.uri).ok())
+            .is_some_and(|uri| matches!(uri.scheme(), "ws" | "wss"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WorkspaceLinkKind {
     Review,
@@ -1274,6 +1284,9 @@ fn help_line(
                         }
                         if selected_workspace_can_compare {
                             push_hotkey(&mut spans, "c", " compare  ");
+                        }
+                        if workspace_supports_task_approval(snapshot) {
+                            push_hotkey(&mut spans, "a", " approve  ");
                         }
                         push_hotkey(&mut spans, "x", " remove issue  ");
                         push_hotkey(&mut spans, "q", " quit");

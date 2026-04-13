@@ -2121,10 +2121,42 @@ mod tests {
         assert!(text.contains("Enter attach"));
         assert!(text.contains("c compare"));
         assert!(text.contains("x remove issue"));
+        assert!(!text.contains("a approve"));
         assert!(!text.contains("i issue"));
         assert!(!text.contains("d edit description"));
         assert!(!text.contains("a archive"));
         assert!(!text.contains("r recheck GH status"));
+    }
+
+    #[test]
+    fn help_line_shows_approve_hotkey_for_codex_task_row_focus() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        let line = help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("a approve"));
+        assert!(!text.contains("a archive"));
     }
 
     #[test]

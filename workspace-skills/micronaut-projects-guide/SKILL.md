@@ -39,7 +39,8 @@ The only exception is an explicit dependency-upgrade use case where automated me
 
 Tag PRs with the following GitHub tags where appropriate:
 
+- `type: docs`
 - `type: bug`
 - `type: improvement`
+- `type: enhancement`
 - `type: breaking`
-
