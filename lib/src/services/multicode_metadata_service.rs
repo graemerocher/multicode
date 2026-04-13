@@ -509,16 +509,27 @@ fn collect_metadata_from_codex_turns<'a>(
     let mut metadata = MulticodeMetadata::default();
     for turn in turns {
         for item in &turn.items {
-            if item.get("type").and_then(serde_json::Value::as_str) != Some("agentMessage") {
-                continue;
-            }
-            let Some(text) = item.get("text").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            merge_text_metadata(text, &mut metadata);
+            merge_json_metadata(item, &mut metadata);
         }
     }
     metadata
+}
+
+fn merge_json_metadata(item: &serde_json::Value, metadata: &mut MulticodeMetadata) {
+    match item {
+        serde_json::Value::String(text) => merge_text_metadata(text, metadata),
+        serde_json::Value::Array(items) => {
+            for value in items {
+                merge_json_metadata(value, metadata);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for value in entries.values() {
+                merge_json_metadata(value, metadata);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +805,23 @@ mod tests {
         assert_eq!(
             metadata.prs,
             BTreeSet::from(["https://github.com/acme/core/pull/99".to_string()])
+        );
+    }
+
+    #[test]
+    fn collects_metadata_from_codex_tool_output_items() {
+        let turns = vec![super::super::codex_app_server::CodexThreadTurn {
+            items: vec![serde_json::json!({
+                "type": "toolCallOutput",
+                "output": "stdout\n<multicode:pr>https://github.com/acme/core/pull/101</multicode:pr>\n"
+            })],
+        }];
+
+        let metadata = collect_metadata_from_codex_turns(turns.iter());
+
+        assert_eq!(
+            metadata.prs,
+            BTreeSet::from(["https://github.com/acme/core/pull/101".to_string()])
         );
     }
 }

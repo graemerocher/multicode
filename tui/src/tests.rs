@@ -296,16 +296,59 @@ mod tests {
     }
 
     #[test]
-    fn workspace_links_hide_issue_and_pr_when_tasks_exist() {
+    fn workspace_links_prefer_active_task_issue_and_pr_when_tasks_exist() {
         let mut started = snapshot(true, Some("http://example"));
-        started.persistent.agent_provided.repo = vec!["/tmp/repo-a".to_string()];
-        started.persistent.agent_provided.issue = vec!["https://example.com/issue/3".to_string()];
-        started.persistent.agent_provided.pr = vec!["https://example.com/pull/4".to_string()];
         assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        if let Some(task) = started
+            .persistent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-42")
+        {
+            task.backing_pr_url = Some("https://github.com/example/repo/pull/322".to_string());
+        }
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                ..Default::default()
+            },
+        );
 
-        let links = workspace_links(&started);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].kind, WorkspaceLinkKind::Review);
+        let links = workspace_issue_pr_links(&started);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].kind, WorkspaceLinkKind::Issue);
+        assert_eq!(links[0].value, "https://github.com/example/repo/issues/42");
+        assert_eq!(links[1].kind, WorkspaceLinkKind::Pr);
+        assert_eq!(links[1].value, "https://github.com/example/repo/pull/322");
+    }
+
+    #[test]
+    fn workspace_links_keep_active_task_pr_when_task_is_in_review() {
+        let mut started = snapshot(true, Some("http://example"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        if let Some(task) = started
+            .persistent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-42")
+        {
+            task.backing_pr_url = Some("https://github.com/example/repo/pull/322".to_string());
+        }
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-42".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        let links = workspace_issue_pr_links(&started);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].kind, WorkspaceLinkKind::Issue);
+        assert_eq!(links[1].kind, WorkspaceLinkKind::Pr);
+        assert_eq!(links[1].value, "https://github.com/example/repo/pull/322");
     }
 
     #[test]
@@ -395,6 +438,30 @@ mod tests {
     }
 
     #[test]
+    fn task_description_prefers_pr_created_for_review_task_with_persisted_pr() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-39".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/39".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        )
+        .with_backing_pr_url(Some(
+            "https://github.com/graemerocher/multicode-test/pull/338".to_string(),
+        ));
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-39".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Review),
+            status: Some("Review multicode-test#39".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::task_description(&task, Some(&task_state)),
+            "PR created #338"
+        );
+    }
+
+    #[test]
     fn task_auto_resume_after_attach_only_resumes_when_task_is_still_working() {
         let review_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
             session_id: Some("thread-4".to_string()),
@@ -416,6 +483,38 @@ mod tests {
         };
         assert!(should_auto_resume_task_codex_after_attach(
             Some(&busy_state),
+            Some("thread-4"),
+            Some(AutomationAgentState::Working)
+        ));
+    }
+
+    #[test]
+    fn task_auto_resume_after_attach_resumes_when_working_task_loses_session() {
+        let lost_session_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: None,
+            session_status: None,
+            agent_state: None,
+            ..Default::default()
+        };
+
+        assert!(should_auto_resume_task_codex_after_attach(
+            Some(&lost_session_state),
+            Some("thread-4"),
+            Some(AutomationAgentState::Working)
+        ));
+    }
+
+    #[test]
+    fn task_auto_resume_after_attach_resumes_stale_working_task() {
+        let stale_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-4".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Stale),
+            ..Default::default()
+        };
+
+        assert!(should_auto_resume_task_codex_after_attach(
+            Some(&stale_state),
             Some("thread-4"),
             Some(AutomationAgentState::Working)
         ));
@@ -1702,6 +1801,86 @@ mod tests {
             .collect::<String>();
         assert!(!stopped_text.contains("Enter attach"));
         assert!(stopped_text.contains("Enter start+attach"));
+    }
+
+    #[test]
+    fn help_line_shows_pause_or_resume_only_for_started_automation_workspace() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository = Some("example/repo".to_string());
+        let started_line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let started_text = started_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(started_text.contains("p pause"));
+
+        started.persistent.automation_paused = true;
+        let paused_line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&started),
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let paused_text = paused_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(paused_text.contains("p resume"));
+
+        let stopped = snapshot(false, None);
+        let stopped_line = help_line(
+            UiMode::Normal,
+            1,
+            1,
+            Some(&stopped),
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let stopped_text = stopped_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!stopped_text.contains("p pause"));
+        assert!(!stopped_text.contains("p resume"));
     }
 
     #[test]

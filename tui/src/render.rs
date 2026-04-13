@@ -192,6 +192,20 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                                 },
                             ),
                         )
+                    } else if pr_link.is_some() {
+                        (
+                            status_icon_cell(
+                                StatusIconKind::GitPullRequest,
+                                if archived {
+                                    Color::DarkGray
+                                } else {
+                                    Color::Green
+                                },
+                                selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                            ),
+                            Cell::default(),
+                            Cell::default(),
+                        )
                     } else {
                         (Cell::default(), Cell::default(), Cell::default())
                     };
@@ -273,6 +287,16 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                     status_icon_cell(
                         kind,
                         if archived { Color::DarkGray } else { color },
+                        selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                    )
+                } else if pr_link.is_some() {
+                    status_icon_cell(
+                        StatusIconKind::GitPullRequest,
+                        if archived {
+                            Color::DarkGray
+                        } else {
+                            Color::Green
+                        },
                         selected_link_kind == Some(WorkspaceLinkKind::Pr),
                     )
                 } else {

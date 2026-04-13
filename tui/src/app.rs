@@ -251,9 +251,14 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
     };
 
     if let Some(attached_session_id) = attached_session_id
-        && task_state.session_id.as_deref() != Some(attached_session_id)
+        && let Some(current_session_id) = task_state.session_id.as_deref()
+        && current_session_id != attached_session_id
     {
         return false;
+    }
+
+    if task_state.agent_state == Some(AutomationAgentState::Stale) {
+        return matches!(initial_agent_state, Some(AutomationAgentState::Working));
     }
 
     match task_effective_agent_state(Some(task_state)) {
@@ -262,9 +267,12 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
             AutomationAgentState::WaitingOnVm
             | AutomationAgentState::Question
             | AutomationAgentState::Review
-            | AutomationAgentState::Idle
-            | AutomationAgentState::Stale,
+            | AutomationAgentState::Idle,
         ) => false,
+        Some(AutomationAgentState::Stale) => false,
+        None if attached_session_id.is_some() && task_state.session_id.is_none() => {
+            matches!(initial_agent_state, Some(AutomationAgentState::Working))
+        }
         None => matches!(initial_agent_state, Some(AutomationAgentState::Working)),
     }
 }
@@ -900,6 +908,10 @@ impl TuiState {
                     continue;
                 };
                 self.github_link_status_rxs.insert(link.clone(), receiver);
+                let _ = self
+                    .service
+                    .github_status_service()
+                    .request_refresh(validated_link);
             }
 
             let status = self
@@ -2175,6 +2187,47 @@ impl TuiState {
                             }
                         }
                         None => {}
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_some() {
+                    return;
+                }
+                if let Some(key) = self.selected_workspace_key().map(str::to_string) {
+                    let Some(snapshot) = self.snapshots.get(&key).cloned() else {
+                        return;
+                    };
+                    if !workspace_supports_pause(&snapshot) {
+                        return;
+                    }
+                    if snapshot.persistent.automation_paused {
+                        match self.service.resume_workspace(&key) {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Resumed autonomous work for workspace '{key}'")
+                            }
+                            Err(err) => {
+                                self.status = format!(
+                                    "Failed to resume autonomous work for workspace '{key}': {err:?}"
+                                )
+                            }
+                        }
+                    } else {
+                        match self.service.pause_workspace(&key).await {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Paused autonomous work for workspace '{key}'")
+                            }
+                            Err(err) => {
+                                self.status = format!(
+                                    "Failed to pause autonomous work for workspace '{key}': {err:?}"
+                                )
+                            }
+                        }
                     }
                 }
             }

@@ -12,6 +12,7 @@ use tokio::{
     task::spawn_blocking,
     time::{Instant, sleep, sleep_until},
 };
+use url::Url;
 
 use super::{
     CombinedService, GithubStatus,
@@ -298,7 +299,7 @@ async fn watch_workspace(
             previous_active_issue_url = None;
             previous_root_status = snapshot.root_session_status;
             clear_automation_runtime_state(&workspace);
-            set_automation_status(&workspace, Some(format!("Stopped {repository_label}")));
+            set_automation_status(&workspace, Some(format!("Paused {repository_label}")));
             if workspace_rx.changed().await.is_err() {
                 break;
             }
@@ -450,6 +451,31 @@ async fn watch_workspace(
                 "autonomous workspace scheduling decision"
             );
             if scan_requested {
+                match resolved_gh_token(&service).await {
+                    Ok(token) => {
+                        if let Err(err) = refresh_existing_task_backing_pr_urls(
+                            &workspace,
+                            &snapshot,
+                            &assigned_repository,
+                            &token,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                workspace_key,
+                                error = %err,
+                                "failed to refresh backing pull requests for existing tasks"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            workspace_key,
+                            error = %err,
+                            "failed to resolve GitHub token while refreshing existing task pull requests"
+                        );
+                    }
+                }
                 let available_slots = service
                     .config
                     .autonomous
@@ -696,6 +722,41 @@ async fn watch_workspace(
         }
 
         set_automation_status(&workspace, Some(format!("Scan issues {repository_label}")));
+        let token = match resolved_gh_token(&service).await {
+            Ok(token) => token,
+            Err(err) => {
+                next_scan_at = Some(Instant::now() + ISSUE_SCAN_RETRY_DELAY);
+                set_automation_status(
+                    &workspace,
+                    Some(format!("Scan failed {repository_label}: {err}")),
+                );
+                previous_root_status = snapshot.root_session_status;
+                if !wait_for_workspace_change_until(
+                    &mut workspace_rx,
+                    &mut issue_status_rx,
+                    next_scan_at,
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Err(err) = refresh_existing_task_backing_pr_urls(
+            &workspace,
+            &snapshot,
+            &assigned_repository,
+            &token,
+        )
+        .await
+        {
+            tracing::warn!(
+                workspace_key,
+                error = %err,
+                "failed to refresh backing pull requests for existing tasks during scan"
+            );
+        }
         let available_slots = service
             .config
             .autonomous
@@ -910,6 +971,61 @@ async fn enqueue_next_issues(
 
     let _ = snapshot;
     Ok(queued)
+}
+
+async fn refresh_existing_task_backing_pr_urls(
+    workspace: &Workspace,
+    snapshot: &WorkspaceSnapshot,
+    assigned_repository: &str,
+    token: &str,
+) -> Result<usize, String> {
+    let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
+    let mut updates = Vec::new();
+
+    for task in &snapshot.persistent.tasks {
+        let Some(issue_number) = issue_number_from_url(&task.issue_url) else {
+            continue;
+        };
+        let issue = SelectedIssue {
+            number: issue_number,
+            title: String::new(),
+            url: task.issue_url.clone(),
+            created_at: String::new(),
+            state: Some("OPEN".to_string()),
+            is_pull_request: Some(false),
+            body: None,
+            labels: Vec::new(),
+            dependency_upgrade_pr_url: None,
+        };
+        let discovered =
+            discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
+        if discovered.as_deref() != task.backing_pr_url.as_deref() {
+            updates.push((task.id.clone(), discovered));
+        }
+    }
+
+    if updates.is_empty() {
+        return Ok(0);
+    }
+
+    workspace.update(|next| {
+        let mut changed = false;
+        for (task_id, backing_pr_url) in &updates {
+            if let Some(task) = next
+                .persistent
+                .tasks
+                .iter_mut()
+                .find(|task| &task.id == task_id)
+                && task.backing_pr_url != *backing_pr_url
+            {
+                task.backing_pr_url = backing_pr_url.clone();
+                changed = true;
+            }
+        }
+        changed
+    });
+
+    Ok(updates.len())
 }
 
 fn ensure_workspace_task_claim(
@@ -1392,15 +1508,21 @@ fn should_start_assigned_issue_work(
         return false;
     }
 
-    let Some(active_task_id) = active_task_id_for_snapshot(snapshot) else {
+    let Some(active_task_id) = snapshot
+        .active_task_id
+        .clone()
+        .or_else(|| active_task_id_for_snapshot(snapshot))
+    else {
         return false;
     };
 
-    snapshot
-        .task_states
-        .get(&active_task_id)
-        .and_then(|state| state.session_id.as_deref())
-        .is_none()
+    match snapshot.task_states.get(&active_task_id) {
+        None => true,
+        Some(task_state) => {
+            task_state.session_id.is_none()
+                || task_state.agent_state == Some(AutomationAgentState::Stale)
+        }
+    }
 }
 
 fn should_bridge_root_runtime_state(
@@ -2083,7 +2205,10 @@ fn unloaded_codex_task_runtime(
             (RootSessionStatus::Question, AutomationAgentState::Question)
         }
         Some(AutomationAgentState::Stale) => (RootSessionStatus::Idle, AutomationAgentState::Stale),
-        _ => (RootSessionStatus::Idle, AutomationAgentState::Review),
+        Some(AutomationAgentState::Review | AutomationAgentState::Idle) => {
+            (RootSessionStatus::Idle, AutomationAgentState::Review)
+        }
+        _ => (RootSessionStatus::Idle, AutomationAgentState::Stale),
     }
 }
 
@@ -2105,15 +2230,9 @@ fn codex_task_metadata_from_turns(
 
     for turn in turns {
         for item in &turn.items {
-            if item.get("type").and_then(serde_json::Value::as_str) != Some("agentMessage") {
-                continue;
-            }
-            let Some(text) = item.get("text").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            repositories.extend(extract_multicode_tag_values(text, "repo"));
-            issues.extend(extract_multicode_tag_values(text, "issue"));
-            prs.extend(extract_multicode_tag_values(text, "pr"));
+            extend_multicode_tag_values_from_json_value(&mut repositories, item, "repo");
+            extend_multicode_tag_values_from_json_value(&mut issues, item, "issue");
+            extend_multicode_tag_values_from_json_value(&mut prs, item, "pr");
         }
     }
 
@@ -2121,6 +2240,29 @@ fn codex_task_metadata_from_turns(
         repositories: repositories.into_iter().collect(),
         issues: issues.into_iter().collect(),
         prs: prs.into_iter().collect(),
+    }
+}
+
+fn extend_multicode_tag_values_from_json_value(
+    values: &mut std::collections::BTreeSet<String>,
+    item: &serde_json::Value,
+    tag: &str,
+) {
+    match item {
+        serde_json::Value::String(text) => {
+            values.extend(extract_multicode_tag_values(text, tag));
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                extend_multicode_tag_values_from_json_value(values, value, tag);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for value in entries.values() {
+                extend_multicode_tag_values_from_json_value(values, value, tag);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -2213,6 +2355,7 @@ fn set_task_runtime_state_from_codex(
             changed = true;
         }
         if let Some(metadata) = metadata {
+            let detected_backing_pr_url = metadata.prs.first().cloned();
             if task_state.repository != metadata.repositories {
                 task_state.repository = metadata.repositories;
                 changed = true;
@@ -2223,6 +2366,17 @@ fn set_task_runtime_state_from_codex(
             }
             if task_state.pr != metadata.prs {
                 task_state.pr = metadata.prs;
+                changed = true;
+            }
+            if let Some(backing_pr_url) = detected_backing_pr_url
+                && let Some(task) = snapshot
+                    .persistent
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                && task.backing_pr_url.as_deref() != Some(backing_pr_url.as_str())
+            {
+                task.backing_pr_url = Some(backing_pr_url);
                 changed = true;
             }
         }
@@ -2247,6 +2401,14 @@ fn codex_task_status_text(
                 .task_states
                 .get(task_id)
                 .and_then(|task_state| task_state.pr.first())
+        })
+        .or_else(|| {
+            snapshot
+                .persistent
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .and_then(|task| task.backing_pr_url.as_ref())
         })
         .and_then(|pr| pull_request_reference(pr))
         .map(|pr| format!("PR created {pr}"))
@@ -2821,6 +2983,7 @@ async fn find_next_issue(
     excluded_issue_urls: &HashSet<String>,
     token: &str,
 ) -> Result<Option<QueuedIssueCandidate>, String> {
+    let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
@@ -2834,8 +2997,12 @@ async fn find_next_issue(
                 continue;
             }
             candidates.push(QueuedIssueCandidate {
+                backing_pr_url: discover_issue_backing_pr_url(
+                    assigned_repository,
+                    &issue,
+                    &open_pull_requests,
+                ),
                 issue,
-                backing_pr_url: None,
             });
         }
     }
@@ -2912,12 +3079,30 @@ async fn fetch_issue(
 
     let mut issue = serde_json::from_slice::<SelectedIssue>(&output.stdout)
         .map_err(|err| format!("failed to parse gh issue view output: {err}"))?;
-    issue.dependency_upgrade_pr_url = issue
+    let discovered_backing_pr_url = issue
         .body
         .as_deref()
         .and_then(extract_dependency_upgrade_pr_marker)
         .map(ToOwned::to_owned);
+    issue.dependency_upgrade_pr_url = match discovered_backing_pr_url {
+        Some(backing_pr_url) => Some(backing_pr_url),
+        None => list_open_pull_requests(assigned_repository, token)
+            .await
+            .ok()
+            .and_then(|open_pull_requests| {
+                discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests)
+            }),
+    };
     Ok(issue.is_open_issue_candidate().then_some(issue))
+}
+
+fn issue_number_from_url(issue_url: &str) -> Option<u64> {
+    let parsed = Url::parse(issue_url).ok()?;
+    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    if segments.len() < 4 || segments[2] != "issues" {
+        return None;
+    }
+    segments[3].parse::<u64>().ok()
 }
 
 fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
@@ -3009,6 +3194,143 @@ async fn list_dependency_upgrade_prs(
 
     serde_json::from_slice::<Vec<SelectedPullRequest>>(&output.stdout)
         .map_err(|err| format!("failed to parse gh search prs output: {err}"))
+}
+
+async fn list_open_pull_requests(
+    assigned_repository: &str,
+    token: &str,
+) -> Result<Vec<SelectedPullRequest>, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            assigned_repository,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,url,body,headRefName,createdAt,isDraft,state,labels,author",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh pr list for {assigned_repository}: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr list failed for {assigned_repository}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice::<Vec<SelectedPullRequest>>(&output.stdout)
+        .map_err(|err| format!("failed to parse gh pr list output: {err}"))
+}
+
+fn discover_issue_backing_pr_url(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    pull_requests: &[SelectedPullRequest],
+) -> Option<String> {
+    let mut matches = pull_requests
+        .iter()
+        .filter_map(|pr| {
+            score_pull_request_issue_match(assigned_repository, issue, pr)
+                .map(|score| (score, pr.created_at.as_deref(), pr.number, pr.url.as_str()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+    });
+    matches.first().map(|(_, _, _, url)| (*url).to_string())
+}
+
+fn score_pull_request_issue_match(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    pr: &SelectedPullRequest,
+) -> Option<u8> {
+    if !matches!(pr.state.as_deref(), Some("OPEN") | Some("open")) || pr.is_draft == Some(true) {
+        return None;
+    }
+
+    let mut score = 0u8;
+    if pull_request_has_closing_issue_reference(assigned_repository, issue, pr) {
+        score = score.max(3);
+    }
+    if pull_request_mentions_issue_reference(assigned_repository, issue, pr) {
+        score = score.max(2);
+    }
+    if pull_request_head_matches_issue_number(issue, pr) {
+        score = score.max(1);
+    }
+
+    (score > 0).then_some(score)
+}
+
+fn pull_request_has_closing_issue_reference(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    pr: &SelectedPullRequest,
+) -> bool {
+    let body = pr.body.as_deref().unwrap_or_default();
+    let title = pr.title.as_str();
+    let issue_number_ref = format!("#{}", issue.number);
+    let repo_issue_ref = format!("{assigned_repository}#{}", issue.number);
+    let issue_url = issue.url.as_str();
+
+    [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ]
+    .iter()
+    .any(|keyword| {
+        let body = body.to_ascii_lowercase();
+        let title = title.to_ascii_lowercase();
+        let keyword = keyword.to_ascii_lowercase();
+        let refs = [
+            format!("{keyword} {issue_number_ref}"),
+            format!("{keyword} {repo_issue_ref}"),
+            format!("{keyword} {issue_url}"),
+        ];
+        refs.iter()
+            .any(|candidate| body.contains(candidate) || title.contains(candidate))
+    })
+}
+
+fn pull_request_mentions_issue_reference(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    pr: &SelectedPullRequest,
+) -> bool {
+    let issue_number_ref = format!("#{}", issue.number);
+    let repo_issue_ref = format!("{assigned_repository}#{}", issue.number);
+    let issue_text = format!("issue #{}", issue.number);
+    let issue_url = issue.url.as_str();
+
+    [pr.title.as_str(), pr.body.as_deref().unwrap_or_default()]
+        .iter()
+        .any(|text| {
+            text.contains(&issue_number_ref)
+                || text.contains(&repo_issue_ref)
+                || text.to_ascii_lowercase().contains(&issue_text)
+                || text.contains(issue_url)
+        })
+}
+
+fn pull_request_head_matches_issue_number(issue: &SelectedIssue, pr: &SelectedPullRequest) -> bool {
+    let issue_number = issue.number.to_string();
+    pr.head_ref_name.as_deref().is_some_and(|head_ref_name| {
+        head_ref_name
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|segment| segment == issue_number)
+    })
 }
 
 async fn find_or_create_dependency_upgrade_issue(
@@ -3495,6 +3817,10 @@ struct SelectedPullRequest {
     number: u64,
     title: String,
     url: String,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(rename = "headRefName")]
+    head_ref_name: Option<String>,
     state: Option<String>,
     #[serde(rename = "isDraft")]
     is_draft: Option<bool>,
@@ -3738,6 +4064,8 @@ mod tests {
             number,
             title: title.to_string(),
             url: url.to_string(),
+            created_at: Some("2026-04-09T10:00:00Z".to_string()),
+            head_ref_name: None,
             state: Some("OPEN".to_string()),
             is_draft: Some(false),
             body: body.map(ToOwned::to_owned),
@@ -3824,6 +4152,79 @@ mod tests {
             .expect("one issue should remain");
 
         assert_eq!(selected.number, 9);
+    }
+
+    #[test]
+    fn discover_issue_backing_pr_url_prefers_explicit_issue_reference() {
+        let issue = test_issue(
+            322,
+            "Dependency Injection Fails",
+            "https://github.com/example/repo/issues/322",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+        let mut branch_only = test_pull_request(
+            17,
+            "Refactor configurer support",
+            "https://github.com/example/repo/pull/17",
+            vec![],
+            None,
+        );
+        branch_only.head_ref_name = Some("fix-322-configurer".to_string());
+
+        let explicit = test_pull_request(
+            18,
+            "Add regression coverage for issue #322",
+            "https://github.com/example/repo/pull/18",
+            vec![],
+            Some("## Summary\n\nResolves #322"),
+        );
+
+        let discovered =
+            discover_issue_backing_pr_url("example/repo", &issue, &[branch_only, explicit]);
+
+        assert_eq!(
+            discovered.as_deref(),
+            Some("https://github.com/example/repo/pull/18")
+        );
+    }
+
+    #[test]
+    fn discover_issue_backing_pr_url_falls_back_to_branch_issue_number() {
+        let issue = test_issue(
+            161,
+            "Generate plugins",
+            "https://github.com/example/repo/issues/161",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+        let mut branch_match = test_pull_request(
+            21,
+            "WIP plugin generation changes",
+            "https://github.com/example/repo/pull/21",
+            vec![],
+            None,
+        );
+        branch_match.head_ref_name = Some("fix-161-plugin-generation".to_string());
+
+        let discovered = discover_issue_backing_pr_url("example/repo", &issue, &[branch_match]);
+
+        assert_eq!(
+            discovered.as_deref(),
+            Some("https://github.com/example/repo/pull/21")
+        );
+    }
+
+    #[test]
+    fn issue_number_from_url_extracts_issue_number() {
+        assert_eq!(
+            issue_number_from_url("https://github.com/example/repo/issues/322"),
+            Some(322)
+        );
+        assert_eq!(
+            issue_number_from_url("https://github.com/example/repo/pull/322"),
+            None
+        );
     }
 
     #[test]
@@ -5048,6 +5449,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_task_status_text_falls_back_to_persisted_backing_pr_url() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
+                "task-33".to_string(),
+                "https://github.com/example/repo/issues/33".to_string(),
+                WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/56".to_string())),
+        );
+
+        assert_eq!(
+            codex_task_status_text(AutomationAgentState::Review, None, "task-33", &snapshot)
+                .as_deref(),
+            Some("PR created #56")
+        );
+    }
+
+    #[test]
     fn set_task_runtime_state_from_codex_clears_resuming_status_once_task_is_working() {
         let workspace = Workspace::new(WorkspaceSnapshot::default());
         workspace.update(|snapshot| {
@@ -5101,6 +5521,19 @@ mod tests {
     }
 
     #[test]
+    fn unloaded_codex_task_runtime_marks_interrupted_working_task_as_stale() {
+        let task_state = crate::WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unloaded_codex_task_runtime(&task_state),
+            (RootSessionStatus::Idle, AutomationAgentState::Stale)
+        );
+    }
+
+    #[test]
     fn codex_task_metadata_from_turns_extracts_issue_and_pr_tags() {
         let turns = vec![crate::services::codex_app_server::CodexThreadTurn {
             items: vec![serde_json::json!({
@@ -5125,6 +5558,71 @@ mod tests {
         assert_eq!(
             metadata.prs,
             vec!["https://github.com/graemerocher/multicode-test/pull/8".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_task_metadata_from_turns_extracts_pr_tag_from_tool_output() {
+        let turns = vec![crate::services::codex_app_server::CodexThreadTurn {
+            items: vec![serde_json::json!({
+                "type": "toolCallOutput",
+                "output": "Chunk ID: c4018f\n<multicode:pr>https://github.com/graemerocher/multicode-test/pull/338</multicode:pr>\n"
+            })],
+        }];
+
+        let metadata = codex_task_metadata_from_turns(
+            &turns,
+            "https://github.com/graemerocher/multicode-test/issues/322",
+        );
+
+        assert_eq!(
+            metadata.issues,
+            vec!["https://github.com/graemerocher/multicode-test/issues/322".to_string()]
+        );
+        assert_eq!(
+            metadata.prs,
+            vec!["https://github.com/graemerocher/multicode-test/pull/338".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_persists_detected_pr_on_task() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-322".to_string(),
+                    "https://github.com/example/repo/issues/322".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-322",
+            "task-session-322",
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review,
+            Some(CodexTaskMetadata {
+                prs: vec!["https://github.com/example/repo/pull/338".to_string()],
+                ..Default::default()
+            }),
+            None,
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task = snapshot
+            .persistent
+            .tasks
+            .iter()
+            .find(|task| task.id == "task-322")
+            .expect("task should exist");
+        assert_eq!(
+            task.backing_pr_url.as_deref(),
+            Some("https://github.com/example/repo/pull/338")
         );
     }
 
@@ -5267,6 +5765,34 @@ mod tests {
         assert!(!should_start_assigned_issue_work(
             &snapshot,
             RootSessionStatus::Busy
+        ));
+    }
+
+    #[test]
+    fn should_start_assigned_issue_work_when_active_task_is_stale() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-6".to_string(),
+                "https://github.com/example/repo/issues/6".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot.active_task_id = Some("task-6".to_string());
+        snapshot.task_states.insert(
+            "task-6".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-task-6".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Stale),
+                ..Default::default()
+            },
+        );
+
+        assert!(should_start_assigned_issue_work(
+            &snapshot,
+            RootSessionStatus::Idle
         ));
     }
 

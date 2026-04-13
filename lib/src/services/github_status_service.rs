@@ -336,6 +336,7 @@ pub struct GithubStatusService {
     watch_entries: Arc<Mutex<HashMap<String, Arc<StatusWatchEntry>>>>,
     token_source: Option<GithubTokenConfig>,
     token: Arc<Mutex<Option<String>>>,
+    client: Arc<Mutex<Option<Octocrab>>>,
     authenticated_login: Arc<Mutex<Option<String>>>,
 }
 
@@ -357,6 +358,7 @@ impl GithubStatusService {
             watch_entries: Arc::new(Mutex::new(HashMap::new())),
             token_source,
             token: Arc::new(Mutex::new(None)),
+            client: Arc::new(Mutex::new(None)),
             authenticated_login: Arc::new(Mutex::new(None)),
         })
     }
@@ -685,12 +687,22 @@ impl GithubStatusService {
     }
 
     async fn github_client(&self) -> Result<Octocrab, GithubStatusServiceError> {
+        if let Some(client) = self
+            .client
+            .lock()
+            .expect("github client lock poisoned")
+            .clone()
+        {
+            return Ok(client);
+        }
+
         let token = self.github_token().await?;
         let mut builder = Octocrab::builder().personal_token(token);
         if let Ok(base_uri) = std::env::var("GITHUB_API_URL") {
             builder = builder.base_uri(base_uri)?;
         }
         let client = builder.build()?;
+        *self.client.lock().expect("github client lock poisoned") = Some(client.clone());
         Ok(client)
     }
 

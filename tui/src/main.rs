@@ -193,6 +193,14 @@ fn workspace_is_usable(snapshot: &WorkspaceSnapshot) -> bool {
     !snapshot.persistent.archived
 }
 
+fn workspace_supports_pause(snapshot: &WorkspaceSnapshot) -> bool {
+    workspace_is_usable(snapshot)
+        && workspace_state(snapshot) == WorkspaceUiState::Started
+        && (snapshot.persistent.automation_paused
+            || snapshot.persistent.assigned_repository.is_some()
+            || !snapshot.persistent.tasks.is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WorkspaceLinkKind {
     Review,
@@ -382,6 +390,23 @@ fn github_link_badge(url: &str) -> String {
     format!("#{number}")
 }
 
+fn task_pr_created_status(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> Option<String> {
+    task_pr_link(task, task_state)
+        .map(github_link_badge)
+        .filter(|reference| !reference.is_empty())
+        .map(|reference| format!("PR created {reference}"))
+}
+
+fn is_generic_review_task_status(status: &str) -> bool {
+    let status = status.trim();
+    status.starts_with("Review ")
+        || status.starts_with("Wait close ")
+        || status.starts_with("PR created ")
+}
+
 fn task_server_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> &'static str {
     if task_state.is_some_and(|state| state.waiting_on_vm) {
         return "Waiting on VM";
@@ -420,9 +445,18 @@ fn task_description(
     task: &WorkspaceTaskPersistentSnapshot,
     task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
 ) -> String {
+    let pr_created_status = task_pr_created_status(task, task_state);
     if let Some(status) = task_state.and_then(|state| state.status.as_deref())
         && !status.trim().is_empty()
     {
+        if matches!(
+            task_effective_agent_state(task_state),
+            Some(AutomationAgentState::Review | AutomationAgentState::Idle)
+        ) && is_generic_review_task_status(status)
+            && let Some(pr_created_status) = pr_created_status.clone()
+        {
+            return pr_created_status;
+        }
         return status.trim().to_string();
     }
     if task_state.is_some_and(|state| state.waiting_on_vm) {
@@ -431,9 +465,12 @@ fn task_description(
     match task_effective_agent_state(task_state) {
         Some(AutomationAgentState::Working) => format!("Working {}", task_issue_reference(task)),
         Some(AutomationAgentState::Question) => format!("Question {}", task_issue_reference(task)),
-        Some(AutomationAgentState::Review) => format!("Review {}", task_issue_reference(task)),
+        Some(AutomationAgentState::Review) => {
+            pr_created_status.unwrap_or_else(|| format!("Review {}", task_issue_reference(task)))
+        }
         Some(AutomationAgentState::WaitingOnVm) => "Queued until VM is free".to_string(),
-        Some(AutomationAgentState::Idle) => format!("Wait close {}", task_issue_reference(task)),
+        Some(AutomationAgentState::Idle) => pr_created_status
+            .unwrap_or_else(|| format!("Wait close {}", task_issue_reference(task))),
         Some(AutomationAgentState::Stale) => format!("Stalled {}", task_issue_reference(task)),
         None => task_issue_reference(task),
     }
@@ -703,46 +740,52 @@ fn workspace_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
 }
 
 fn workspace_issue_pr_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
-    let mut links = Vec::new();
-
-    if snapshot.persistent.tasks.is_empty() {
-        links.extend(
-            active_task_issue_url(snapshot)
-                .iter()
-                .cloned()
-                .map(|value| WorkspaceLink {
-                    kind: WorkspaceLinkKind::Issue,
-                    value,
-                    source: WorkspaceLinkSource::Automation,
-                }),
-        );
-        links.extend(
-            snapshot
-                .persistent
-                .agent_provided
-                .issue
-                .iter()
-                .cloned()
-                .map(|value| WorkspaceLink {
-                    kind: WorkspaceLinkKind::Issue,
-                    value,
-                    source: WorkspaceLinkSource::AgentProvided,
-                }),
-        );
-        links.extend(
-            snapshot
-                .persistent
-                .agent_provided
-                .pr
-                .iter()
-                .cloned()
-                .map(|value| WorkspaceLink {
-                    kind: WorkspaceLinkKind::Pr,
-                    value,
-                    source: WorkspaceLinkSource::AgentProvided,
-                }),
-        );
+    if let Some(active_task_id) = snapshot
+        .active_task_id
+        .clone()
+        .or_else(|| snapshot.resolved_active_task_id())
+        && let Some(task) = snapshot.task_persistent_snapshot(&active_task_id)
+    {
+        return task_links(task, task_runtime_snapshot(snapshot, &active_task_id));
     }
+
+    let mut links = Vec::new();
+    links.extend(
+        active_task_issue_url(snapshot)
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Issue,
+                value,
+                source: WorkspaceLinkSource::Automation,
+            }),
+    );
+    links.extend(
+        snapshot
+            .persistent
+            .agent_provided
+            .issue
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Issue,
+                value,
+                source: WorkspaceLinkSource::AgentProvided,
+            }),
+    );
+    links.extend(
+        snapshot
+            .persistent
+            .agent_provided
+            .pr
+            .iter()
+            .cloned()
+            .map(|value| WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value,
+                source: WorkspaceLinkSource::AgentProvided,
+            }),
+    );
 
     links
 }
@@ -1240,6 +1283,14 @@ fn help_line(
                                     " stop  "
                                 };
                             push_hotkey(&mut spans, "s", start_stop_action);
+                            if workspace_supports_pause(snapshot) {
+                                let pause_action = if snapshot.persistent.automation_paused {
+                                    " resume  "
+                                } else {
+                                    " pause  "
+                                };
+                                push_hotkey(&mut spans, "p", pause_action);
+                            }
                             if selected_workspace_has_refreshable_github_link {
                                 push_hotkey(&mut spans, "r", " recheck GH status  ");
                             }

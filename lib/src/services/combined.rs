@@ -338,6 +338,70 @@ impl CombinedService {
         Ok(())
     }
 
+    pub fn resume_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
+        self.request_workspace_issue_scan(key)
+    }
+
+    pub async fn pause_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        let snapshot = workspace.subscribe().borrow().clone();
+        let _runtime_handle = snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.runtime.clone())
+            .ok_or_else(|| CombinedServiceError::TransientSnapshotMissing(key.clone()))?;
+
+        if self.agent_provider == AgentProvider::Opencode
+            && let Some(opencode_client) = snapshot.opencode_client.as_ref()
+        {
+            let active_session_id = snapshot
+                .active_task_id
+                .as_deref()
+                .and_then(|task_id| snapshot.task_states.get(task_id))
+                .and_then(|task_state| task_state.session_id.as_deref())
+                .or(snapshot.automation_session_id.as_deref())
+                .or(snapshot.root_session_id.as_deref());
+            if let Some(session_id) = active_session_id
+                && let Ok(session_id) =
+                    opencode::client::types::SessionAbortSessionId::try_from(session_id)
+                && let Err(err) = opencode_client
+                    .client
+                    .session_abort(&session_id, None, None)
+                    .await
+            {
+                tracing::warn!(
+                    workspace_key = %key,
+                    error = ?err,
+                    "failed to abort active opencode session while pausing workspace"
+                );
+            }
+        }
+
+        workspace.update(|snapshot| {
+            let mut changed = false;
+            if !snapshot.persistent.automation_paused {
+                snapshot.persistent.automation_paused = true;
+                changed = true;
+            }
+            let next_status = snapshot
+                .persistent
+                .assigned_repository
+                .as_ref()
+                .map(|repository| format!("Paused {repository}"))
+                .or_else(|| {
+                    (!snapshot.persistent.tasks.is_empty()).then_some("Paused".to_string())
+                });
+            if snapshot.automation_status != next_status {
+                snapshot.automation_status = next_status;
+                changed = true;
+            }
+            changed
+        });
+
+        Ok(())
+    }
+
     fn set_workspace_repository(
         &self,
         key: &str,
@@ -5150,6 +5214,79 @@ inherit-env = ["TERM", "COLORTERM"]
                 err,
                 CombinedServiceError::TransientSnapshotMissing(key) if key == "alpha"
             ));
+        });
+    }
+
+    #[test]
+    fn pause_workspace_keeps_runtime_and_marks_automation_paused() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            fs::create_dir_all(&home).expect("home should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime should exist");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(&config_path, config_with_isolation("~/workspaces"))
+                .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+
+            service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .update(|snapshot| {
+                    snapshot.persistent.assigned_repository = Some("example/repo".to_string());
+                    snapshot.transient = Some(crate::TransientWorkspaceSnapshot {
+                        uri: "http://127.0.0.1:3000".to_string(),
+                        runtime: crate::RuntimeHandleSnapshot {
+                            backend: crate::RuntimeBackend::LinuxSystemdBwrap,
+                            id: "alpha.service".to_string(),
+                            metadata: Default::default(),
+                        },
+                    });
+                    true
+                });
+
+            service
+                .pause_workspace("alpha")
+                .await
+                .expect("pause should succeed for started workspace");
+
+            let snapshot = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe()
+                .borrow()
+                .clone();
+
+            assert!(snapshot.transient.is_some());
+            assert!(snapshot.persistent.automation_paused);
+            assert_eq!(
+                snapshot.automation_status.as_deref(),
+                Some("Paused example/repo")
+            );
         });
     }
 

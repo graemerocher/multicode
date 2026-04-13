@@ -3,9 +3,17 @@ name: machine-readable-pr
 description: Rules for machine-readable pull request metadata. Load when actively working on or creating any GitHub pull request.
 ---
 
-When actively working on or creating a GitHub pull request, request a review from Copilot as soon as the PR exists.
+When actively working on or creating a GitHub pull request, assign the PR to yourself as soon as the PR exists.
 
-After creating the PR and requesting the Copilot review, immediately emit the link to the PR like this:
+If you are using `gh`, prefer:
+
+```bash
+gh pr edit --add-assignee @me
+```
+
+After assigning the PR to yourself, request a review from Copilot as soon as the PR exists.
+
+After creating the PR, assigning yourself, and requesting the Copilot review, immediately emit the link to the PR like this:
 
 ```
 <multicode:pr>https://github.com/example/example-core/pull/12345</multicode:pr>
