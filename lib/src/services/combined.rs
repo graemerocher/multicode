@@ -1013,6 +1013,12 @@ impl CombinedService {
         task_id: &str,
         prompt: &str,
     ) -> Result<(), String> {
+        tracing::info!(
+            workspace_key,
+            task_id,
+            provider = ?self.agent_provider,
+            "dispatching task session prompt"
+        );
         if self.agent_provider != AgentProvider::Codex {
             let session_id = snapshot
                 .task_states
@@ -1054,6 +1060,12 @@ impl CombinedService {
             .and_then(|task_state| task_state.session_id.clone());
 
         if let Some(session_id) = existing_session_id.as_deref() {
+            tracing::info!(
+                workspace_key,
+                task_id,
+                session_id,
+                "sending codex prompt to existing task session"
+            );
             match Self::prompt_codex_session_with_retry(
                 &uri,
                 session_id,
@@ -1072,7 +1084,16 @@ impl CombinedService {
                         "replacing stale codex task session after interrupted attach"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        workspace_key,
+                        task_id,
+                        session_id,
+                        error = %error,
+                        "failed to dispatch codex prompt to existing task session"
+                    );
+                    return Err(error);
+                }
             }
         }
 
@@ -1098,7 +1119,7 @@ impl CombinedService {
                 .await;
         }
 
-        tracing::info!(workspace_key, task_id, "starting fresh codex task session");
+        tracing::info!(workspace_key, task_id, "restarting codex task session");
         let previous_session_id = snapshot
             .task_states
             .get(task_id)
@@ -1114,6 +1135,12 @@ impl CombinedService {
         prompt: &str,
         previous_session_id: Option<&str>,
     ) -> Result<(), String> {
+        tracing::info!(
+            workspace_key,
+            task_id,
+            previous_session_id,
+            "starting fresh codex task session"
+        );
         let workspace = self
             .manager
             .get_workspace(workspace_key)
@@ -1147,6 +1174,13 @@ impl CombinedService {
             .await?
             .thread
             .id;
+        tracing::info!(
+            workspace_key,
+            task_id,
+            session_id,
+            previous_session_id,
+            "created fresh codex task session"
+        );
         let prompt =
             Self::rewrite_codex_task_prompt_session_id(prompt, previous_session_id, &session_id);
         Self::wait_for_codex_thread_ready(&client, &session_id).await?;
@@ -1176,8 +1210,29 @@ impl CombinedService {
             }
             changed
         });
-        Self::prompt_codex_session_with_retry(&uri, &session_id, &prompt, &self.config.agent.codex)
-            .await
+        let result = Self::prompt_codex_session_with_retry(
+            &uri,
+            &session_id,
+            &prompt,
+            &self.config.agent.codex,
+        )
+        .await;
+        match &result {
+            Ok(()) => tracing::info!(
+                workspace_key,
+                task_id,
+                session_id,
+                "dispatched codex prompt to fresh task session"
+            ),
+            Err(error) => tracing::warn!(
+                workspace_key,
+                task_id,
+                session_id,
+                error = %error,
+                "failed to dispatch codex prompt to fresh task session"
+            ),
+        }
+        result
     }
 
     fn rewrite_codex_task_prompt_session_id(

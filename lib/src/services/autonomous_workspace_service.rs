@@ -50,6 +50,7 @@ const WORK_STARTED_COMMENT_BODY: &str = "I started working on this issue";
 struct QueuedIssueCandidate {
     issue: SelectedIssue,
     backing_pr_url: Option<String>,
+    dependency_upgrade_backing_pr: bool,
 }
 
 #[derive(Debug)]
@@ -835,16 +836,19 @@ async fn start_assigned_issue_work(
     let Some(issue) = fetch_issue(assigned_repository, issue_url, &token).await? else {
         return Ok(None);
     };
+    let existing_task = task_persistent_snapshot_for_issue(snapshot, &issue.url);
     let backing_pr_url = issue.backing_pr_url().map(ToOwned::to_owned).or_else(|| {
-        task_persistent_snapshot_for_issue(snapshot, &issue.url)
-            .and_then(|task| task.backing_pr_url.clone())
+        existing_task.and_then(|task| task.backing_pr_url.clone())
     });
+    let dependency_upgrade_backing_pr = issue.backing_pr_url().is_some()
+        || existing_task.is_some_and(|task| task.dependency_upgrade_backing_pr);
 
     ensure_workspace_task_claim(
         workspace,
         assigned_repository,
         &issue,
         backing_pr_url.as_deref(),
+        dependency_upgrade_backing_pr,
         WorkspaceTaskSource::Manual,
     );
     let task_session_id = ensure_task_session(
@@ -885,7 +889,7 @@ async fn start_assigned_issue_work(
         assigned_repository,
         &task_id,
         &issue,
-        backing_pr_url.as_deref(),
+        dependency_upgrade_backing_pr.then_some(backing_pr_url.as_deref()).flatten(),
         &task_session_id,
         task_cwd_path(service, workspace_key, assigned_repository, &issue.url),
     )
@@ -962,6 +966,7 @@ async fn enqueue_next_issues(
             workspace,
             &candidate.issue,
             candidate.backing_pr_url.as_deref(),
+            candidate.dependency_upgrade_backing_pr,
             WorkspaceTaskSource::Scan,
         );
         queued += 1;
@@ -1031,6 +1036,7 @@ fn ensure_workspace_task_claim(
     assigned_repository: &str,
     issue: &SelectedIssue,
     backing_pr_url: Option<&str>,
+    dependency_upgrade_backing_pr: bool,
     source: WorkspaceTaskSource,
 ) {
     workspace.update(|snapshot| {
@@ -1045,7 +1051,8 @@ fn ensure_workspace_task_claim(
                 issue.url.clone(),
                 source,
             )
-            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned));
+            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned))
+            .with_dependency_upgrade_backing_pr(dependency_upgrade_backing_pr);
             let task_id = task.id.clone();
             snapshot.persistent.tasks.push(task);
             task_id
@@ -1055,10 +1062,15 @@ fn ensure_workspace_task_claim(
             .tasks
             .iter_mut()
             .find(|task| task.id == task_id)
-            && task.backing_pr_url.as_deref() != backing_pr_url
         {
-            task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
-            changed = true;
+            if task.backing_pr_url.as_deref() != backing_pr_url {
+                task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
+                changed = true;
+            }
+            if task.dependency_upgrade_backing_pr != dependency_upgrade_backing_pr {
+                task.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
+                changed = true;
+            }
         }
         if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
             snapshot.active_task_id = Some(task_id);
@@ -1072,6 +1084,7 @@ fn queue_issue_task(
     workspace: &Workspace,
     issue: &SelectedIssue,
     backing_pr_url: Option<&str>,
+    dependency_upgrade_backing_pr: bool,
     source: WorkspaceTaskSource,
 ) {
     workspace.update(|snapshot| {
@@ -1087,10 +1100,17 @@ fn queue_issue_task(
                 .tasks
                 .iter_mut()
                 .find(|task| task.id == existing)
-                && task.backing_pr_url.as_deref() != backing_pr_url
             {
-                task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
-                return true;
+                let mut changed = false;
+                if task.backing_pr_url.as_deref() != backing_pr_url {
+                    task.backing_pr_url = backing_pr_url.map(ToOwned::to_owned);
+                    changed = true;
+                }
+                if task.dependency_upgrade_backing_pr != dependency_upgrade_backing_pr {
+                    task.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
+                    changed = true;
+                }
+                return changed;
             }
             return false;
         }
@@ -1100,7 +1120,8 @@ fn queue_issue_task(
                 issue.url.clone(),
                 source,
             )
-            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned)),
+            .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned))
+            .with_dependency_upgrade_backing_pr(dependency_upgrade_backing_pr),
         );
         true
     });
@@ -2540,7 +2561,7 @@ fn merged_dependency_upgrade_issue_urls(
         .persistent
         .tasks
         .iter()
-        .filter(|task| task.backing_pr_url.is_some())
+        .filter(|task| task.backing_pr_url.is_some() && task.dependency_upgrade_backing_pr)
         .filter_map(|task| {
             matches!(
                 task_pr_status_rxs.get(&task.issue_url).and_then(|receiver| *receiver.borrow()),
@@ -2561,7 +2582,9 @@ async fn close_dependency_upgrade_issue(
     let Some(task) = task_persistent_snapshot_for_issue(snapshot, issue_url) else {
         return Ok(());
     };
-    let Some(backing_pr_url) = task.backing_pr_url.as_deref() else {
+    let Some(backing_pr_url) =
+        task.dependency_upgrade_backing_pr.then_some(task.backing_pr_url.as_deref()).flatten()
+    else {
         return Ok(());
     };
 
@@ -3008,6 +3031,7 @@ async fn find_next_issue(
                     &issue,
                     &open_pull_requests,
                 ),
+                dependency_upgrade_backing_pr: false,
                 issue,
             });
         }
@@ -3090,15 +3114,7 @@ async fn fetch_issue(
         .as_deref()
         .and_then(extract_dependency_upgrade_pr_marker)
         .map(ToOwned::to_owned);
-    issue.dependency_upgrade_pr_url = match discovered_backing_pr_url {
-        Some(backing_pr_url) => Some(backing_pr_url),
-        None => list_open_pull_requests(assigned_repository, token)
-            .await
-            .ok()
-            .and_then(|open_pull_requests| {
-                discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests)
-            }),
-    };
+    issue.dependency_upgrade_pr_url = discovered_backing_pr_url;
     Ok(issue.is_open_issue_candidate().then_some(issue))
 }
 
@@ -3160,6 +3176,7 @@ async fn find_next_dependency_upgrade_issue(
         return Ok(Some(QueuedIssueCandidate {
             issue,
             backing_pr_url: Some(pr.url),
+            dependency_upgrade_backing_pr: true,
         }));
     }
 
@@ -3982,11 +3999,16 @@ mod tests {
     use super::*;
     use crate::WorkspaceSnapshot;
     use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
+    use crate::services::github_status_service::{
+        GithubPrBuildState, GithubPrReviewState, GithubPrState, GithubPrStatus,
+    };
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::sync::watch;
 
     #[test]
     fn normalize_github_repository_spec_accepts_owner_repo_and_urls() {
@@ -4438,6 +4460,7 @@ mod tests {
             "example/repo",
             &issue,
             None,
+            false,
             WorkspaceTaskSource::Scan,
         );
 
@@ -4706,6 +4729,7 @@ mod tests {
             "example/repo",
             &issue,
             None,
+            false,
             WorkspaceTaskSource::Scan,
         );
         clear_automation_issue_claim(&workspace, "https://github.com/example/repo/issues/999");
@@ -6064,6 +6088,30 @@ mod tests {
     }
 
     #[test]
+    fn build_issue_prompt_with_generic_backing_pr_still_requires_publish_approval() {
+        let issue = test_issue(
+            982,
+            "ordinary issue with associated PR",
+            "https://github.com/example/repo/issues/982",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+
+        let prompt = build_issue_prompt(
+            "example/repo",
+            &issue,
+            None,
+            "thread-task-982",
+            std::path::Path::new("/tmp/work/example-repo-982"),
+            std::path::Path::new("/tmp/state/task-982.state"),
+        );
+
+        assert!(prompt.contains("explicitly approves publishing"));
+        assert!(!prompt.contains("backed by Renovate pull request"));
+        assert!(!prompt.contains("merge it without waiting for human review"));
+    }
+
+    #[test]
     fn work_started_comment_body_is_first_person() {
         assert_eq!(
             work_started_comment_body(),
@@ -6100,6 +6148,58 @@ mod tests {
         assert!(prompt.contains("merge it without waiting for human review"));
         assert!(prompt.contains("close GitHub issue https://github.com/example/repo/issues/981"));
         assert!(!prompt.contains("explicitly approves publishing"));
+    }
+
+    #[test]
+    fn merged_dependency_upgrade_issue_urls_ignores_non_dependency_tasks() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
+                "task-485".to_string(),
+                "https://github.com/example/repo/issues/485".to_string(),
+                WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/900".to_string())),
+        );
+        let (tx, rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
+            state: GithubPrState::Merged,
+            build: GithubPrBuildState::Succeeded,
+            review: GithubPrReviewState::Accepted,
+            is_draft: false,
+            fetched_at: std::time::SystemTime::UNIX_EPOCH,
+        })));
+        let _ = tx;
+        let receivers = HashMap::from([(snapshot.persistent.tasks[0].issue_url.clone(), rx)]);
+
+        assert!(merged_dependency_upgrade_issue_urls(&snapshot, &receivers).is_empty());
+    }
+
+    #[test]
+    fn merged_dependency_upgrade_issue_urls_includes_dependency_upgrade_tasks() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            WorkspaceTaskPersistentSnapshot::new(
+                "task-981".to_string(),
+                "https://github.com/example/repo/issues/981".to_string(),
+                WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/88".to_string()))
+            .with_dependency_upgrade_backing_pr(true),
+        );
+        let (tx, rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
+            state: GithubPrState::Merged,
+            build: GithubPrBuildState::Succeeded,
+            review: GithubPrReviewState::Accepted,
+            is_draft: false,
+            fetched_at: std::time::SystemTime::UNIX_EPOCH,
+        })));
+        let _ = tx;
+        let receivers = HashMap::from([(snapshot.persistent.tasks[0].issue_url.clone(), rx)]);
+
+        assert_eq!(
+            merged_dependency_upgrade_issue_urls(&snapshot, &receivers),
+            vec!["https://github.com/example/repo/issues/981".to_string()]
+        );
     }
 
     #[test]

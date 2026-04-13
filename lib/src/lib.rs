@@ -76,6 +76,8 @@ pub struct WorkspaceTaskPersistentSnapshot {
     #[serde(default)]
     pub backing_pr_url: Option<String>,
     #[serde(default)]
+    pub dependency_upgrade_backing_pr: bool,
+    #[serde(default)]
     pub source: WorkspaceTaskSource,
     #[serde(default)]
     pub created_at: Option<SystemTime>,
@@ -87,6 +89,7 @@ impl WorkspaceTaskPersistentSnapshot {
             id,
             issue_url,
             backing_pr_url: None,
+            dependency_upgrade_backing_pr: false,
             source,
             created_at: Some(SystemTime::now()),
         }
@@ -94,6 +97,14 @@ impl WorkspaceTaskPersistentSnapshot {
 
     pub fn with_backing_pr_url(mut self, backing_pr_url: Option<String>) -> Self {
         self.backing_pr_url = backing_pr_url;
+        self
+    }
+
+    pub fn with_dependency_upgrade_backing_pr(
+        mut self,
+        dependency_upgrade_backing_pr: bool,
+    ) -> Self {
+        self.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
         self
     }
 }

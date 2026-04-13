@@ -11,6 +11,7 @@ mod tests {
     use crate::app::{
         compact_github_tooltip_target, count_codex_session_turn_metrics,
         last_user_message_from_codex_session_log_contents, restored_selected_row,
+        should_restart_codex_task_for_pr_request,
         snapshot_attach_cwd_for_selection,
         snapshot_attach_target_for_selection,
         should_auto_resume_autonomous_codex_after_attach,
@@ -3058,6 +3059,32 @@ mod tests {
 
         assert!(server_width >= content_width("Waiting on VM"));
         assert!(cost_width >= content_width("123456k"));
+    }
+
+    #[test]
+    fn approve_restarts_codex_task_when_runtime_is_not_loaded() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            status: Some("NotLoaded".to_string()),
+            ..Default::default()
+        };
+
+        assert!(should_restart_codex_task_for_pr_request(Some(&task_state)));
+    }
+
+    #[test]
+    fn approve_keeps_existing_codex_task_when_review_session_is_idle() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            status: Some("Idle".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!should_restart_codex_task_for_pr_request(Some(&task_state)));
     }
 
     #[test]

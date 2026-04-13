@@ -179,6 +179,20 @@ pub(crate) fn should_resume_codex_task_after_incomplete_attached_turn(
     }
 }
 
+pub(crate) fn should_restart_codex_task_for_pr_request(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> bool {
+    let Some(task_state) = task_state else {
+        return false;
+    };
+
+    if task_state.agent_state == Some(AutomationAgentState::Stale) {
+        return true;
+    }
+
+    matches!(task_state.status.as_deref(), Some("NotLoaded"))
+}
+
 pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     let url = Url::parse(target).ok()?;
     if url.host_str()? != "github.com" {
@@ -1196,29 +1210,108 @@ impl TuiState {
         let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
             return;
         };
+        let previous_snapshot = snapshot.clone();
+        let should_restart = should_restart_codex_task_for_pr_request(
+            task_runtime_snapshot(&snapshot, &task_id),
+        );
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing PR approval request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+        let task_id_for_task = task_id.clone();
 
-        match self
-            .service
-            .prompt_task_session(
-                &workspace_key,
-                &snapshot,
-                &task_id,
-                CODEX_CREATE_PR_APPROVAL_PROMPT,
-            )
-            .await
-        {
-            Ok(()) => {
-                self.mark_task_resuming_in_background(&workspace_key, &task_id);
-                self.status = format!(
-                    "Approved local changes for '{task_id}' in workspace '{workspace_key}'; asked Codex to create or update the PR"
-                );
+        self.mark_task_resuming_in_background(&workspace_key, &task_id);
+        tokio::spawn(async move {
+            let progress_message = if should_restart {
+                "Restarting the Codex review session before asking for PR creation..."
+            } else {
+                "Asking Codex to create or update the PR..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        CODEX_CREATE_PR_APPROVAL_PROMPT,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        CODEX_CREATE_PR_APPROVAL_PROMPT,
+                    )
+                    .await
+            };
+
+            if let Err(err) = result {
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
+                    workspace.update(|next| {
+                        let mut changed = false;
+                        match previous_snapshot.task_states.get(&task_id_for_task).cloned() {
+                            Some(previous_task_state) => {
+                                if next.task_states.get(&task_id_for_task)
+                                    != Some(&previous_task_state)
+                                {
+                                    next.task_states
+                                        .insert(task_id_for_task.clone(), previous_task_state);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if next.task_states.remove(&task_id_for_task).is_some() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if next.active_task_id != previous_snapshot.active_task_id {
+                            next.active_task_id = previous_snapshot.active_task_id.clone();
+                            changed = true;
+                        }
+                        if next.automation_agent_state != previous_snapshot.automation_agent_state {
+                            next.automation_agent_state = previous_snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status
+                            != previous_snapshot.automation_session_status
+                        {
+                            next.automation_session_status =
+                                previous_snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != previous_snapshot.automation_status {
+                            next.automation_status = previous_snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                let _ = result_tx.send(Err(err));
+                return;
             }
-            Err(err) => {
-                self.status = format!(
-                    "Failed to approve local changes for '{task_id}' in workspace '{workspace_key}': {err}"
-                );
-            }
-        }
+
+            let _ = progress_tx.send("Codex accepted the PR request and is continuing in the background.".to_string());
+            let _ = result_tx.send(Ok(()));
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Approve {task_id}"),
+            success_status: Some(format!(
+                "PR request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+            )),
+            progress_rx,
+            result_rx,
+            cancel: None,
+        });
+        self.status = format!(
+            "Approved local changes for '{task_id}' in workspace '{workspace_key}'; sending the PR request to Codex in the background"
+        );
     }
 
     pub(crate) async fn handle_key(
@@ -1584,10 +1677,12 @@ impl TuiState {
             self.mode = UiMode::Normal;
             match result {
                 Ok(()) => {
-                    self.status = format!(
-                        "{} completed for workspace '{}'",
-                        running_tool.operation_name, running_tool.workspace_key
-                    );
+                    self.status = running_tool.success_status.unwrap_or_else(|| {
+                        format!(
+                            "{} completed for workspace '{}'",
+                            running_tool.operation_name, running_tool.workspace_key
+                        )
+                    });
                 }
                 Err(err) => {
                     self.status = format!(
@@ -1837,6 +1932,7 @@ impl TuiState {
         self.running_operation = Some(RunningOperation {
             workspace_key: workspace_key_owned,
             operation_name: tool_name_owned.clone(),
+            success_status: None,
             progress_rx,
             result_rx,
             cancel: None,
@@ -2123,6 +2219,7 @@ impl TuiState {
                     self.running_operation = Some(RunningOperation {
                         workspace_key: key.clone(),
                         operation_name: operation_name.to_string(),
+                        success_status: None,
                         progress_rx,
                         result_rx,
                         cancel: Some(join_handle.abort_handle()),

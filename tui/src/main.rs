@@ -210,6 +210,7 @@ struct CodexSessionTurnMetrics {
 struct RunningOperation {
     workspace_key: String,
     operation_name: String,
+    success_status: Option<String>,
     progress_rx: watch::Receiver<String>,
     result_rx: oneshot::Receiver<Result<(), String>>,
     cancel: Option<tokio::task::AbortHandle>,
