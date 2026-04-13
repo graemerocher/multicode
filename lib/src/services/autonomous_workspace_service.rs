@@ -43,6 +43,7 @@ const DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX: &str = "Dependency upgrade follow-u
 const DEPENDENCY_UPGRADE_PR_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-pr=";
 const IN_PROGRESS_LABEL: &str = "status: in progress";
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
+const WORK_STARTED_COMMENT_BODY: &str = "I started working on this issue";
 
 #[derive(Debug, Clone)]
 struct QueuedIssueCandidate {
@@ -840,9 +841,7 @@ async fn start_assigned_issue_work(
         return Err(err);
     }
 
-    if let Err(err) =
-        add_work_started_comment(assigned_repository, &issue, workspace_key, &token).await
-    {
+    if let Err(err) = add_work_started_comment(assigned_repository, &issue, &token).await {
         tracing::warn!(
             workspace_key,
             issue_url = %issue.url,
@@ -860,6 +859,16 @@ async fn start_assigned_issue_work(
             label = IN_PROGRESS_LABEL,
             error = %err,
             "manual issue prompt started but adding in-progress label failed"
+        );
+        return Err(err);
+    }
+
+    if let Err(err) = assign_issue_to_me(assigned_repository, &issue, &token).await {
+        tracing::warn!(
+            workspace_key,
+            issue_url = %issue.url,
+            error = %err,
+            "manual issue prompt started but assigning issue to current user failed"
         );
         return Err(err);
     }
@@ -3178,7 +3187,6 @@ fn dependency_upgrade_issue_search_queries(pr: &SelectedPullRequest) -> [String;
 async fn add_work_started_comment(
     assigned_repository: &str,
     issue: &SelectedIssue,
-    workspace_key: &str,
     token: &str,
 ) -> Result<(), String> {
     let mut command = Command::new(gh_program());
@@ -3191,7 +3199,7 @@ async fn add_work_started_comment(
             "--repo",
             assigned_repository,
             "--body",
-            &format!("multicode has started work on this issue in workspace `{workspace_key}`."),
+            work_started_comment_body(),
         ])
         .output()
         .await
@@ -3206,6 +3214,42 @@ async fn add_work_started_comment(
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+async fn assign_issue_to_me(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    token: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "edit",
+            &issue.url,
+            "--repo",
+            assigned_repository,
+            "--add-assignee",
+            "@me",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue edit for {}: {err}", issue.url))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh issue edit failed for {}: {}",
+            issue.url,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn work_started_comment_body() -> &'static str {
+    WORK_STARTED_COMMENT_BODY
 }
 
 async fn add_issue_label(
@@ -5297,6 +5341,11 @@ mod tests {
             "Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission."
         ));
         assert!(prompt.contains("Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing."));
+    }
+
+    #[test]
+    fn work_started_comment_body_is_first_person() {
+        assert_eq!(work_started_comment_body(), "I started working on this issue");
     }
 
     #[test]
