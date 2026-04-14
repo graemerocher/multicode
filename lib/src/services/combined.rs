@@ -2314,7 +2314,7 @@ fn spawn_autonomous_workspace_service(service: CombinedService) {
 mod tests {
     use super::*;
     use crate::services::{
-        GithubTokenConfig, ToolType,
+        CompareTool, GithubTokenConfig, ToolType,
         config::{CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode},
         runtime::{MountKind, MountSpec},
     };
@@ -2441,6 +2441,7 @@ mod tests {
             autonomous: Default::default(),
             agent: Default::default(),
             opencode: vec!["opencode-cli".to_string(), "opencode".to_string()],
+            compare: Default::default(),
             tool: Vec::new(),
             handler: Default::default(),
             remote: None,
@@ -2507,6 +2508,28 @@ model-provider = "openai"
         assert_eq!(
             config.agent.codex.network_access,
             CodexNetworkAccess::Enabled
+        );
+    }
+
+    #[test]
+    fn config_parses_compare_settings() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[compare]
+tool = "intellij"
+command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.compare.tool, CompareTool::Intellij);
+        assert_eq!(
+            config.compare.command.as_deref(),
+            Some("~/Library/Application Support/JetBrains/Toolbox/scripts/idea")
         );
     }
 

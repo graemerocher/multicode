@@ -682,7 +682,7 @@ impl TuiState {
         self.selected_workspace_snapshot()
             .is_some_and(workspace_is_usable)
             && self.selected_workspace_compare_target_path().is_some()
-            && vscode_is_available()
+            && compare_tool_is_available(&self.service.config.compare)
     }
 
     fn selected_workspace_compare_target_path(&self) -> Option<PathBuf> {
@@ -2448,13 +2448,17 @@ impl TuiState {
                         return;
                     };
 
-                    match write_compare_preview(&repo_path, &key).await {
+                    let compare_tool_name = compare_tool_name(self.service.config.compare.tool);
+                    match write_compare_preview(&self.service.config.compare, &repo_path, &key)
+                        .await
+                    {
                         Ok((program, args)) => {
                             tracing::info!(
                                 command = %format_command_line(&program, &args),
                                 workspace = %key,
                                 repo = %repo_path.display(),
-                                "opening workspace compare in vscode"
+                                compare_tool = compare_tool_name,
+                                "opening workspace compare"
                             );
                             let mut command = Command::new(&program);
                             match command
@@ -2465,8 +2469,9 @@ impl TuiState {
                                 .spawn()
                             {
                                 Ok(_) => {
-                                    self.status =
-                                        format!("Opened compare for workspace '{key}' in VS Code");
+                                    self.status = format!(
+                                        "Opened compare for workspace '{key}' in {compare_tool_name}"
+                                    );
                                 }
                                 Err(err) => {
                                     self.status = format!(

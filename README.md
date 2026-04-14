@@ -17,6 +17,43 @@ solve, but still take time to understand, debug and fix. AI agents can solve man
 cargo run --bin multicode-tui config.toml
 ```
 
+## Compare Tool
+
+The `c` shortcut in the TUI opens a workspace compare view. This is configurable in
+`config.toml` with the `[compare]` section.
+
+By default, multicode uses VS Code:
+
+```toml
+[compare]
+tool = "vscode"
+```
+
+Supported values are:
+
+- `vscode`
+- `intellij`
+
+You can also override the launcher command explicitly:
+
+```toml
+[compare]
+tool = "intellij"
+command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+```
+
+Notes:
+
+- If `command` is omitted, multicode tries common launcher names and install locations for the
+  selected tool.
+- For VS Code, that includes `code` and common macOS app bundle paths.
+- For IntelliJ IDEA, that includes `idea`, common app bundle paths, and the JetBrains Toolbox
+  shell script location at `~/Library/Application Support/JetBrains/Toolbox/scripts/idea`.
+- If you manage IntelliJ via JetBrains Toolbox, using the Toolbox-generated `idea` script is the
+  most stable option. If you have not enabled Toolbox shell scripts, you can instead point
+  `command` directly at the app binary inside the `.app` bundle.
+- The compare action opens the repository plus a generated diff preview file in the selected tool.
+
 ## Workspaces
 
 *multicode* parallelizes work in **workspaces**. They are short-lived and isolated. Typically, a workspace is used for

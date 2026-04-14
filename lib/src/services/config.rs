@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default = "default_opencode_commands")]
     pub opencode: Vec<String>,
     #[serde(default)]
+    pub compare: CompareConfig,
+    #[serde(default)]
     pub tool: Vec<ToolConfig>,
     #[serde(default)]
     pub handler: HandlerConfig,
@@ -44,6 +46,23 @@ pub struct AutonomousConfig {
     pub issue_scan_delay_seconds: u64,
     #[serde(default = "default_max_parallel_issues", alias = "max-parallel-issues")]
     pub max_parallel_issues: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CompareConfig {
+    #[serde(default)]
+    pub tool: CompareTool,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompareTool {
+    #[default]
+    Vscode,
+    Intellij,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]

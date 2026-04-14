@@ -25,8 +25,9 @@ pub use automation_state_file_service::{
 };
 pub use combined::{CombinedService, CombinedServiceError, summarize_workspace_start_failure};
 pub use config::{
-    AgentConfig, AgentProvider, AutonomousConfig, CodexAgentConfig, Config, GithubTokenConfig,
-    HandlerConfig, RuntimeConfig, ToolConfig, ToolType, parse_optional_size_bytes,
+    AgentConfig, AgentProvider, AutonomousConfig, CodexAgentConfig, CompareConfig, CompareTool,
+    Config, GithubTokenConfig, HandlerConfig, RuntimeConfig, ToolConfig, ToolType,
+    parse_optional_size_bytes,
 };
 pub use github_status_service::{
     GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrReviewState, GithubPrState,

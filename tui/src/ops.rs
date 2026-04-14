@@ -1,4 +1,5 @@
 use crate::*;
+use multicode_lib::services::{CompareConfig, CompareTool};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -15,32 +16,106 @@ fn vscode_command_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-pub(crate) fn vscode_command_path() -> Option<PathBuf> {
-    if command_exists("code") {
-        return Some(PathBuf::from("code"));
+fn intellij_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/Applications/IntelliJ IDEA.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA Ultimate.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA CE.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA Community Edition.app/Contents/MacOS/idea"),
+        PathBuf::from("/usr/local/bin/idea"),
+        PathBuf::from("/opt/idea/bin/idea.sh"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates
+            .push(PathBuf::from(&home).join("Applications/IntelliJ IDEA.app/Contents/MacOS/idea"));
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/IntelliJ IDEA Ultimate.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home).join("Applications/IntelliJ IDEA CE.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/IntelliJ IDEA Community Edition.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home).join("Library/Application Support/JetBrains/Toolbox/scripts/idea"),
+        );
+    }
+    candidates
+}
+
+fn compare_command_candidates(tool: CompareTool) -> Vec<PathBuf> {
+    match tool {
+        CompareTool::Vscode => {
+            let mut candidates = vec![PathBuf::from("code")];
+            candidates.extend(vscode_command_candidates());
+            candidates
+        }
+        CompareTool::Intellij => {
+            let mut candidates = vec![PathBuf::from("idea")];
+            candidates.extend(intellij_command_candidates());
+            candidates
+        }
+    }
+}
+
+pub(crate) fn compare_tool_name(tool: CompareTool) -> &'static str {
+    match tool {
+        CompareTool::Vscode => "VS Code",
+        CompareTool::Intellij => "IntelliJ IDEA",
+    }
+}
+
+fn compare_command_path(config: &CompareConfig) -> Option<PathBuf> {
+    if let Some(command) = config.command.as_deref().map(str::trim)
+        && !command.is_empty()
+        && command_exists(command)
+    {
+        return Some(PathBuf::from(command));
     }
 
-    vscode_command_candidates()
+    compare_command_candidates(config.tool)
         .into_iter()
         .find(|candidate| command_exists(candidate.to_string_lossy().as_ref()))
 }
 
-pub(crate) fn vscode_is_available() -> bool {
-    vscode_command_path().is_some()
+pub(crate) fn compare_tool_is_available(config: &CompareConfig) -> bool {
+    compare_command_path(config).is_some()
 }
 
-pub(crate) fn vscode_open_command(paths: &[PathBuf]) -> io::Result<(String, Vec<String>)> {
-    let program = vscode_command_path().ok_or_else(|| {
-        io::Error::other("VS Code is not installed or the 'code' CLI is unavailable")
+fn compare_open_command(
+    config: &CompareConfig,
+    paths: &[PathBuf],
+) -> io::Result<(String, Vec<String>)> {
+    let program = compare_command_path(config).ok_or_else(|| {
+        let configured = config.command.as_deref().map(str::trim).unwrap_or_default();
+        if configured.is_empty() {
+            io::Error::other(format!(
+                "{} is not installed or its CLI launcher is unavailable",
+                compare_tool_name(config.tool)
+            ))
+        } else {
+            io::Error::other(format!(
+                "{} compare command '{}' is unavailable",
+                compare_tool_name(config.tool),
+                configured
+            ))
+        }
     })?;
 
-    let mut args = vec!["--reuse-window".to_string()];
+    let mut args = Vec::new();
+    if matches!(config.tool, CompareTool::Vscode) {
+        args.push("--reuse-window".to_string());
+    }
     args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
 
     Ok((program.to_string_lossy().into_owned(), args))
 }
 
 pub(crate) async fn write_compare_preview(
+    compare: &CompareConfig,
     repo_path: &Path,
     workspace_key: &str,
 ) -> io::Result<(String, Vec<String>)> {
@@ -124,7 +199,7 @@ pub(crate) async fn write_compare_preview(
         paths.push(preview_path);
     }
 
-    vscode_open_command(&paths)
+    compare_open_command(compare, &paths)
 }
 
 pub(crate) fn shell_escape_arg(arg: &str) -> String {

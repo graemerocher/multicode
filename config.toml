@@ -14,6 +14,12 @@ commands = ["codex"]
 # sandbox-mode = "external-sandbox"
 # network-access = "enabled"
 
+[compare]
+tool = "vscode"
+# For JetBrains Toolbox users you can switch to IntelliJ IDEA instead:
+# tool = "intellij"
+# command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
 [runtime]
 backend = "apple-container"
 # Local Apple container image. It should contain Java 25, git, gh, opencode, and codex.

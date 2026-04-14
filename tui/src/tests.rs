@@ -4,7 +4,9 @@ use crate::*;
 mod tests {
     use multicode_lib::{
         AutomationAgentState, RootSessionStatus,
-        services::{HandlerConfig, codex_app_server::CodexThreadStatus},
+        services::{
+            CompareConfig, CompareTool, HandlerConfig, codex_app_server::CodexThreadStatus,
+        },
     };
 
     use super::*;
@@ -24,8 +26,9 @@ mod tests {
     };
     use crate::ops::{
         SessionWaitState, attach_cli_args, build_handler_command, command_exists,
-        session_wait_state_for_entry, task_attach_target, tmux_session_command, tmux_status_left,
-        validate_workspace_link_target, workspace_attach_target, workspace_ordering,
+        compare_tool_is_available, compare_tool_name, session_wait_state_for_entry,
+        task_attach_target, tmux_session_command, tmux_status_left, validate_workspace_link_target,
+        workspace_attach_target, workspace_ordering,
     };
     use crate::render::selected_link_tooltip_area;
     use crate::system::{
@@ -1048,6 +1051,29 @@ mod tests {
                 std::env::remove_var("PATH");
             }
         }
+    }
+
+    #[test]
+    fn compare_tool_is_available_uses_configured_command_path() {
+        let root = TestDir::new();
+        let tool_path = root.path().join("idea");
+        fs::write(&tool_path, "#!/bin/sh\nexit 0\n").expect("tool should be written");
+        let mut perms = fs::metadata(&tool_path)
+            .expect("tool metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tool_path, perms).expect("tool should be executable");
+
+        assert!(compare_tool_is_available(&CompareConfig {
+            tool: CompareTool::Intellij,
+            command: Some(tool_path.to_string_lossy().into_owned()),
+        }));
+    }
+
+    #[test]
+    fn compare_tool_name_labels_supported_tools() {
+        assert_eq!(compare_tool_name(CompareTool::Vscode), "VS Code");
+        assert_eq!(compare_tool_name(CompareTool::Intellij), "IntelliJ IDEA");
     }
 
     #[test]

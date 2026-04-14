@@ -10,6 +10,10 @@ approval-policy = "never"
 sandbox-mode = "external-sandbox"
 network-access = "enabled"
 
+[compare]
+tool = "intellij"
+command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
 [runtime]
 backend = "apple-container"
 codex-image = "multicode-codex-java25:latest"
