@@ -956,6 +956,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_attach_target_for_selection_uses_last_codex_thread_when_task_is_stale() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        started.task_states.insert(
+            "task-42".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-stale".to_string()),
+                agent_state: Some(AutomationAgentState::Stale),
+                ..Default::default()
+            },
+        );
+
+        let target = snapshot_attach_target_for_selection(&started, Some("task-42"))
+            .expect("stale codex task should attach via last thread");
+
+        assert_eq!(
+            target,
+            AttachTarget::Codex {
+                uri: "ws://127.0.0.1:3456/".to_string(),
+                thread_id: None,
+            }
+        );
+    }
+
+    #[test]
     fn snapshot_attach_target_for_selection_prefers_task_attach_when_task_session_exists() {
         let mut started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         started.root_session_id = Some("ses-root-1".to_string());

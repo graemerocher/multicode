@@ -150,7 +150,7 @@ fn apply_state_file_snapshot(
         {
             return false;
         }
-        let next_session_id = next.as_ref().and_then(|state| state.thread_id.clone());
+        let next_session_id = state_snapshot_session_id(next.as_ref());
         let next_agent_state = next.as_ref().map(|state| state.state);
         let next_session_status = next.as_ref().map(|state| state.state.root_status());
         if let Some(next_session_id) = next_session_id.as_deref()
@@ -222,6 +222,17 @@ fn apply_state_file_snapshot(
         }
         changed
     });
+}
+
+fn state_snapshot_session_id(next: Option<&ParsedAutomationState>) -> Option<String> {
+    match next {
+        Some(ParsedAutomationState {
+            state: AutomationAgentState::Stale,
+            ..
+        }) => None,
+        Some(state) => state.thread_id.clone(),
+        None => None,
+    }
 }
 
 fn clear_automation_state(workspace: &Workspace) {
@@ -452,6 +463,47 @@ mod tests {
         let parsed = parse_state_file("bogus\n").expect("state exists");
 
         assert_eq!(parsed.state, AutomationAgentState::Stale);
+    }
+
+    #[test]
+    fn stale_state_snapshot_does_not_promote_thread_id_to_resumable_session() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot.active_task_id = Some("task-42".to_string());
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            Some("task-42"),
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Stale,
+                thread_id: Some("thread-stale".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task state should be present");
+        assert_eq!(task_state.session_id, None);
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Stale));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
+        assert_eq!(snapshot.automation_session_id, None);
+        assert_eq!(snapshot.automation_agent_state, Some(AutomationAgentState::Stale));
+        assert_eq!(
+            snapshot.automation_session_status,
+            Some(RootSessionStatus::Idle)
+        );
     }
 
     #[test]
