@@ -13,6 +13,8 @@ mod tests {
     use crate::app::{
         compact_github_tooltip_target, count_codex_session_turn_metrics,
         last_user_message_from_codex_session_log_contents, restored_selected_row,
+        repository_diff_shell_command,
+        shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach,
         should_queue_task_codex_resume_until_vm_available,
@@ -76,6 +78,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn create_fake_git_repo(path: &std::path::Path) {
+        let git_dir = path.join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir should be created");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD should be created");
+        fs::write(git_dir.join("config"), "[core]\n\trepositoryformatversion = 0\n")
+            .expect("config should be created");
+        fs::create_dir_all(git_dir.join("objects")).expect("objects dir should be created");
+    }
+
+    fn create_fake_git_worktree(path: &std::path::Path, common_dir: &std::path::Path) {
+        let git_dir = common_dir
+            .join("worktrees")
+            .join(path.file_name().expect("worktree should have name"));
+        fs::create_dir_all(&git_dir).expect("worktree git dir should be created");
+        fs::write(path.join(".git"), format!("gitdir: {}\n", git_dir.display()))
+            .expect("worktree .git file should be created");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+            .expect("worktree HEAD should be created");
+        fs::write(git_dir.join("commondir"), "../..\n")
+            .expect("worktree commondir should be created");
     }
 
     fn snapshot(started: bool, uri: Option<&str>) -> WorkspaceSnapshot {
@@ -1077,6 +1101,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_diff_shell_command_keeps_pager_open_and_shows_status() {
+        let command = repository_diff_shell_command();
+        assert!(command.contains("git status --short"));
+        assert!(command.contains("git --no-pager diff"));
+        assert!(command.contains("less -R -X"));
+        assert!(!command.contains("less -R -F -X"));
+    }
+
+    #[test]
+    fn shell_command_in_repo_does_not_prefix_exec() {
+        let command = shell_command_in_repo("/tmp/repo", "tmp=1; echo hi");
+        assert!(command.contains("cd -- /tmp/repo && "));
+        assert!(!command.contains("&& exec "));
+    }
+
+    #[test]
     fn tui_cli_args_accept_optional_relay_socket() {
         let parsed = crate::CliArgs::try_parse_from([
             "multicode-tui",
@@ -1210,7 +1250,11 @@ mod tests {
             let err = validate_workspace_link_target(&link, &workspace_dir)
                 .await
                 .expect_err("repo outside workspace root should be rejected");
-            assert!(err.to_string().contains("outside workspace directory"));
+            let message = err.to_string();
+            assert!(
+                message.contains("outside workspace directory")
+                    || message.contains("must contain a '.git' entry")
+            );
         });
     }
 
@@ -1420,10 +1464,11 @@ mod tests {
             "https://github.com/micronaut-projects/micronaut-serialization/issues/921".to_string(),
         );
         let workspace = TestDir::new();
+        let repo_root = workspace.path().join("micronaut-serialization");
+        create_fake_git_repo(&repo_root);
         let repo_path = workspace.path().join("work/micronaut-serialization-921");
         fs::create_dir_all(&repo_path).expect("issue worktree repo should be created");
-        fs::write(repo_path.join(".git"), "gitdir: /tmp/mock-worktree\n")
-            .expect("issue worktree git file should be created");
+        create_fake_git_worktree(&repo_path, &repo_root.join(".git"));
 
         assert_eq!(
             compare_target_path(&started, &HashMap::new(), workspace.path()),
@@ -1437,12 +1482,79 @@ mod tests {
         started.persistent.assigned_repository =
             Some("micronaut-projects/micronaut-serialization".to_string());
         let workspace = TestDir::new();
-        let repo_path = workspace.path().join("micronaut-serialization/.git");
-        fs::create_dir_all(&repo_path).expect("assigned repo root should be created");
+        create_fake_git_repo(&workspace.path().join("micronaut-serialization"));
 
         assert_eq!(
             compare_target_path(&started, &HashMap::new(), workspace.path()),
             Some(workspace.path().join("micronaut-serialization"))
+        );
+    }
+
+    #[test]
+    fn compare_target_path_for_task_prefers_runtime_task_checkout_metadata() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-redis".to_string());
+        assign_active_task(
+            &mut started,
+            "https://github.com/micronaut-projects/micronaut-redis/issues/726",
+        );
+        let workspace = TestDir::new();
+        let repo_root = workspace.path().join("micronaut-redis");
+        create_fake_git_repo(&repo_root);
+        let worktree = workspace.path().join("work/micronaut-redis-726");
+        fs::create_dir_all(&worktree).expect("task worktree should be created");
+        create_fake_git_worktree(&worktree, &repo_root.join(".git"));
+        started.task_states.insert(
+            "task-42".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                repository: vec![repo_root.display().to_string(), worktree.display().to_string()],
+                ..Default::default()
+            },
+        );
+
+        let task = started
+            .task_persistent_snapshot("task-42")
+            .expect("task should exist");
+        assert_eq!(
+            compare_target_path_for_task(&started, task, started.task_states.get("task-42"), workspace.path()),
+            Some(worktree)
+        );
+    }
+
+    #[test]
+    fn compare_target_path_for_task_skips_broken_worktree_and_falls_back() {
+        let mut started = snapshot(true, Some("http://example"));
+        started.persistent.assigned_repository =
+            Some("micronaut-projects/micronaut-redis".to_string());
+        assign_active_task(
+            &mut started,
+            "https://github.com/micronaut-projects/micronaut-redis/issues/726",
+        );
+        let workspace = TestDir::new();
+        let repo_root = workspace.path().join("micronaut-redis");
+        create_fake_git_repo(&repo_root);
+        let worktree = workspace.path().join("work/micronaut-redis-726");
+        fs::create_dir_all(&worktree).expect("task worktree should be created");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", repo_root.join(".git/worktrees/micronaut-redis-726").display()),
+        )
+        .expect("broken worktree git file should be created");
+        started.task_states.insert(
+            "task-42".to_string(),
+            WorkspaceTaskRuntimeSnapshot {
+                repository: vec![worktree.display().to_string(), repo_root.display().to_string()],
+                ..Default::default()
+            },
+        );
+
+        let task = started
+            .task_persistent_snapshot("task-42")
+            .expect("task should exist");
+        assert_eq!(
+            compare_target_path_for_task(&started, task, started.task_states.get("task-42"), workspace.path()),
+            Some(repo_root)
         );
     }
 
@@ -1467,10 +1579,11 @@ mod tests {
             "https://github.com/micronaut-projects/micronaut-serialization/issues/921",
         );
         let workspace = TestDir::new();
+        let repo_root = workspace.path().join("micronaut-serialization");
+        create_fake_git_repo(&repo_root);
         let task_checkout = workspace.path().join("work/micronaut-serialization-921");
         fs::create_dir_all(&task_checkout).expect("task checkout should be created");
-        fs::write(task_checkout.join(".git"), "gitdir: /tmp/mock-worktree\n")
-            .expect("task checkout git file should be created");
+        create_fake_git_worktree(&task_checkout, &repo_root.join(".git"));
 
         assert_eq!(
             snapshot_attach_cwd_for_selection(
@@ -1489,8 +1602,7 @@ mod tests {
         started.persistent.assigned_repository =
             Some("micronaut-projects/micronaut-serialization".to_string());
         let workspace = TestDir::new();
-        let repo_root = workspace.path().join("micronaut-serialization/.git");
-        fs::create_dir_all(&repo_root).expect("workspace repo should be created");
+        create_fake_git_repo(&workspace.path().join("micronaut-serialization"));
 
         assert_eq!(
             snapshot_attach_cwd_for_selection(&started, None, &HashMap::new(), workspace.path()),
@@ -1829,6 +1941,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1866,6 +1979,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1894,6 +2008,7 @@ mod tests {
             true,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             false,
             false,
             no_tool_hotkeys(),
@@ -1928,6 +2043,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -1949,6 +2065,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -1976,6 +2093,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2010,6 +2128,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2032,6 +2151,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2065,6 +2185,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2090,6 +2211,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2112,6 +2234,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2145,6 +2268,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2171,6 +2295,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2203,6 +2328,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2232,6 +2358,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             no_tool_hotkeys(),
             "",
         );
@@ -2243,6 +2370,7 @@ mod tests {
 
         assert!(text.contains("Enter attach"));
         assert!(text.contains("c compare"));
+        assert!(text.contains("e edit"));
         assert!(text.contains("x remove issue"));
         assert!(!text.contains("a approve"));
         assert!(!text.contains("i issue"));
@@ -2269,6 +2397,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             no_tool_hotkeys(),
             "",
         );
@@ -2287,10 +2416,10 @@ mod tests {
         let started = snapshot(true, Some("http://example"));
         let enabled_line = help_line(
             UiMode::Normal,
-            1,
+            2,
             1,
             Some(&started),
-            false,
+            true,
             0,
             None,
             false,
@@ -2298,6 +2427,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             true,
             no_tool_hotkeys(),
             "",
@@ -2308,18 +2438,20 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(enabled_text.contains("c compare"));
+        assert!(enabled_text.contains("e edit"));
 
         let disabled_line = help_line(
             UiMode::Normal,
-            1,
+            2,
             1,
             Some(&started),
-            false,
+            true,
             0,
             None,
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2332,6 +2464,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(!disabled_text.contains("c compare"));
+        assert!(!disabled_text.contains("e edit"));
     }
 
     #[test]
@@ -2347,6 +2480,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2378,6 +2512,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2404,6 +2539,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2477,12 +2613,13 @@ mod tests {
             1,
             1,
             Some(&started),
-            false,
+            true,
             0,
             None,
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2649,6 +2786,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2672,6 +2810,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -3016,6 +3155,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -3043,6 +3183,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -3066,6 +3207,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,

@@ -1046,6 +1046,7 @@ fn compare_target_path(
 fn compare_target_path_for_task(
     snapshot: &WorkspaceSnapshot,
     task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
     workspace_path: &Path,
 ) -> Option<PathBuf> {
     let repo_name = snapshot
@@ -1060,12 +1061,32 @@ fn compare_target_path_for_task(
         .next()
         .filter(|segment| !segment.is_empty())?;
 
-    let candidates = [
-        workspace_path
-            .join("work")
-            .join(format!("{repo_name}-{issue_number}")),
-        workspace_path.join(repo_name),
-    ];
+    let worktree_name = format!("{repo_name}-{issue_number}");
+    let mut candidates = Vec::new();
+
+    if let Some(task_state) = task_state {
+        for repository in &task_state.repository {
+            let candidate = PathBuf::from(repository);
+            if candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == worktree_name)
+            {
+                push_unique_candidate(&mut candidates, candidate);
+            }
+        }
+    }
+
+    push_unique_candidate(&mut candidates, workspace_path.join("work").join(&worktree_name));
+
+    if let Some(task_state) = task_state {
+        for repository in &task_state.repository {
+            push_unique_candidate(&mut candidates, PathBuf::from(repository));
+        }
+    }
+
+    push_unique_candidate(&mut candidates, workspace_path.join(repo_name));
+
     candidates
         .into_iter()
         .find(|candidate| is_git_checkout(candidate))
@@ -1105,7 +1126,66 @@ fn compare_target_path_from_workspace(
 }
 
 fn is_git_checkout(path: &Path) -> bool {
-    std::fs::symlink_metadata(path.join(".git")).is_ok()
+    let Some(git_dir) = checkout_git_dir(path) else {
+        return false;
+    };
+
+    if !git_dir.is_dir() || !git_dir.join("HEAD").exists() {
+        return false;
+    }
+
+    let commondir_path = git_dir.join("commondir");
+    if !commondir_path.is_file() {
+        return true;
+    }
+
+    let Ok(commondir) = std::fs::read_to_string(&commondir_path) else {
+        return false;
+    };
+    let commondir = commondir.trim();
+    if commondir.is_empty() {
+        return false;
+    }
+
+    let common_dir = resolve_git_path(&git_dir, commondir);
+    common_dir.is_dir()
+        && (common_dir.join("config").exists()
+            || common_dir.join("HEAD").exists()
+            || common_dir.join("objects").exists())
+}
+
+fn checkout_git_dir(path: &Path) -> Option<PathBuf> {
+    let git_path = path.join(".git");
+    let metadata = std::fs::symlink_metadata(&git_path).ok()?;
+    if metadata.is_dir() {
+        return Some(git_path);
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(&git_path).ok()?;
+    let git_dir = contents.strip_prefix("gitdir:")?.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+
+    Some(resolve_git_path(path, git_dir))
+}
+
+fn resolve_git_path(base: &Path, target: &str) -> PathBuf {
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        base.join(target_path)
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn active_task_issue_url(snapshot: &WorkspaceSnapshot) -> Option<String> {
@@ -1310,7 +1390,8 @@ fn help_line(
     selected_link_kind: Option<WorkspaceLinkKind>,
     selected_workspace_has_refreshable_github_link: bool,
     selected_workspace_can_assign_issue: bool,
-    selected_workspace_can_compare: bool,
+    selected_workspace_can_diff: bool,
+    selected_workspace_can_edit: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
 ) -> Line<'static> {
@@ -1333,11 +1414,17 @@ fn help_line(
                         {
                             push_hotkey(&mut spans, "Enter", " start+attach  ");
                         }
-                        if selected_workspace_can_compare {
+                        if selected_workspace_can_diff {
                             push_hotkey(&mut spans, "c", " compare  ");
+                        }
+                        if selected_workspace_can_edit {
+                            push_hotkey(&mut spans, "e", " edit  ");
                         }
                         if workspace_supports_task_approval(snapshot) {
                             push_hotkey(&mut spans, "a", " approve  ");
+                        }
+                        for (tool_key, tool_name) in tool_hotkeys {
+                            push_hotkey(&mut spans, tool_key.clone(), format!(" {}  ", tool_name));
                         }
                         push_hotkey(&mut spans, "x", " remove issue  ");
                         push_hotkey(&mut spans, "q", " quit");
@@ -1400,8 +1487,11 @@ fn help_line(
                         if selected_workspace_can_assign_issue {
                             push_hotkey(&mut spans, "i", " issue  ");
                         }
-                        if selected_workspace_can_compare {
+                        if selected_workspace_can_diff {
                             push_hotkey(&mut spans, "c", " compare  ");
+                        }
+                        if selected_workspace_can_edit {
+                            push_hotkey(&mut spans, "e", " edit  ");
                         }
                         push_hotkey(&mut spans, "d", " edit description  ");
                         push_hotkey(&mut spans, "x", " delete  ");

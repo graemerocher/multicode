@@ -436,7 +436,8 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         app.selected_workspace_snapshot().is_some_and(|snapshot| {
             workspace_is_usable(snapshot) && snapshot.persistent.assigned_repository.is_some()
         }) && app.selected_link_index.is_none(),
-        app.selected_workspace_can_compare(),
+        app.selected_workspace_can_diff(),
+        app.selected_workspace_can_edit(),
         &app.contextual_tool_hotkeys(),
         &app.status,
     );

@@ -3219,8 +3219,9 @@ fn build_issue_prompt(
             issue_url = issue.url
         )
     } else {
-        "7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing. When the change is ready, stop and ask for permission.\n\
-8. When you do create or update the pull request after approval, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements."
+        "7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing.\n\
+8. When the change is ready for review, stage the full task checkout with `git add -A` so new files are included, then stop and ask for permission.\n\
+9. When you do create or update the pull request after approval, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements."
             .to_string()
     };
     format!(
@@ -6486,6 +6487,9 @@ mod tests {
             "Run repository commands, builds, Gradle tasks, and focused tests as needed without asking for permission."
         ));
         assert!(prompt.contains("Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing."));
+        assert!(prompt.contains(
+            "When the change is ready for review, stage the full task checkout with `git add -A`"
+        ));
         assert!(prompt.contains("include an appropriate type label such as `type: docs`"));
         assert!(prompt.contains("`type: bug`"));
         assert!(prompt.contains("`type: improvement`"));
@@ -6512,6 +6516,7 @@ mod tests {
         );
 
         assert!(prompt.contains("explicitly approves publishing"));
+        assert!(prompt.contains("stage the full task checkout with `git add -A`"));
         assert!(!prompt.contains("backed by Renovate pull request"));
         assert!(!prompt.contains("merge it without waiting for human review"));
     }

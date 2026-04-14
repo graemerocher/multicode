@@ -11,6 +11,34 @@ const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
 const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
 const CODEX_CREATE_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing. Create or update the pull request now from this task checkout. Push the branch if needed, use the correct upstream base branch, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements, assign the pull request to yourself, request Copilot review, emit the <multicode:pr> link, and stop once the PR is ready for human review. If a PR already exists, update it instead of creating a duplicate. Do not merge the PR.";
 
+pub(crate) fn repository_diff_shell_command() -> &'static str {
+    r#"tmp="$(mktemp -t multicode-diff.XXXXXX)" || exit 1
+{
+  echo "Git status"
+  echo "=========="
+  git status --short
+  echo
+  echo "Git diff"
+  echo "========"
+  git --no-pager diff --color=always --stat --patch HEAD --
+} >"$tmp"
+if [ ! -s "$tmp" ]; then
+  printf 'No local changes\n' >"$tmp"
+fi
+if command -v less >/dev/null 2>&1; then
+  less -R -X "$tmp"
+else
+  cat "$tmp"
+  printf '\nPress Enter to return...'
+  read -r _
+fi
+rm -f "$tmp""#
+}
+
+pub(crate) fn shell_command_in_repo(repo_dir: &str, shell_command: &str) -> String {
+    format!("cd -- {} && {}", shell_escape_arg(repo_dir), shell_command)
+}
+
 pub(crate) fn count_codex_session_turn_metrics(contents: &str) -> CodexSessionTurnMetrics {
     CodexSessionTurnMetrics {
         started: contents.matches("\"type\":\"task_started\"").count(),
@@ -674,25 +702,37 @@ impl TuiState {
             .and_then(|key| self.snapshots.get(key))
     }
 
-    pub(crate) fn selected_workspace_can_compare(&self) -> bool {
+    pub(crate) fn selected_workspace_can_diff(&self) -> bool {
         if self.selected_link_index.is_some() {
+            return false;
+        }
+        if self.selected_task_id().is_none() {
             return false;
         }
 
         self.selected_workspace_snapshot()
             .is_some_and(workspace_is_usable)
-            && self.selected_workspace_compare_target_path().is_some()
+            && self.selected_workspace_repo_path().is_some()
+    }
+
+    pub(crate) fn selected_workspace_can_edit(&self) -> bool {
+        self.selected_workspace_can_diff()
             && compare_tool_is_available(&self.service.config.compare)
     }
 
-    fn selected_workspace_compare_target_path(&self) -> Option<PathBuf> {
+    fn selected_workspace_repo_path(&self) -> Option<PathBuf> {
         let key = self.selected_workspace_key()?;
         let snapshot = self.snapshots.get(key)?;
         let workspace_path = self.service.workspace_directory_path().join(key);
         if let Some(task_id) = self.selected_task_id()
             && let Some(task) = task_persistent_snapshot(snapshot, task_id)
         {
-            return compare_target_path_for_task(snapshot, task, &workspace_path);
+            return compare_target_path_for_task(
+                snapshot,
+                task,
+                task_runtime_snapshot(snapshot, task_id),
+                &workspace_path,
+            );
         }
         compare_target_path(
             snapshot,
@@ -1125,13 +1165,40 @@ impl TuiState {
     }
 
     pub(crate) fn contextual_tool_hotkeys(&self) -> Vec<(String, String)> {
-        if self.selected_task_id().is_some() {
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
             return Vec::new();
+        };
+        let mut seen = HashSet::new();
+
+        if self.selected_task_id().is_some() {
+            if self.selected_workspace_repo_path().is_none() {
+                return Vec::new();
+            }
+            return self
+                .service
+                .config
+                .tool
+                .iter()
+                .filter(|tool| matches!(tool.type_, ToolType::Exec))
+                .filter(|tool| tool_is_usable(tool, snapshot))
+                .filter_map(|tool| {
+                    let ch = tool_key_char(tool)?;
+                    seen.insert(ch).then_some((ch.to_string(), tool.name.clone()))
+                })
+                .collect();
         }
-        contextual_tool_hotkeys(
-            &self.service.config.tool,
-            self.selected_workspace_snapshot(),
-        )
+
+        self.service
+            .config
+            .tool
+            .iter()
+            .filter(|tool| matches!(tool.type_, ToolType::Prompt))
+            .filter(|tool| tool_is_usable(tool, snapshot))
+            .filter_map(|tool| {
+                let ch = tool_key_char(tool)?;
+                seen.insert(ch).then_some((ch.to_string(), tool.name.clone()))
+            })
+            .collect()
     }
 
     fn auto_attach_ready_key(&mut self, now: Instant) -> Option<String> {
@@ -1937,8 +2004,14 @@ impl TuiState {
         let Some(tool) = find_tool_for_key(&self.service.config.tool, key_char) else {
             return;
         };
+        let selected_repo_path = self.selected_workspace_repo_path();
+        let selected_task = self.selected_task_id().is_some();
 
-        if !tool_is_usable(&tool, &snapshot) {
+        if !tool_is_usable(&tool, &snapshot)
+            || (selected_task && !matches!(tool.type_, ToolType::Exec))
+            || (selected_task && selected_repo_path.is_none())
+            || (!selected_task && !matches!(tool.type_, ToolType::Prompt))
+        {
             self.status = format!(
                 "Tool '{}' is unavailable for workspace '{}' in its current state",
                 tool.name, workspace_key
@@ -1952,8 +2025,14 @@ impl TuiState {
                     self.status = format!("Tool '{}' is missing its exec command", tool.name);
                     return;
                 };
-                self.run_exec_tool(terminal, &workspace_key, &tool.name, exec_command)
-                    .await;
+                self.run_exec_tool(
+                    terminal,
+                    &workspace_key,
+                    &tool.name,
+                    exec_command,
+                    selected_repo_path.as_deref(),
+                )
+                .await;
             }
             ToolType::Prompt => {
                 let Some(prompt) = tool.prompt.as_deref().map(str::trim) else {
@@ -1972,50 +2051,105 @@ impl TuiState {
         workspace_key: &str,
         tool_name: &str,
         exec_command: &str,
+        repo_path: Option<&Path>,
     ) {
-        let exec_command = match self
-            .service
-            .build_exec_tool_command(workspace_key, exec_command)
+        let result = if let Some(repo_path) = repo_path {
+            self.run_repo_shell_command_in_pty(terminal, workspace_key, repo_path, exec_command)
+                .await
+        } else {
+            let exec_command = match self
+                .service
+                .build_exec_tool_command(workspace_key, exec_command)
+                .await
+            {
+                Ok(command) => command,
+                Err(err) => {
+                    self.status = format!("Failed to prepare exec tool '{}': {err:?}", tool_name);
+                    return;
+                }
+            };
+
+            let inherited_env = exec_command.inherited_env;
+            let tmux_command = std::iter::once(exec_command.program)
+                .chain(exec_command.args)
+                .collect::<Vec<_>>();
+            let custom_description = self
+                .snapshots
+                .get(workspace_key)
+                .map(|snapshot| snapshot.persistent.description.clone())
+                .unwrap_or_default();
+            tracing::info!(
+                workspace_key = workspace_key,
+                tool_name = tool_name,
+                command = %format_command_line("tmux", &{
+                    let mut debug_command = vec![
+                        "new-session".to_string(),
+                        "-d".to_string(),
+                        "-s".to_string(),
+                        "<session>".to_string(),
+                        "env".to_string(),
+                    ];
+                    debug_command.extend(
+                        inherited_env
+                            .iter()
+                            .map(|(name, value)| format!("{name}={value}")),
+                    );
+                    debug_command.extend(tmux_command.clone());
+                    debug_command
+                }),
+                "launching exec tool tmux command"
+            );
+            run_tmux_new_session_command(
+                terminal,
+                &inherited_env,
+                tmux_command,
+                None,
+                workspace_key,
+                &custom_description,
+            )
             .await
-        {
-            Ok(command) => command,
-            Err(err) => {
-                self.status = format!("Failed to prepare exec tool '{}': {err:?}", tool_name);
-                return;
-            }
         };
 
-        let inherited_env = exec_command.inherited_env;
-        let tmux_command = std::iter::once(exec_command.program)
-            .chain(exec_command.args)
+        self.status = match result {
+            Ok(()) => format!(
+                "Tool '{}' finished for workspace '{}'",
+                tool_name, workspace_key
+            ),
+            Err(err) => format!("Failed to run tool '{}': {err}", tool_name),
+        };
+    }
+
+    async fn run_repo_shell_command_in_pty(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        workspace_key: &str,
+        repo_path: &Path,
+        shell_command: &str,
+    ) -> io::Result<()> {
+        let repo_dir = repo_path.to_string_lossy().into_owned();
+        let command = self
+            .service
+            .build_pty_tool_command(
+                workspace_key,
+                vec![
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    shell_command_in_repo(&repo_dir, shell_command),
+                ],
+            )
+            .await
+            .map_err(|err| io::Error::other(format!("failed to prepare PTY command: {err:?}")))?;
+
+        let inherited_env = command.inherited_env;
+        let tmux_command = std::iter::once(command.program)
+            .chain(command.args)
             .collect::<Vec<_>>();
         let custom_description = self
             .snapshots
             .get(workspace_key)
             .map(|snapshot| snapshot.persistent.description.clone())
             .unwrap_or_default();
-        tracing::info!(
-            workspace_key = workspace_key,
-            tool_name = tool_name,
-            command = %format_command_line("tmux", &{
-                let mut debug_command = vec![
-                    "new-session".to_string(),
-                    "-d".to_string(),
-                    "-s".to_string(),
-                    "<session>".to_string(),
-                    "env".to_string(),
-                ];
-                debug_command.extend(
-                    inherited_env
-                        .iter()
-                        .map(|(name, value)| format!("{name}={value}")),
-                );
-                debug_command.extend(tmux_command.clone());
-                debug_command
-            }),
-            "launching exec tool tmux command"
-        );
-        self.status = match run_tmux_new_session_command(
+        run_tmux_new_session_command(
             terminal,
             &inherited_env,
             tmux_command,
@@ -2024,12 +2158,85 @@ impl TuiState {
             &custom_description,
         )
         .await
+    }
+
+    async fn open_selected_workspace_in_editor(&mut self) {
+        if let Some(key) = self.selected_workspace_key().map(str::to_string) {
+            let Some(snapshot) = self.snapshots.get(&key) else {
+                return;
+            };
+            if !workspace_is_usable(snapshot) {
+                self.status = format!("Workspace '{key}' is archived and cannot be opened");
+                return;
+            }
+            let Some(repo_path) = self.selected_workspace_repo_path() else {
+                self.status = format!("Workspace '{key}' does not have a repository to edit");
+                return;
+            };
+
+            let compare_tool_name = compare_tool_name(self.service.config.compare.tool);
+            match compare_open_repo_command(&self.service.config.compare, &repo_path) {
+                Ok((program, args)) => {
+                    tracing::info!(
+                        command = %format_command_line(&program, &args),
+                        workspace = %key,
+                        repo = %repo_path.display(),
+                        compare_tool = compare_tool_name,
+                        "opening workspace repository in editor"
+                    );
+                    let mut command = Command::new(&program);
+                    match command
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Ok(_) => {
+                            self.status = format!(
+                                "Opened workspace '{key}' in {compare_tool_name}"
+                            );
+                        }
+                        Err(err) => {
+                            self.status =
+                                format!("Failed to open workspace '{key}' in {compare_tool_name}: {err}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.status =
+                        format!("Failed to open workspace '{key}' in {compare_tool_name}: {err}");
+                }
+            }
+        }
+    }
+
+    async fn open_selected_workspace_diff_in_terminal(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) {
+        let Some(key) = self.selected_workspace_key().map(str::to_string) else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&key) else {
+            return;
+        };
+        if !workspace_is_usable(snapshot) {
+            self.status = format!("Workspace '{key}' is archived and cannot be compared");
+            return;
+        }
+        let Some(repo_path) = self.selected_workspace_repo_path() else {
+            self.status = format!("Workspace '{key}' does not have a repository to compare");
+            return;
+        };
+
+        let diff_command = repository_diff_shell_command();
+        self.status = match self
+            .run_repo_shell_command_in_pty(terminal, &key, &repo_path, diff_command)
+            .await
         {
-            Ok(()) => format!(
-                "Tool '{}' finished for workspace '{}'",
-                tool_name, workspace_key
-            ),
-            Err(err) => format!("Failed to run tool '{}': {err}", tool_name),
+            Ok(()) => format!("Compared workspace '{key}'"),
+            Err(err) => format!("Failed to compare workspace '{key}': {err}"),
         };
     }
 
@@ -2434,58 +2641,19 @@ impl TuiState {
                 if link_selected {
                     return;
                 }
-                if let Some(key) = self.selected_workspace_key().map(str::to_string) {
-                    let Some(snapshot) = self.snapshots.get(&key) else {
-                        return;
-                    };
-                    if !workspace_is_usable(snapshot) {
-                        self.status = format!("Workspace '{key}' is archived and cannot be opened");
-                        return;
-                    }
-                    let Some(repo_path) = self.selected_workspace_compare_target_path() else {
-                        self.status =
-                            format!("Workspace '{key}' does not have a repository to compare");
-                        return;
-                    };
-
-                    let compare_tool_name = compare_tool_name(self.service.config.compare.tool);
-                    match write_compare_preview(&self.service.config.compare, &repo_path, &key)
-                        .await
-                    {
-                        Ok((program, args)) => {
-                            tracing::info!(
-                                command = %format_command_line(&program, &args),
-                                workspace = %key,
-                                repo = %repo_path.display(),
-                                compare_tool = compare_tool_name,
-                                "opening workspace compare"
-                            );
-                            let mut command = Command::new(&program);
-                            match command
-                                .args(&args)
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .spawn()
-                            {
-                                Ok(_) => {
-                                    self.status = format!(
-                                        "Opened compare for workspace '{key}' in {compare_tool_name}"
-                                    );
-                                }
-                                Err(err) => {
-                                    self.status = format!(
-                                        "Failed to open compare for workspace '{key}': {err}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            self.status =
-                                format!("Failed to open compare for workspace '{key}': {err}");
-                        }
-                    }
+                if self.selected_task_id().is_none() {
+                    return;
                 }
+                self.open_selected_workspace_diff_in_terminal(terminal).await;
+            }
+            KeyCode::Char('e') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_none() {
+                    return;
+                }
+                self.open_selected_workspace_in_editor().await;
             }
             KeyCode::Char('d') => {
                 if link_selected {
@@ -3096,7 +3264,12 @@ pub(crate) fn snapshot_attach_cwd_for_selection(
     if let Some(task_id) = selected_task_id
         && let Some(task) = task_persistent_snapshot(snapshot, task_id)
     {
-        return compare_target_path_for_task(snapshot, task, workspace_path);
+        return compare_target_path_for_task(
+            snapshot,
+            task,
+            task_runtime_snapshot(snapshot, task_id),
+            workspace_path,
+        );
     }
 
     compare_target_path(snapshot, validations, workspace_path)

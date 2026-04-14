@@ -114,92 +114,11 @@ fn compare_open_command(
     Ok((program.to_string_lossy().into_owned(), args))
 }
 
-pub(crate) async fn write_compare_preview(
+pub(crate) fn compare_open_repo_command(
     compare: &CompareConfig,
     repo_path: &Path,
-    workspace_key: &str,
 ) -> io::Result<(String, Vec<String>)> {
-    let diff = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["diff", "--no-ext-diff", "--stat", "--patch", "HEAD", "--"])
-        .output()
-        .await?;
-    if !diff.status.success() {
-        let stderr = String::from_utf8_lossy(&diff.stderr).trim().to_string();
-        return Err(io::Error::other(format!(
-            "git diff failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        )));
-    }
-
-    let untracked = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
-        .await?;
-    if !untracked.status.success() {
-        let stderr = String::from_utf8_lossy(&untracked.stderr)
-            .trim()
-            .to_string();
-        return Err(io::Error::other(format!(
-            "git ls-files failed{}",
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        )));
-    }
-
-    let diff_text = String::from_utf8_lossy(&diff.stdout).into_owned();
-    let untracked_text = String::from_utf8_lossy(&untracked.stdout).into_owned();
-    let mut preview = String::new();
-    if !diff_text.trim().is_empty() {
-        preview.push_str(&diff_text);
-        if !preview.ends_with('\n') {
-            preview.push('\n');
-        }
-    }
-    if !untracked_text.trim().is_empty() {
-        if !preview.is_empty() {
-            preview.push('\n');
-        }
-        preview.push_str("Untracked files:\n");
-        for line in untracked_text
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-        {
-            preview.push_str("  ");
-            preview.push_str(line);
-            preview.push('\n');
-        }
-    }
-
-    let mut paths = vec![repo_path.to_path_buf()];
-    if !preview.trim().is_empty() {
-        let sanitized_key: String = workspace_key
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let preview_path =
-            std::env::temp_dir().join(format!("multicode-compare-{sanitized_key}.diff"));
-        tokio::fs::write(&preview_path, preview).await?;
-        paths.push(preview_path);
-    }
-
-    compare_open_command(compare, &paths)
+    compare_open_command(compare, &[repo_path.to_path_buf()])
 }
 
 pub(crate) fn shell_escape_arg(arg: &str) -> String {
