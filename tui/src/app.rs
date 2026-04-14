@@ -276,7 +276,15 @@ pub(crate) fn should_auto_resume_task_codex_after_attach(
         return matches!(initial_agent_state, Some(AutomationAgentState::Working));
     }
 
-    match task_effective_agent_state(Some(task_state)) {
+    let effective_agent_state = task_effective_agent_state(Some(task_state));
+    if attached_session_id.is_some()
+        && task_state.session_id.as_deref() == attached_session_id
+        && effective_agent_state == Some(AutomationAgentState::Working)
+    {
+        return false;
+    }
+
+    match effective_agent_state {
         Some(AutomationAgentState::Working) => true,
         Some(
             AutomationAgentState::WaitingOnVm

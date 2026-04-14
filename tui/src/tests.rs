@@ -493,9 +493,25 @@ mod tests {
             agent_state: Some(AutomationAgentState::Working),
             ..Default::default()
         };
-        assert!(should_auto_resume_task_codex_after_attach(
+        assert!(!should_auto_resume_task_codex_after_attach(
             Some(&busy_state),
             Some("thread-4"),
+            Some(AutomationAgentState::Working)
+        ));
+    }
+
+    #[test]
+    fn task_auto_resume_after_attach_resumes_busy_task_when_session_is_missing() {
+        let busy_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-4".to_string()),
+            session_status: Some(RootSessionStatus::Busy),
+            agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+
+        assert!(should_auto_resume_task_codex_after_attach(
+            Some(&busy_state),
+            None,
             Some(AutomationAgentState::Working)
         ));
     }
