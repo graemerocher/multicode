@@ -14,18 +14,6 @@ network-access = "enabled"
 backend = "apple-container"
 codex-image = "multicode-codex-java25:latest"
 
-[runtime.docker-bridge]
-enabled = true
-allowed-images = [
-    "redis",
-    "testcontainers/ryuk",
-    "confluentinc/cp-kafka",
-    "confluentinc/cp-zookeeper",
-    "apache/kafka",
-    "apache/kafka-native",
-    "bitnami/kafka",
-]
-
 [github]
 token = {env = "GITHUB_MCP_TOKEN"}
 populate-git-credentials = true
@@ -46,7 +34,6 @@ inherit-env = [
     "LANG",
     "TERM",
     "COLORTERM",
-    "DOCKER_HOST",
 ]
 memory-high = "6 GiB"
 memory-max = "8 GiB"
