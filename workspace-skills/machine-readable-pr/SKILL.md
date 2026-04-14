@@ -32,6 +32,21 @@ When creating or updating the PR, add an appropriate type label. Choose the clos
 
 Do not skip the label when the repository has a matching label available.
 
+If you mention agent authorship anywhere in the PR title, body, comments, or related text, do not use `multicode <multicode@yawk.at>`. Use the actual agent name, actual model name, and an agent-appropriate email address instead:
+
+```
+Co-Authored-By: <agent> with <model> <<agent-email>>
+```
+
+Examples:
+
+```text
+Co-Authored-By: Codex with GPT-5 <codex@openai.com>
+Co-Authored-By: OpenCode with Claude 4 <opencode@example.com>
+```
+
+Do not hard-code `Codex with GPT-5 <codex@openai.com>` unless that is actually the agent, model, and email identity used.
+
 Do not merge pull requests yourself. A PR should be merged by a human, not by the agent.
 
 The only exception is an explicit dependency-upgrade workflow where the user or repository policy already allows automated merging for that upgrade task. Outside that narrow case, stop at review-ready and leave the PR open.
