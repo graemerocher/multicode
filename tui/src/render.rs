@@ -438,6 +438,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         }) && app.selected_link_index.is_none(),
         app.selected_workspace_can_diff(),
         app.selected_workspace_can_edit(),
+        app.running_operation_is_cancellable(),
         &app.contextual_tool_hotkeys(),
         &app.status,
     );

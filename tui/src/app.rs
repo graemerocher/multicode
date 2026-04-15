@@ -503,6 +503,7 @@ impl TuiState {
             pending_task_removal_action: TaskRemovalAction::default(),
             attached_session: None,
             starting_workspace_key: None,
+            starting_attach_when_ready: false,
             started_wait_since: None,
             previous_machine_cpu_totals: None,
             machine_cpu_count: 1,
@@ -648,18 +649,30 @@ impl TuiState {
                 .and_then(|key| self.snapshots.get(key).map(workspace_state));
             match starting_state {
                 Some(WorkspaceUiState::Starting) => {}
-                Some(WorkspaceUiState::Started) => {}
+                Some(WorkspaceUiState::Started) => {
+                    if !self.starting_attach_when_ready {
+                        if let Some(key) = self.starting_workspace_key.as_deref() {
+                            self.status = format!("Started workspace '{key}'");
+                        }
+                        self.mode = UiMode::Normal;
+                        self.starting_workspace_key = None;
+                        self.starting_attach_when_ready = false;
+                        self.started_wait_since = None;
+                    }
+                }
                 Some(WorkspaceUiState::Stopped) => {
                     if let Some(key) = self.starting_workspace_key.as_deref() {
                         self.status = starting_modal_failure_status(key, self.snapshots.get(key));
                     }
                     self.mode = UiMode::Normal;
                     self.starting_workspace_key = None;
+                    self.starting_attach_when_ready = false;
                     self.started_wait_since = None;
                 }
                 None => {
                     self.mode = UiMode::Normal;
                     self.starting_workspace_key = None;
+                    self.starting_attach_when_ready = false;
                     self.started_wait_since = None;
                 }
             }
@@ -1170,6 +1183,88 @@ impl TuiState {
         }
     }
 
+    fn start_workspace_operation(&mut self, workspace_key: String, attach_when_ready: bool) {
+        let initial_progress = if attach_when_ready {
+            format!("Starting workspace '{workspace_key}' before attaching...")
+        } else {
+            format!("Starting workspace '{workspace_key}'...")
+        };
+        let (progress_tx, progress_rx) = watch::channel(initial_progress);
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+
+        tokio::spawn(async move {
+            let _ = progress_tx.send(format!(
+                "Starting runtime for workspace '{workspace_key_for_task}'..."
+            ));
+            let result = service
+                .start_workspace(&workspace_key_for_task)
+                .await
+                .map_err(|err| err.summary());
+            if result.is_ok() {
+                let _ = progress_tx.send(format!(
+                    "Runtime started for workspace '{workspace_key_for_task}'. Waiting for server readiness..."
+                ));
+            }
+            let _ = result_tx.send(result);
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: "Start".to_string(),
+            success_status: None,
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::WaitForWorkspaceStart {
+                attach_when_ready,
+            },
+            cancel: None,
+        });
+        self.mode = UiMode::ToolProgressModal;
+        self.status = if attach_when_ready {
+            format!("Starting workspace '{workspace_key}' before attaching")
+        } else {
+            format!("Starting workspace '{workspace_key}'")
+        };
+    }
+
+    fn start_stop_workspace_operation(&mut self, workspace_key: String) {
+        let (progress_tx, progress_rx) =
+            watch::channel(format!("Stopping workspace '{workspace_key}'..."));
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+
+        tokio::spawn(async move {
+            let _ = progress_tx.send(format!(
+                "Stopping runtime for workspace '{workspace_key_for_task}'..."
+            ));
+            let result = service
+                .stop_workspace(&workspace_key_for_task)
+                .await
+                .map_err(|err| err.summary());
+            if result.is_ok() {
+                let _ = progress_tx.send(format!(
+                    "Stopped workspace '{workspace_key_for_task}'. Refreshing UI state..."
+                ));
+            }
+            let _ = result_tx.send(result);
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: "Stop".to_string(),
+            success_status: Some(format!("Stopped workspace '{workspace_key}'")),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::None,
+            cancel: None,
+        });
+        self.mode = UiMode::ToolProgressModal;
+        self.status = format!("Stopping workspace '{workspace_key}'");
+    }
+
     fn move_selected_link_right(&mut self) {
         let link_count = self.selected_workspace_link_count();
         self.selected_link_index = next_link_selection_right(self.selected_link_index, link_count);
@@ -1472,6 +1567,7 @@ impl TuiState {
             )),
             progress_rx,
             result_rx,
+            completion_action: RunningOperationCompletionAction::None,
             cancel: None,
         });
         self.status = format!(
@@ -1505,12 +1601,16 @@ impl TuiState {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) {
+        if !self.starting_attach_when_ready {
+            return;
+        }
         let Some(key) = self.auto_attach_ready_key(Instant::now()) else {
             return;
         };
 
         self.mode = UiMode::Normal;
         self.starting_workspace_key = None;
+        self.starting_attach_when_ready = false;
         self.started_wait_since = None;
 
         match self.snapshot_attach_target(&key) {
@@ -2065,17 +2165,41 @@ impl TuiState {
         if let Some(result) = completion
             && let Some(running_tool) = self.running_operation.take()
         {
-            self.mode = UiMode::Normal;
             match result {
                 Ok(()) => {
-                    self.status = running_tool.success_status.unwrap_or_else(|| {
-                        format!(
-                            "{} completed for workspace '{}'",
-                            running_tool.operation_name, running_tool.workspace_key
-                        )
-                    });
+                    match running_tool.completion_action {
+                        RunningOperationCompletionAction::None => {
+                            self.mode = UiMode::Normal;
+                            self.status = running_tool.success_status.unwrap_or_else(|| {
+                                format!(
+                                    "{} completed for workspace '{}'",
+                                    running_tool.operation_name, running_tool.workspace_key
+                                )
+                            });
+                        }
+                        RunningOperationCompletionAction::WaitForWorkspaceStart {
+                            attach_when_ready,
+                        } => {
+                            self.mode = UiMode::StartingModal;
+                            self.starting_workspace_key = Some(running_tool.workspace_key.clone());
+                            self.starting_attach_when_ready = attach_when_ready;
+                            self.started_wait_since = None;
+                            self.status = if attach_when_ready {
+                                format!(
+                                    "Starting workspace '{}' before attaching",
+                                    running_tool.workspace_key
+                                )
+                            } else {
+                                format!(
+                                    "Waiting for workspace '{}' to become ready",
+                                    running_tool.workspace_key
+                                )
+                            };
+                        }
+                    }
                 }
                 Err(err) => {
+                    self.mode = UiMode::Normal;
                     self.status = format!(
                         "{} failed for workspace '{}': {err}",
                         running_tool.operation_name, running_tool.workspace_key
@@ -2094,8 +2218,24 @@ impl TuiState {
         })
     }
 
+    pub(crate) fn running_operation_is_cancellable(&self) -> bool {
+        self.running_operation
+            .as_ref()
+            .and_then(|operation| operation.cancel.as_ref())
+            .is_some()
+    }
+
     fn handle_tool_progress_key(&mut self, key: KeyEvent) {
         if key.code != KeyCode::Esc {
+            return;
+        }
+        if !self.running_operation_is_cancellable() {
+            if let Some(operation) = self.running_operation.as_ref() {
+                self.status = format!(
+                    "{} is still running for workspace '{}'",
+                    operation.operation_name, operation.workspace_key
+                );
+            }
             return;
         }
         let Some(mut operation) = self.running_operation.take() else {
@@ -2466,6 +2606,7 @@ impl TuiState {
             success_status: None,
             progress_rx,
             result_rx,
+            completion_action: RunningOperationCompletionAction::None,
             cancel: None,
         });
         self.mode = UiMode::ToolProgressModal;
@@ -2691,21 +2832,7 @@ impl TuiState {
                                     format!("Workspace '{key}' is archived and cannot be started");
                                 return;
                             }
-                            match self.service.start_workspace(&key).await {
-                                Ok(_) => {
-                                    self.mode = UiMode::StartingModal;
-                                    self.starting_workspace_key = Some(key.clone());
-                                    self.started_wait_since = None;
-                                    self.status =
-                                        format!("Starting workspace '{key}' before attaching");
-                                }
-                                Err(err) => {
-                                    self.status = format!(
-                                        "Failed to start workspace '{key}' before attaching: {}",
-                                        err.summary()
-                                    );
-                                }
-                            }
+                            self.start_workspace_operation(key.clone(), true);
                         }
                         None => {}
                     }
@@ -2753,6 +2880,7 @@ impl TuiState {
                         success_status: None,
                         progress_rx,
                         result_rx,
+                        completion_action: RunningOperationCompletionAction::None,
                         cancel: Some(join_handle.abort_handle()),
                     });
                     self.mode = UiMode::ToolProgressModal;
@@ -2850,23 +2978,10 @@ impl TuiState {
                                     format!("Workspace '{key}' is archived and cannot be started");
                                 return;
                             }
-                            match self.service.start_workspace(&key).await {
-                                Ok(_) => self.status = format!("Starting workspace '{key}'"),
-                                Err(err) => {
-                                    self.status = format!(
-                                        "Failed to start workspace '{key}': {}",
-                                        err.summary()
-                                    )
-                                }
-                            }
+                            self.start_workspace_operation(key, false);
                         }
                         Some(WorkspaceUiState::Starting) | Some(WorkspaceUiState::Started) => {
-                            match self.service.stop_workspace(&key).await {
-                                Ok(_) => self.status = format!("Stopped workspace '{key}'"),
-                                Err(err) => {
-                                    self.status = format!("Failed to stop workspace: {err:?}")
-                                }
-                            }
+                            self.start_stop_workspace_operation(key);
                         }
                         None => {}
                     }

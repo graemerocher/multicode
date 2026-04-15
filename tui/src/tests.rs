@@ -46,9 +46,12 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::broadcast;
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir {
         path: PathBuf,
@@ -60,10 +63,12 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos();
+            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "multicode-tui-test-{}-{}",
+                "multicode-tui-test-{}-{}-{}",
                 std::process::id(),
-                unique
+                unique,
+                counter,
             ));
             fs::create_dir_all(&path).expect("test dir should be created");
             Self { path }
@@ -1970,6 +1975,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2008,6 +2014,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2036,6 +2043,7 @@ mod tests {
             true,
             Some(WorkspaceLinkKind::Issue),
             true,
+            false,
             false,
             false,
             false,
@@ -2072,6 +2080,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2093,6 +2102,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2121,6 +2131,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2157,6 +2168,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2179,6 +2191,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2214,6 +2227,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2240,6 +2254,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2262,6 +2277,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2297,6 +2313,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2324,6 +2341,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2359,6 +2377,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2389,6 +2408,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2428,6 +2448,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2459,6 +2480,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2481,6 +2503,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2514,6 +2537,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2524,6 +2548,38 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Starting workspace and waiting for server readiness"));
+    }
+
+    #[test]
+    fn help_line_shows_wait_message_for_non_cancellable_tool_progress_modal() {
+        let line = help_line(
+            UiMode::ToolProgressModal,
+            1,
+            1,
+            Some(&snapshot(false, None)),
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Operation is running in the selected workspace"));
+        assert!(text.contains("Waiting for it to finish"));
+        assert!(!text.contains("Esc cancel"));
     }
 
     #[test]
@@ -2539,6 +2595,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2569,6 +2626,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2649,6 +2707,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -2817,6 +2876,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2840,6 +2900,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -3186,6 +3247,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -3214,6 +3276,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -3237,6 +3300,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,

@@ -178,6 +178,7 @@ struct TuiState {
     pending_task_removal_action: TaskRemovalAction,
     attached_session: Option<AttachedSession>,
     starting_workspace_key: Option<String>,
+    starting_attach_when_ready: bool,
     started_wait_since: Option<Instant>,
     previous_machine_cpu_totals: Option<ProcCpuTotals>,
     machine_cpu_count: usize,
@@ -213,7 +214,15 @@ struct RunningOperation {
     success_status: Option<String>,
     progress_rx: watch::Receiver<String>,
     result_rx: oneshot::Receiver<Result<(), String>>,
+    completion_action: RunningOperationCompletionAction,
     cancel: Option<tokio::task::AbortHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RunningOperationCompletionAction {
+    #[default]
+    None,
+    WaitForWorkspaceStart { attach_when_ready: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1392,6 +1401,7 @@ fn help_line(
     selected_workspace_can_assign_issue: bool,
     selected_workspace_can_diff: bool,
     selected_workspace_can_edit: bool,
+    tool_progress_can_cancel: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
 ) -> Line<'static> {
@@ -1552,7 +1562,11 @@ fn help_line(
             spans.push(Span::raw(
                 "Operation is running in the selected workspace... ",
             ));
-            push_hotkey(&mut spans, "Esc", " cancel");
+            if tool_progress_can_cancel {
+                push_hotkey(&mut spans, "Esc", " cancel");
+            } else {
+                spans.push(Span::raw("Waiting for it to finish..."));
+            }
         }
     }
     if !status.is_empty() {
