@@ -11,6 +11,12 @@ If you are using `gh`, prefer:
 gh pr edit --add-assignee @me
 ```
 
+For Micronaut projects, also assign the PR to the next Micronaut project release at the organization level under `https://github.com/orgs/micronaut-projects/projects`.
+
+- Prefer the next semantically versioned release project.
+- The next available project is typically suffixed with a milestone number, for example `5.0.0-M2`.
+- Otherwise, use the semantically versioned project suffixed with `Release`, for example `5.0.0 Release`.
+
 After assigning the PR to yourself, request a review from Copilot as soon as the PR exists.
 
 After creating the PR, assigning yourself, and requesting the Copilot review, immediately emit the link to the PR like this:

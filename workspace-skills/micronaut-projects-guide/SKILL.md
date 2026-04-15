@@ -39,6 +39,16 @@ When writing documentation:
 - Unless the project only supports a narrower set, create snippets for Java, Kotlin, and Groovy.
 - Resolve documentation snippets from the project's `doc-examples` subdirectory.
 - Structure `doc-examples` in the same style used by `micronaut-graphql`'s `docs-examples` reference project on the `5.0.x` branch.
+- For configuration examples, prefer the `configuration` macro:
+
+```adoc
+[configuration]
+----
+YAML GOES HERE
+----
+```
+
+- Do not use `[source,yaml]` for configuration snippets when the `configuration` macro applies, because `configuration` renders the example across configuration formats such as properties, YAML, and TOML.
 
 ## PR creation
 
