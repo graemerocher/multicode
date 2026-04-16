@@ -233,7 +233,7 @@ writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
 readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
 isolated = ["~/.local/share/opencode", "~/.local/state/opencode"]
 tmpfs = ["/tmp"]
-inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
+inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
 cpu = "300%"
 ```
@@ -264,7 +264,7 @@ codex-image = "ghcr.io/example/multicode-codex-java25:latest"
 [isolation]
 add-skills-from = ["./workspace-skills"]
 writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
-inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR", "GITHUB_MCP_TOKEN"]
+inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
 cpu = "300%"
 ```
@@ -356,30 +356,55 @@ Alternatively, you can add entries manually in the TUI, but this is tedious.
 ### Authentication
 
 To authenticate with GitHub, you need to configure a [personal access token (PAT)](https://github.com/settings/tokens) 
-(required scopes: `public_repo`, `read:user`). In `config.toml`, there are two approaches to configuring this token:
+(required scopes: `public_repo`, `read:user`). In `config.toml`, there are three approaches to configuring this token:
 
 ```toml
 [github]
+# Token from macOS Keychain
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
 # Token from environment variable
 token = {env = "GITHUB_MCP_TOKEN"}
 # Token from command (GitHub CLI)
 token = {command = "gh auth token"}
 ```
 
-The env variable approach is recommended. It is prudent to use a token that has more limited access than the GitHub CLI.
+On macOS, the Keychain approach is recommended because the token is not left in shell startup files or other plaintext
+config. The env variable and command approaches remain available as fallbacks. It is prudent to use a token that has
+more limited access than the GitHub CLI.
+
+To store the token in Keychain and configure multicode to use it:
+
+```bash
+security add-generic-password -U \
+  -a github-mcp-token \
+  -s multicode.github \
+  -w 'YOUR_GITHUB_PAT'
+```
+
+You can verify the stored token can be read:
+
+```bash
+security find-generic-password -a github-mcp-token -s multicode.github -w
+```
+
+Then configure:
+
+```toml
+[github]
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
+populate-git-credentials = true
+```
 
 To give agents access to GitHub, there are two options to set. `populate-git-credentials` will set environment 
 variables that authenticate `git` instances inside the isolate with GitHub. This allows the agents to push changes to
-repos they have cloned with HTTPS. The `inherit_env` option allows you to inherit the token from the environment, which
-you can then configure the GitHub MCP server to use. This allows the agent to e.g. create pull requests from the 
-changes it has pushed.
+repos they have cloned with HTTPS. It also provides `GH_TOKEN` and `GITHUB_TOKEN` inside the isolate for GitHub-aware
+tools. The `inherit_env` option is only needed if you explicitly want to pass through additional host environment
+variables; it is not required when using the Keychain-backed GitHub token source.
 
 ```toml
 [github]
 token = ...
 populate-git-credentials = true
-[isolation]
-inherit_env = [..., "GITHUB_MCP_TOKEN"]
 ```
 
 ## Description

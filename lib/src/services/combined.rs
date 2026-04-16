@@ -2509,6 +2509,8 @@ token = { env = "GITHUB_TOKEN" }
             Some(GithubTokenConfig {
                 env: Some("GITHUB_TOKEN".to_string()),
                 command: None,
+                keychain_service: None,
+                keychain_account: None,
             })
         );
     }
@@ -2713,6 +2715,8 @@ token = { env = "GITHUB_TOKEN" }
             Some(GithubTokenConfig {
                 env: Some("GITHUB_TOKEN".to_string()),
                 command: None,
+                keychain_service: None,
+                keychain_account: None,
             })
         );
     }
@@ -2736,6 +2740,33 @@ token = { command = "gh auth token" }
             Some(GithubTokenConfig {
                 env: None,
                 command: Some("gh auth token".to_string()),
+                keychain_service: None,
+                keychain_account: None,
+            })
+        );
+    }
+
+    #[test]
+    fn config_parses_github_token_keychain_source() {
+        let config: Config = toml::from_str(
+            r#"
+workspace-directory = "/tmp/workspaces"
+
+[github]
+token = { keychain-service = "multicode.github", keychain-account = "github-mcp-token" }
+
+[isolation]
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.github.token,
+            Some(GithubTokenConfig {
+                env: None,
+                command: None,
+                keychain_service: Some("multicode.github".to_string()),
+                keychain_account: Some("github-mcp-token".to_string()),
             })
         );
     }

@@ -27,7 +27,7 @@ image = "multicode-java25:latest"
 
 [github]
 #token = {command = "gh auth token"}
-token = {env = "GITHUB_MCP_TOKEN"}
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
 populate-git-credentials = true
 
 [isolation]

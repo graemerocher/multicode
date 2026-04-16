@@ -468,6 +468,8 @@ impl TuiState {
             config.github.token = Some(GithubTokenConfig {
                 env: Some(github_token_env),
                 command: None,
+                keychain_service: None,
+                keychain_account: None,
             });
         }
         let service = CombinedService::from_config_path(&config_path)

@@ -755,6 +755,8 @@ impl GithubStatusService {
             Some(GithubTokenConfig {
                 env: Some(env),
                 command: None,
+                keychain_service: None,
+                keychain_account: None,
             }) => {
                 let token = std::env::var(env).map_err(|err| {
                     GithubStatusServiceError::Auth(format!(
@@ -766,18 +768,54 @@ impl GithubStatusService {
             Some(GithubTokenConfig {
                 env: None,
                 command: Some(command),
+                keychain_service: None,
+                keychain_account: None,
             }) => load_github_token_from_command(command).await,
+            Some(GithubTokenConfig {
+                env: None,
+                command: None,
+                keychain_service: Some(service),
+                keychain_account,
+            }) => load_github_token_from_keychain(service, keychain_account.as_deref()).await,
+            Some(GithubTokenConfig {
+                env: None,
+                command: None,
+                keychain_service: None,
+                keychain_account: Some(_),
+            }) => Err(GithubStatusServiceError::Auth(
+                "GitHub token config cannot set `keychain-account` without `keychain-service`"
+                    .to_string(),
+            )),
             Some(GithubTokenConfig {
                 env: Some(_),
                 command: Some(_),
+                keychain_service: _,
+                keychain_account: _,
+            })
+            | Some(GithubTokenConfig {
+                env: Some(_),
+                command: None,
+                keychain_service: Some(_),
+                keychain_account: _,
+            })
+            | Some(GithubTokenConfig {
+                env: None,
+                command: Some(_),
+                keychain_service: Some(_),
+                keychain_account: _,
             }) => Err(GithubStatusServiceError::Auth(
-                "GitHub token config must set exactly one of `env` or `command`".to_string(),
+                "GitHub token config must set exactly one of `env`, `command`, or `keychain-service`".to_string(),
             )),
             Some(GithubTokenConfig {
                 env: None,
                 command: None,
+                keychain_service: None,
+                keychain_account: None,
             }) => Err(GithubStatusServiceError::Auth(
-                "GitHub token config must set exactly one of `env` or `command`".to_string(),
+                "GitHub token config must set exactly one of `env`, `command`, or `keychain-service`".to_string(),
+            )),
+            Some(_) => Err(GithubStatusServiceError::Auth(
+                "GitHub token config must set exactly one of `env`, `command`, or `keychain-service`".to_string(),
             )),
             None => load_github_token_from_command("gh auth token").await,
         }
@@ -818,6 +856,53 @@ async fn load_github_token_from_command(command: &str) -> Result<String, GithubS
         &String::from_utf8_lossy(&output.stdout),
         &source_description,
     )
+}
+
+async fn load_github_token_from_keychain(
+    service: &str,
+    account: Option<&str>,
+) -> Result<String, GithubStatusServiceError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("security");
+        command.arg("find-generic-password").arg("-s").arg(service);
+        if let Some(account) = account {
+            command.arg("-a").arg(account);
+        }
+        command.arg("-w");
+        let output = command.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let source_description = account
+                .map(|account| format!("service `{service}` account `{account}`"))
+                .unwrap_or_else(|| format!("service `{service}`"));
+            let message = if stderr.is_empty() {
+                format!(
+                    "GitHub token Keychain lookup for {source_description} failed with status {}",
+                    output.status
+                )
+            } else {
+                format!("GitHub token Keychain lookup for {source_description} failed: {stderr}")
+            };
+            return Err(GithubStatusServiceError::Auth(message));
+        }
+
+        let source_description = account
+            .map(|account| format!("macOS Keychain item service `{service}` account `{account}`"))
+            .unwrap_or_else(|| format!("macOS Keychain item service `{service}`"));
+        return validate_github_token(
+            &String::from_utf8_lossy(&output.stdout),
+            &source_description,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (service, account);
+        Err(GithubStatusServiceError::Auth(
+            "GitHub token `keychain-service` is only supported on macOS".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1206,9 +1291,13 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir {
         path: PathBuf,
@@ -1220,10 +1309,12 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system time should be after unix epoch")
                 .as_nanos();
+            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "multicode-github-status-service-{}-{}",
+                "multicode-github-status-service-{}-{}-{}",
                 std::process::id(),
-                unique
+                unique,
+                counter
             ));
             fs::create_dir_all(&path).expect("test dir should be created");
             Self { path }
@@ -1693,6 +1784,8 @@ mod tests {
                 Some(GithubTokenConfig {
                     env: Some(variable_name.to_string()),
                     command: None,
+                    keychain_service: None,
+                    keychain_account: None,
                 }),
             )
             .await
@@ -1733,6 +1826,8 @@ mod tests {
                 Some(GithubTokenConfig {
                     env: None,
                     command: Some("printf 'command-token-value\n'".to_string()),
+                    keychain_service: None,
+                    keychain_account: None,
                 }),
             )
             .await
@@ -1743,6 +1838,77 @@ mod tests {
                 .await
                 .expect("token should load from command");
             assert_eq!(token, "command-token-value");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_loads_github_token_from_keychain() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            tokio::fs::create_dir_all(&workspace_root)
+                .await
+                .expect("workspace root should exist");
+            let database = Database::open_in_workspace(&workspace_root)
+                .await
+                .expect("database should open");
+
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            let security_path = bin_dir.join("security");
+            fs::write(
+                &security_path,
+                "#!/bin/sh\n[ \"$1\" = \"find-generic-password\" ] || exit 11\n[ \"$2\" = \"-s\" ] || exit 12\n[ \"$3\" = \"multicode.github\" ] || exit 13\n[ \"$4\" = \"-a\" ] || exit 14\n[ \"$5\" = \"github-mcp-token\" ] || exit 15\n[ \"$6\" = \"-w\" ] || exit 16\nprintf 'keychain-token-value\\n'\n",
+            )
+            .expect("fake security should be written");
+            let mut perms = fs::metadata(&security_path)
+                .expect("fake security metadata should be readable")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&security_path, perms)
+                .expect("fake security should be executable");
+
+            let previous_path = std::env::var_os("PATH");
+            let path = match &previous_path {
+                Some(previous_path) => format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    previous_path.to_string_lossy()
+                ),
+                None => bin_dir.display().to_string(),
+            };
+            unsafe {
+                std::env::set_var("PATH", path);
+            }
+
+            let service = GithubStatusService::new(
+                database,
+                Some(GithubTokenConfig {
+                    env: None,
+                    command: None,
+                    keychain_service: Some("multicode.github".to_string()),
+                    keychain_account: Some("github-mcp-token".to_string()),
+                }),
+            )
+            .await
+            .expect("service should construct");
+
+            let token = service
+                .github_token()
+                .await
+                .expect("token should load from keychain");
+            assert_eq!(token, "keychain-token-value");
+
+            match previous_path {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
         });
     }
 

@@ -189,6 +189,10 @@ pub struct GithubTokenConfig {
     pub env: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default)]
+    pub keychain_service: Option<String>,
+    #[serde(default)]
+    pub keychain_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

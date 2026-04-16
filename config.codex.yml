@@ -19,7 +19,7 @@ backend = "apple-container"
 codex-image = "multicode-codex-java25:latest"
 
 [github]
-token = {env = "GITHUB_MCP_TOKEN"}
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
 populate-git-credentials = true
 
 [autonomous]
