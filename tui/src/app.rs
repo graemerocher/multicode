@@ -241,6 +241,32 @@ pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
     Some(format!("{NERD_FONT_GITHUB_GLYPH} {owner}/{repo}#{number}"))
 }
 
+pub(crate) fn github_repository_url(repository: &str) -> Option<String> {
+    let trimmed = repository.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.host_str()? != "github.com" {
+            return None;
+        }
+        let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+        let owner = segments.next()?;
+        let repo = segments.next()?;
+        return Some(format!("https://github.com/{owner}/{repo}"));
+    }
+
+    let mut segments = trimmed.split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
+
 pub(crate) fn has_available_task_slot(
     snapshot: &WorkspaceSnapshot,
     max_parallel_issues: usize,
@@ -754,6 +780,18 @@ impl TuiState {
     pub(crate) fn selected_workspace_can_edit(&self) -> bool {
         self.selected_workspace_can_diff()
             && compare_tool_is_available(&self.service.config.compare)
+    }
+
+    fn selected_workspace_github_repository_url(&self) -> Option<String> {
+        if self.selected_task_id().is_some() {
+            return None;
+        }
+
+        self.selected_workspace_snapshot()?
+            .persistent
+            .assigned_repository
+            .as_deref()
+            .and_then(github_repository_url)
     }
 
     fn selected_workspace_repo_path(&self) -> Option<PathBuf> {
@@ -2717,6 +2755,75 @@ impl TuiState {
         }
     }
 
+    async fn open_selected_github_target(&mut self) {
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key) else {
+            return;
+        };
+        if snapshot.persistent.archived {
+            self.status = format!(
+                "GitHub links for workspace '{}' are unavailable while archived",
+                workspace_key
+            );
+            return;
+        }
+
+        let (target_description, url) = if let Some(link) = self.selected_workspace_link() {
+            if link.value.is_empty()
+                || !matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
+            {
+                return;
+            }
+            let targets = self.selected_workspace_link_targets();
+            let Some((_, argument)) = targets.get(self.selected_link_target_index) else {
+                self.status = format!(
+                    "{} link for workspace '{}' is still validating or invalid",
+                    link.label(),
+                    workspace_key
+                );
+                return;
+            };
+            ("GitHub link", argument.clone())
+        } else {
+            let Some(url) = self.selected_workspace_github_repository_url() else {
+                return;
+            };
+            ("GitHub repository", url)
+        };
+
+        let (program, args) = match build_handler_command(
+            &self.service.config.handler.web,
+            multicode_lib::HandlerArgumentMode::Argument,
+            &url,
+        ) {
+            Ok(command) => command,
+            Err(err) => {
+                self.status = format!(
+                    "Invalid web handler configuration for workspace '{}': {err}",
+                    workspace_key
+                );
+                return;
+            }
+        };
+
+        let result =
+            dispatch_web_handler_action(self.relay_socket.as_deref(), &program, &args, &url).await;
+
+        match result {
+            Ok(()) => {
+                self.status =
+                    format!("Opened {target_description} for workspace '{workspace_key}'");
+            }
+            Err(err) => {
+                self.status = format!(
+                    "Failed to open {target_description} for workspace '{workspace_key}': {err}"
+                );
+            }
+        }
+    }
+
     async fn handle_normal_key(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2976,6 +3083,12 @@ impl TuiState {
                     return;
                 }
                 self.request_selected_workspace_queue_next_issue();
+            }
+            KeyCode::Char('o') => {
+                if !link_selected && self.selected_task_id().is_some() {
+                    return;
+                }
+                self.open_selected_github_target().await;
             }
             KeyCode::Char('s') => {
                 if link_selected {
@@ -3621,5 +3734,50 @@ pub(crate) async fn dispatch_handler_action(
     if link.kind == WorkspaceLinkKind::Review {
         command.current_dir(argument);
     }
+    command.spawn().map(|_| ())
+}
+
+async fn dispatch_web_handler_action(
+    relay_socket: Option<&Path>,
+    program: &str,
+    args: &[String],
+    argument: &str,
+) -> io::Result<()> {
+    if let Some(socket_path) = relay_socket {
+        let request = multicode_lib::RemoteActionRequest {
+            action: multicode_lib::RemoteAction::Web,
+            argument: argument.to_string(),
+        };
+        let payload = multicode_lib::encode_remote_action_request(&request);
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await?;
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(payload.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    tracing::info!(
+        command = %std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(|arg| {
+                if arg.is_empty() {
+                    "''".to_string()
+                } else if arg.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | ':' | '_' | '-' | '.' | '=')) {
+                    arg.to_string()
+                } else {
+                    format!("'{}'", arg.replace('\'', "'\\''"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        "starting web handler via local spawn"
+    );
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     command.spawn().map(|_| ())
 }

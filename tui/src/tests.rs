@@ -11,7 +11,7 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        compact_github_tooltip_target, count_codex_session_turn_metrics,
+        compact_github_tooltip_target, count_codex_session_turn_metrics, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
@@ -1795,6 +1795,28 @@ mod tests {
     }
 
     #[test]
+    fn github_repository_url_normalizes_repository_specs() {
+        assert_eq!(
+            github_repository_url("micronaut-projects/micronaut-core"),
+            Some("https://github.com/micronaut-projects/micronaut-core".to_string())
+        );
+        assert_eq!(
+            github_repository_url("https://github.com/micronaut-projects/micronaut-core/issues"),
+            Some("https://github.com/micronaut-projects/micronaut-core".to_string())
+        );
+    }
+
+    #[test]
+    fn github_repository_url_rejects_invalid_specs() {
+        assert_eq!(github_repository_url(""), None);
+        assert_eq!(github_repository_url("owner/repo/extra"), None);
+        assert_eq!(
+            github_repository_url("https://example.com/owner/repo"),
+            None
+        );
+    }
+
+    #[test]
     fn selected_link_tooltip_area_prefers_space_below_link() {
         let targets = vec![("target".to_string(), false)];
         let area = selected_link_tooltip_area(
@@ -2013,6 +2035,7 @@ mod tests {
 
         assert!(text.contains("←/→ select link"));
         assert!(text.contains("Enter open link"));
+        assert!(text.contains("o open GitHub"));
         assert!(text.contains("↑/↓ select target"));
         assert!(text.contains("a add link"));
         assert!(text.contains("Esc row focus"));
@@ -2349,6 +2372,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
+        assert!(text.contains("o open repo"));
         assert!(text.contains("i issue"));
         assert!(text.contains("n queue next"));
     }

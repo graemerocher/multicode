@@ -1463,6 +1463,12 @@ fn help_line(
                             push_hotkey(&mut spans, "Enter", add_label);
                         } else {
                             push_hotkey(&mut spans, "Enter", " open link  ");
+                            if matches!(
+                                selected_link_kind,
+                                Some(WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr)
+                            ) {
+                                push_hotkey(&mut spans, "o", " open GitHub  ");
+                            }
                             push_hotkey(&mut spans, "a", " add link  ");
                         }
                         if selected_link_is_custom && !selected_link_is_placeholder {
@@ -1500,6 +1506,7 @@ fn help_line(
                             }
                         }
                         if selected_workspace_can_assign_issue {
+                            push_hotkey(&mut spans, "o", " open repo  ");
                             push_hotkey(&mut spans, "i", " issue  ");
                             push_hotkey(&mut spans, "n", " queue next  ");
                         }
