@@ -45,8 +45,10 @@ const DEPENDENCY_UPGRADE_LABEL: &str = "type: dependency-upgrade";
 const NON_MAJOR_DEPENDENCY_UPGRADE_LABELS: [&str; 4] = ["minor", "patch", "pin", "digest"];
 const MAJOR_DEPENDENCY_UPGRADE_LABELS: [&str; 1] = ["major"];
 const RENOVATE_LOGINS: [&str; 2] = ["renovate[bot]", "app/renovate"];
-const DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX: &str = "Dependency upgrade follow-up for PR #";
+const DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX: &str =
+    "Dependency upgrade follow-up for Renovate batch";
 const DEPENDENCY_UPGRADE_PR_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-pr=";
+const DEPENDENCY_UPGRADE_PR_BATCH_MARKER_PREFIX: &str = "<!-- multicode:dependency-upgrade-prs=";
 const IN_PROGRESS_LABEL: &str = "status: in progress";
 const IN_PROGRESS_LABEL_ALIASES: [&str; 2] = [IN_PROGRESS_LABEL, "status: in-progress"];
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
@@ -881,10 +883,10 @@ async fn start_assigned_issue_work(
     };
     let existing_task = task_persistent_snapshot_for_issue(snapshot, &issue.url);
     let backing_pr_url = issue
-        .backing_pr_url()
+        .legacy_dependency_upgrade_pr_url()
         .map(ToOwned::to_owned)
         .or_else(|| existing_task.and_then(|task| task.backing_pr_url.clone()));
-    let dependency_upgrade_backing_pr = issue.backing_pr_url().is_some()
+    let dependency_upgrade_backing_pr = !issue.dependency_upgrade_pr_urls().is_empty()
         || existing_task.is_some_and(|task| task.dependency_upgrade_backing_pr);
 
     ensure_workspace_task_claim(
@@ -1034,7 +1036,7 @@ async fn refresh_existing_task_backing_pr_urls(
             is_pull_request: Some(false),
             body: None,
             labels: Vec::new(),
-            dependency_upgrade_pr_url: None,
+            dependency_upgrade_pr_urls: Vec::new(),
         };
         let discovered =
             discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
@@ -2773,7 +2775,7 @@ async fn refresh_task_backing_pr_url_after_codex_review(
         is_pull_request: Some(false),
         body: None,
         labels: Vec::new(),
-        dependency_upgrade_pr_url: None,
+        dependency_upgrade_pr_urls: Vec::new(),
     };
     let backing_pr_url =
         discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests)?;
@@ -3400,15 +3402,34 @@ fn build_issue_prompt(
     cwd: &std::path::Path,
     task_state_path: &std::path::Path,
 ) -> String {
-    let publish_instruction = if let Some(backing_pr_url) = backing_pr_url {
-        format!(
-            "7. This task is backed by Renovate pull request {backing_pr_url}. Confirm it is still a non-major dependency upgrade.\n\
-8. If CI for {backing_pr_url} is already passing, rebase the branch if needed, merge it without waiting for human review, and close GitHub issue {issue_url}.\n\
-9. Do not leave placeholder comments, placeholder reviews, or dummy approvals on {backing_pr_url}; only comment or review when it is strictly required to complete the merge.\n\
-10. If CI is not passing, investigate the failure and only stop for human input if you cannot safely get the dependency upgrade merged.\n\
-11. If you merge the PR, summarize the merge result and make sure the issue is closed before stopping.",
-            issue_url = issue.url
-        )
+    let dependency_upgrade_pr_urls = issue.dependency_upgrade_pr_urls();
+    let publish_instruction = if !dependency_upgrade_pr_urls.is_empty() {
+        let renovate_pr_list = dependency_upgrade_pr_urls
+            .iter()
+            .map(|url| format!("- {url}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(backing_pr_url) = backing_pr_url {
+            format!(
+                "7. This task tracks the following Renovate pull requests:\n\
+{renovate_pr_list}\n\
+8. Treat {backing_pr_url} as the single combined dependency-upgrade PR for GitHub issue {issue_url}. Do not merge the individual Renovate PRs directly.\n\
+9. Confirm the source Renovate PRs are still safe non-major updates and keep the combined PR aligned with that set.\n\
+10. Get CI passing for {backing_pr_url}. Merge only the combined PR once its CI is green, then close GitHub issue {issue_url}.\n\
+11. Do not leave placeholder comments, placeholder reviews, or dummy approvals on {backing_pr_url}; only comment or review when it is strictly required to complete the merge.",
+                issue_url = issue.url
+            )
+        } else {
+            format!(
+                "7. This task tracks the following Renovate pull requests:\n\
+{renovate_pr_list}\n\
+8. Confirm the source Renovate PRs are still safe non-major updates and combine all still-valid candidates into a single dependency-upgrade branch and pull request associated with GitHub issue {issue_url}.\n\
+9. Do not merge the individual Renovate PRs directly.\n\
+10. Keep CI passing for the combined PR, merge only that combined PR once it is green, and then close GitHub issue {issue_url}.\n\
+11. Do not leave placeholder comments, placeholder reviews, or dummy approvals on the combined PR; only comment or review when it is strictly required to complete the merge.",
+                issue_url = issue.url
+            )
+        }
     } else {
         "7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing.\n\
 8. When the change is ready for review, stage the full task checkout with `git add -A` so new files are included, then stop and ask for permission.\n\
@@ -3447,6 +3468,12 @@ async fn find_next_issue(
     excluded_issue_urls: &HashSet<String>,
     token: &str,
 ) -> Result<Option<QueuedIssueCandidate>, String> {
+    if let Some(candidate) =
+        find_next_dependency_upgrade_issue(assigned_repository, excluded_issue_urls, token).await?
+    {
+        return Ok(Some(candidate));
+    }
+
     let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
@@ -3479,7 +3506,7 @@ async fn find_next_issue(
         return Ok(Some(candidate));
     }
 
-    find_next_dependency_upgrade_issue(assigned_repository, excluded_issue_urls, token).await
+    Ok(None)
 }
 
 async fn list_issues_for_label(
@@ -3544,12 +3571,7 @@ async fn fetch_issue(
 
     let mut issue = serde_json::from_slice::<SelectedIssue>(&output.stdout)
         .map_err(|err| format!("failed to parse gh issue view output: {err}"))?;
-    let discovered_backing_pr_url = issue
-        .body
-        .as_deref()
-        .and_then(extract_dependency_upgrade_pr_marker)
-        .map(ToOwned::to_owned);
-    issue.dependency_upgrade_pr_url = discovered_backing_pr_url;
+    issue.dependency_upgrade_pr_urls = issue.dependency_upgrade_pr_urls();
     Ok(issue.is_open_issue_candidate().then_some(issue))
 }
 
@@ -3630,27 +3652,36 @@ async fn find_next_dependency_upgrade_issue(
     token: &str,
 ) -> Result<Option<QueuedIssueCandidate>, String> {
     let pull_requests = list_dependency_upgrade_prs(assigned_repository, token).await?;
-    for pr in pull_requests {
-        if !pr.is_open_dependency_upgrade_candidate() || !pr.is_non_major_dependency_upgrade() {
-            continue;
-        }
-        let Some(mut issue) =
-            find_or_create_dependency_upgrade_issue(assigned_repository, &pr, token).await?
-        else {
-            continue;
-        };
-        if issue.is_in_progress() || excluded_issue_urls.contains(&issue.url) {
-            continue;
-        }
-        issue.dependency_upgrade_pr_url = Some(pr.url.clone());
-        return Ok(Some(QueuedIssueCandidate {
-            issue,
-            backing_pr_url: Some(pr.url),
-            dependency_upgrade_backing_pr: true,
-        }));
+    let batch_candidates = pull_requests
+        .into_iter()
+        .filter(|pr| {
+            pr.is_open_dependency_upgrade_candidate() && pr.is_non_major_dependency_upgrade()
+        })
+        .collect::<Vec<_>>();
+    if batch_candidates.is_empty() {
+        return Ok(None);
     }
 
-    Ok(None)
+    let Some(issue) =
+        find_or_create_dependency_upgrade_issue(assigned_repository, &batch_candidates, token)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if issue.is_in_progress() || excluded_issue_urls.contains(&issue.url) {
+        return Ok(None);
+    }
+
+    let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
+    Ok(Some(QueuedIssueCandidate {
+        backing_pr_url: discover_issue_backing_pr_url(
+            assigned_repository,
+            &issue,
+            &open_pull_requests,
+        ),
+        issue,
+        dependency_upgrade_backing_pr: true,
+    }))
 }
 
 async fn list_dependency_upgrade_prs(
@@ -3885,73 +3916,34 @@ fn is_issue_branch_keyword(segment: &str) -> bool {
 
 async fn find_or_create_dependency_upgrade_issue(
     assigned_repository: &str,
-    pr: &SelectedPullRequest,
+    prs: &[SelectedPullRequest],
     token: &str,
 ) -> Result<Option<SelectedIssue>, String> {
-    if let Some(issue) =
-        find_existing_dependency_upgrade_issue(assigned_repository, pr, token).await?
-    {
-        return Ok(Some(issue));
+    if let Some(issue) = find_existing_dependency_upgrade_issue(assigned_repository, token).await? {
+        return Ok(Some(
+            sync_dependency_upgrade_issue(assigned_repository, issue, prs, token).await?,
+        ));
     }
 
-    create_dependency_upgrade_issue(assigned_repository, pr, token)
+    create_dependency_upgrade_issue(assigned_repository, prs, token)
         .await
         .map(Some)
 }
 
 async fn find_existing_dependency_upgrade_issue(
     assigned_repository: &str,
-    pr: &SelectedPullRequest,
     token: &str,
 ) -> Result<Option<SelectedIssue>, String> {
-    for query in dependency_upgrade_issue_search_queries(pr) {
-        let mut command = Command::new(gh_program());
-        apply_gh_env(&mut command, token);
-        let output = command
-            .args([
-                "search",
-                "issues",
-                "--repo",
-                assigned_repository,
-                "--state",
-                "open",
-                "--sort",
-                "created",
-                "--order",
-                "desc",
-                "--limit",
-                "10",
-                "--json",
-                "number,title,createdAt,labels,url,state,isPullRequest,body",
-                "--",
-                &query,
-            ])
-            .output()
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to run gh search issues for dependency upgrade PR {}: {err}",
-                    pr.url
-                )
-            })?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "gh search issues failed while locating dependency-upgrade issue for {}: {}",
-                pr.url,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+    for mut issue in list_dependency_upgrade_issues(assigned_repository, token).await? {
+        if !issue.is_open_issue_candidate() {
+            continue;
         }
-
-        let mut issues =
-            serde_json::from_slice::<Vec<SelectedIssue>>(&output.stdout).map_err(|err| {
-                format!("failed to parse gh dependency-upgrade issue search output: {err}")
-            })?;
-        if let Some(mut issue) = issues
-            .drain(..)
-            .find(|issue| issue.is_open_issue_candidate())
+        issue.dependency_upgrade_pr_urls = issue.dependency_upgrade_pr_urls();
+        if issue
+            .title
+            .starts_with(DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX)
+            || !issue.dependency_upgrade_pr_urls.is_empty()
         {
-            issue.dependency_upgrade_pr_url = Some(pr.url.clone());
             return Ok(Some(issue));
         }
     }
@@ -3961,7 +3953,7 @@ async fn find_existing_dependency_upgrade_issue(
 
 async fn create_dependency_upgrade_issue(
     assigned_repository: &str,
-    pr: &SelectedPullRequest,
+    prs: &[SelectedPullRequest],
     token: &str,
 ) -> Result<SelectedIssue, String> {
     let mut command = Command::new(gh_program());
@@ -3973,23 +3965,17 @@ async fn create_dependency_upgrade_issue(
             "--repo",
             assigned_repository,
             "--title",
-            &dependency_upgrade_issue_title(pr),
+            &dependency_upgrade_issue_title(prs),
             "--body",
-            &dependency_upgrade_issue_body(pr),
+            &dependency_upgrade_issue_body(prs),
         ])
         .output()
         .await
-        .map_err(|err| {
-            format!(
-                "failed to run gh issue create for dependency upgrade PR {}: {err}",
-                pr.url
-            )
-        })?;
+        .map_err(|err| format!("failed to run gh issue create for dependency upgrade batch in {assigned_repository}: {err}"))?;
 
     if !output.status.success() {
         return Err(format!(
-            "gh issue create failed for dependency upgrade PR {}: {}",
-            pr.url,
+            "gh issue create failed for dependency upgrade batch in {assigned_repository}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -4002,8 +3988,7 @@ async fn create_dependency_upgrade_issue(
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             format!(
-                "gh issue create for dependency upgrade PR {} did not return an issue URL",
-                pr.url
+                "gh issue create for dependency upgrade batch in {assigned_repository} did not return an issue URL"
             )
         })?;
 
@@ -4012,14 +3997,14 @@ async fn create_dependency_upgrade_issue(
         .ok_or_else(|| {
             format!("created dependency-upgrade issue {created_issue_url} could not be fetched")
         })?;
-    issue.dependency_upgrade_pr_url = Some(pr.url.clone());
+    issue.dependency_upgrade_pr_urls = dependency_upgrade_pr_urls_from_pull_requests(prs);
 
     if let Err(err) =
         add_issue_label(assigned_repository, &issue, DEPENDENCY_UPGRADE_LABEL, token).await
     {
         tracing::info!(
             issue_url = %issue.url,
-            pr_url = %pr.url,
+            pr_count = prs.len(),
             error = %err,
             "failed to add dependency-upgrade label to synthetic issue"
         );
@@ -4028,36 +4013,98 @@ async fn create_dependency_upgrade_issue(
     Ok(issue)
 }
 
-fn dependency_upgrade_issue_title(pr: &SelectedPullRequest) -> String {
+async fn sync_dependency_upgrade_issue(
+    assigned_repository: &str,
+    mut issue: SelectedIssue,
+    prs: &[SelectedPullRequest],
+    token: &str,
+) -> Result<SelectedIssue, String> {
+    let expected_title = dependency_upgrade_issue_title(prs);
+    let expected_body = dependency_upgrade_issue_body(prs);
+    if issue.title != expected_title || issue.body.as_deref() != Some(expected_body.as_str()) {
+        edit_issue_title_and_body(
+            assigned_repository,
+            &issue.url,
+            &expected_title,
+            &expected_body,
+            token,
+        )
+        .await?;
+        issue.title = expected_title;
+        issue.body = Some(expected_body);
+    }
+    issue.dependency_upgrade_pr_urls = dependency_upgrade_pr_urls_from_pull_requests(prs);
+    Ok(issue)
+}
+
+async fn list_dependency_upgrade_issues(
+    assigned_repository: &str,
+    token: &str,
+) -> Result<Vec<SelectedIssue>, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "search",
+            "issues",
+            "--repo",
+            assigned_repository,
+            "--state",
+            "open",
+            "--label",
+            DEPENDENCY_UPGRADE_LABEL,
+            "--sort",
+            "created",
+            "--order",
+            "desc",
+            "--limit",
+            "20",
+            "--json",
+            "number,title,createdAt,labels,url,state,isPullRequest,body",
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh search issues for dependency upgrade batches in {assigned_repository}: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh search issues failed while locating dependency-upgrade batches in {assigned_repository}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice::<Vec<SelectedIssue>>(&output.stdout)
+        .map_err(|err| format!("failed to parse gh dependency-upgrade issue search output: {err}"))
+}
+
+fn dependency_upgrade_issue_title(prs: &[SelectedPullRequest]) -> String {
     format!(
-        "{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX}{}: {}",
-        pr.number, pr.title
+        "{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX} ({} PRs)",
+        prs.len()
     )
 }
 
-fn dependency_upgrade_issue_body(pr: &SelectedPullRequest) -> String {
+fn dependency_upgrade_issue_body(prs: &[SelectedPullRequest]) -> String {
+    let candidate_list = prs
+        .iter()
+        .map(|pr| format!("- {} ({})", pr.url, pr.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let marker = serde_json::to_string(&dependency_upgrade_pr_urls_from_pull_requests(prs))
+        .expect("dependency upgrade batch marker should serialize");
     format!(
-        "Track dependency-upgrade automation for Renovate pull request {pr_url}.\n\n\
-This issue was created automatically by multicode to prrocess the PR.\n\
-If the update is still a non-major version bump and CI is passing, rebase and merge the PR without waiting for human review, then close this issue.\n\n\
-{marker}{pr_url} -->",
-        pr_url = pr.url,
-        marker = DEPENDENCY_UPGRADE_PR_MARKER_PREFIX
+        "Track dependency-upgrade automation for the current batch of Renovate pull requests.\n\n\
+Current Renovate candidates:\n\
+{candidate_list}\n\n\
+This issue was created automatically by multicode to process the Renovate batch.\n\
+Create or update a single combined dependency-upgrade pull request associated with this issue, keep CI passing for that combined PR, and merge only the combined PR once it is green. Do not merge the individual Renovate PRs directly.\n\n\
+{marker_prefix}{marker} -->",
+        marker_prefix = DEPENDENCY_UPGRADE_PR_BATCH_MARKER_PREFIX
     )
 }
 
-fn dependency_upgrade_issue_search_queries(pr: &SelectedPullRequest) -> [String; 2] {
-    let pr_search_fragment = pr
-        .url
-        .strip_prefix("https://github.com/")
-        .unwrap_or(pr.url.as_str());
-    [
-        format!(
-            "\"{DEPENDENCY_UPGRADE_ISSUE_TITLE_PREFIX}{}\" in:title",
-            pr.number
-        ),
-        format!("\"{pr_search_fragment}\" in:body"),
-    ]
+fn dependency_upgrade_pr_urls_from_pull_requests(prs: &[SelectedPullRequest]) -> Vec<String> {
+    prs.iter().map(|pr| pr.url.clone()).collect()
 }
 
 async fn assign_issue_to_me(
@@ -4139,6 +4186,41 @@ async fn add_issue_label(
         Err(format!(
             "gh issue edit failed for {}: {}",
             issue.url,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+async fn edit_issue_title_and_body(
+    assigned_repository: &str,
+    issue_url: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "issue",
+            "edit",
+            issue_url,
+            "--repo",
+            assigned_repository,
+            "--title",
+            title,
+            "--body",
+            body,
+        ])
+        .output()
+        .await
+        .map_err(|err| format!("failed to run gh issue edit for {issue_url}: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "gh issue edit failed for {issue_url}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -4356,7 +4438,7 @@ struct SelectedIssue {
     body: Option<String>,
     labels: Vec<SelectedIssueLabel>,
     #[serde(skip)]
-    dependency_upgrade_pr_url: Option<String>,
+    dependency_upgrade_pr_urls: Vec<String>,
 }
 
 impl SelectedIssue {
@@ -4394,12 +4476,20 @@ impl SelectedIssue {
             && self.is_pull_request != Some(true)
     }
 
-    fn backing_pr_url(&self) -> Option<&str> {
-        self.dependency_upgrade_pr_url.as_deref().or_else(|| {
-            self.body
-                .as_deref()
-                .and_then(extract_dependency_upgrade_pr_marker)
-        })
+    fn dependency_upgrade_pr_urls(&self) -> Vec<String> {
+        if !self.dependency_upgrade_pr_urls.is_empty() {
+            return self.dependency_upgrade_pr_urls.clone();
+        }
+        self.body
+            .as_deref()
+            .map(extract_dependency_upgrade_pr_urls)
+            .unwrap_or_default()
+    }
+
+    fn legacy_dependency_upgrade_pr_url(&self) -> Option<&str> {
+        self.body
+            .as_deref()
+            .and_then(extract_dependency_upgrade_pr_marker)
     }
 }
 
@@ -4495,6 +4585,24 @@ fn extract_dependency_upgrade_pr_marker(body: &str) -> Option<&str> {
         .unwrap_or(body.len());
     let value = body[content_start..content_end].trim();
     (!value.is_empty()).then_some(value)
+}
+
+fn extract_dependency_upgrade_pr_urls(body: &str) -> Vec<String> {
+    if let Some(marker_start) = body.find(DEPENDENCY_UPGRADE_PR_BATCH_MARKER_PREFIX) {
+        let content_start = marker_start + DEPENDENCY_UPGRADE_PR_BATCH_MARKER_PREFIX.len();
+        let content_end = body[content_start..]
+            .find("-->")
+            .map(|index| content_start + index)
+            .unwrap_or(body.len());
+        let value = body[content_start..content_end].trim();
+        if let Ok(pr_urls) = serde_json::from_str::<Vec<String>>(value) {
+            return pr_urls;
+        }
+    }
+
+    extract_dependency_upgrade_pr_marker(body)
+        .map(|url| vec![url.to_string()])
+        .unwrap_or_default()
 }
 
 fn dependency_upgrade_versions_from_text(text: &str) -> Option<(u64, u64)> {
@@ -4876,7 +4984,7 @@ mod tests {
             is_pull_request: Some(false),
             body: None,
             labels,
-            dependency_upgrade_pr_url: None,
+            dependency_upgrade_pr_urls: Vec::new(),
         }
     }
 
@@ -7146,8 +7254,8 @@ mod tests {
     }
 
     #[test]
-    fn build_issue_prompt_for_dependency_upgrade_allows_direct_merge() {
-        let issue = test_issue(
+    fn build_issue_prompt_for_dependency_upgrade_requires_combined_pr() {
+        let mut issue = test_issue(
             981,
             "dependency upgrade",
             "https://github.com/example/repo/issues/981",
@@ -7156,22 +7264,27 @@ mod tests {
                 name: DEPENDENCY_UPGRADE_LABEL.to_string(),
             }],
         );
+        issue.dependency_upgrade_pr_urls = vec![
+            "https://github.com/example/repo/pull/88".to_string(),
+            "https://github.com/example/repo/pull/91".to_string(),
+        ];
 
         let prompt = build_issue_prompt(
             "example/repo",
             &issue,
-            Some("https://github.com/example/repo/pull/88"),
+            Some("https://github.com/example/repo/pull/999"),
             "thread-task-981",
             std::path::Path::new("/tmp/work/example-repo-981"),
             std::path::Path::new("/tmp/state/task-981.state"),
         );
 
-        assert!(
-            prompt.contains(
-                "backed by Renovate pull request https://github.com/example/repo/pull/88"
-            )
-        );
-        assert!(prompt.contains("merge it without waiting for human review"));
+        assert!(prompt.contains("tracks the following Renovate pull requests"));
+        assert!(prompt.contains("https://github.com/example/repo/pull/88"));
+        assert!(prompt.contains("https://github.com/example/repo/pull/91"));
+        assert!(prompt.contains(
+            "Treat https://github.com/example/repo/pull/999 as the single combined dependency-upgrade PR"
+        ));
+        assert!(prompt.contains("Do not merge the individual Renovate PRs directly."));
         assert!(prompt.contains("close GitHub issue https://github.com/example/repo/issues/981"));
         assert!(prompt.contains(
             "Do not leave placeholder comments, placeholder reviews, or dummy approvals"
@@ -7181,23 +7294,34 @@ mod tests {
 
     #[test]
     fn dependency_upgrade_issue_body_uses_updated_queue_text() {
-        let body = dependency_upgrade_issue_body(&test_pull_request(
-            91,
-            "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
-            "https://github.com/example/repo/pull/91",
-            vec![SelectedIssueLabel {
-                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
-            }],
-            None,
-        ));
+        let body = dependency_upgrade_issue_body(&[
+            test_pull_request(
+                91,
+                "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
+                "https://github.com/example/repo/pull/91",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+            test_pull_request(
+                92,
+                "Update dependency io.micronaut:micronaut-json-core from 4.4.1 to 4.4.2",
+                "https://github.com/example/repo/pull/92",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+        ]);
 
-        assert!(
-            body.contains("This issue was created automatically by multicode to prrocess the PR.")
-        );
+        assert!(body.contains("Current Renovate candidates:"));
+        assert!(body.contains("https://github.com/example/repo/pull/91"));
+        assert!(body.contains("https://github.com/example/repo/pull/92"));
         assert!(body.contains(
-            "If the update is still a non-major version bump and CI is passing, rebase and merge the PR without waiting for human review, then close this issue."
+            "Create or update a single combined dependency-upgrade pull request associated with this issue"
         ));
-        assert!(!body.contains("so the autonomous queue can process the PR"));
+        assert!(body.contains("Do not merge the individual Renovate PRs directly."));
     }
 
     #[test]
@@ -7300,41 +7424,63 @@ mod tests {
     }
 
     #[test]
-    fn extract_dependency_upgrade_pr_marker_reads_hidden_comment() {
-        let body = dependency_upgrade_issue_body(&test_pull_request(
-            91,
-            "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
-            "https://github.com/example/repo/pull/91",
-            vec![SelectedIssueLabel {
-                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
-            }],
-            None,
-        ));
+    fn extract_dependency_upgrade_pr_urls_reads_hidden_comment() {
+        let body = dependency_upgrade_issue_body(&[
+            test_pull_request(
+                91,
+                "Update dependency io.micronaut:micronaut-core from 4.4.1 to 4.4.2",
+                "https://github.com/example/repo/pull/91",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+            test_pull_request(
+                92,
+                "Update dependency io.micronaut:micronaut-json-core from 4.4.1 to 4.4.2",
+                "https://github.com/example/repo/pull/92",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+        ]);
 
         assert_eq!(
-            extract_dependency_upgrade_pr_marker(&body),
-            Some("https://github.com/example/repo/pull/91")
+            extract_dependency_upgrade_pr_urls(&body),
+            vec![
+                "https://github.com/example/repo/pull/91".to_string(),
+                "https://github.com/example/repo/pull/92".to_string()
+            ]
         );
     }
 
     #[test]
-    fn dependency_upgrade_issue_search_queries_use_searchable_pr_url_fragment() {
-        let queries = dependency_upgrade_issue_search_queries(&test_pull_request(
-            728,
-            "fix(deps): update dependency io.lettuce:lettuce-core to v7.5.1.release",
-            "https://github.com/micronaut-projects/micronaut-redis/pull/728",
-            vec![SelectedIssueLabel {
-                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
-            }],
-            None,
-        ));
+    fn dependency_upgrade_issue_title_includes_batch_size() {
+        let queries = dependency_upgrade_issue_title(&[
+            test_pull_request(
+                728,
+                "fix(deps): update dependency io.lettuce:lettuce-core to v7.5.1.release",
+                "https://github.com/micronaut-projects/micronaut-redis/pull/728",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+            test_pull_request(
+                729,
+                "fix(deps): update dependency io.micronaut.redis:micronaut-redis-lettuce to v6.6.0",
+                "https://github.com/micronaut-projects/micronaut-redis/pull/729",
+                vec![SelectedIssueLabel {
+                    name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+                }],
+                None,
+            ),
+        ]);
 
         assert_eq!(
             queries,
-            [
-                "\"Dependency upgrade follow-up for PR #728\" in:title".to_string(),
-                "\"micronaut-projects/micronaut-redis/pull/728\" in:body".to_string(),
-            ]
+            "Dependency upgrade follow-up for Renovate batch (2 PRs)".to_string()
         );
     }
 
