@@ -494,10 +494,15 @@ fn workspace_issue_type(snapshot: &WorkspaceSnapshot) -> Option<WorkspaceIssueTy
     workspace_active_task(snapshot).and_then(|task| task.issue_type)
 }
 
-fn issue_type_cell(issue_type: Option<WorkspaceIssueType>, archived: bool) -> Cell<'static> {
+fn issue_type_cell(
+    issue_type: Option<WorkspaceIssueType>,
+    issue_type_glyph: Option<&str>,
+    archived: bool,
+) -> Cell<'static> {
     issue_type.map_or_else(Cell::default, |issue_type| {
         let (kind, color) = issue_type_icon_kind_and_color(issue_type);
-        Cell::from(icon_glyph(kind)).style(
+        let glyph = issue_type_glyph.unwrap_or_else(|| icon_glyph(kind));
+        Cell::from(glyph.to_string()).style(
             Style::default()
                 .fg(if archived { Color::DarkGray } else { color })
                 .bg(Color::Reset),

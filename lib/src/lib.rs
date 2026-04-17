@@ -80,6 +80,17 @@ pub enum WorkspaceIssueType {
     DependencyUpgrade,
 }
 
+pub fn workspace_issue_type_glyph(issue_type: WorkspaceIssueType) -> &'static str {
+    match issue_type {
+        WorkspaceIssueType::Bug => "\u{f188}",
+        WorkspaceIssueType::Docs => "\u{f02d}",
+        WorkspaceIssueType::Enhancement => "\u{f135}",
+        WorkspaceIssueType::Improvement => "\u{f0ad}",
+        WorkspaceIssueType::Regression => "\u{f1da}",
+        WorkspaceIssueType::DependencyUpgrade => "\u{f1b2}",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTaskPersistentSnapshot {
     pub id: String,
@@ -90,6 +101,8 @@ pub struct WorkspaceTaskPersistentSnapshot {
     pub dependency_upgrade_backing_pr: bool,
     #[serde(default)]
     pub issue_type: Option<WorkspaceIssueType>,
+    #[serde(default)]
+    pub issue_type_glyph: Option<String>,
     #[serde(default)]
     pub source: WorkspaceTaskSource,
     #[serde(default)]
@@ -104,6 +117,7 @@ impl WorkspaceTaskPersistentSnapshot {
             backing_pr_url: None,
             dependency_upgrade_backing_pr: false,
             issue_type: None,
+            issue_type_glyph: None,
             source,
             created_at: Some(SystemTime::now()),
         }
@@ -123,8 +137,13 @@ impl WorkspaceTaskPersistentSnapshot {
     }
 
     pub fn with_issue_type(mut self, issue_type: Option<WorkspaceIssueType>) -> Self {
-        self.issue_type = issue_type;
+        self.set_issue_type(issue_type);
         self
+    }
+
+    pub fn set_issue_type(&mut self, issue_type: Option<WorkspaceIssueType>) {
+        self.issue_type = issue_type;
+        self.issue_type_glyph = issue_type.map(|kind| workspace_issue_type_glyph(kind).to_string());
     }
 }
 

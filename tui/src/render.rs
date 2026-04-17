@@ -156,7 +156,12 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                     } else {
                         Cell::default()
                     };
-                let task_type_cell = issue_type_cell(workspace_issue_type(snapshot), archived);
+                let task_type_cell = issue_type_cell(
+                    workspace_issue_type(snapshot),
+                    workspace_active_task(snapshot)
+                        .and_then(|task| task.issue_type_glyph.as_deref()),
+                    archived,
+                );
                 let (pr_cell, build_cell, review_status_cell) =
                     if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
                         let (kind, color) = pr_icon_kind_and_color(*pr_status);
@@ -354,7 +359,8 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                     } else {
                         (Cell::default(), Cell::default())
                     };
-                let task_type_cell = issue_type_cell(task.issue_type, archived);
+                let task_type_cell =
+                    issue_type_cell(task.issue_type, task.issue_type_glyph.as_deref(), archived);
                 rows.push(
                     Row::new(vec![
                         Cell::from(task_row_label(task)),

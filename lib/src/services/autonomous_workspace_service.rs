@@ -31,7 +31,7 @@ use super::{
 use crate::{
     AutomationAgentState, RootSessionStatus, WorkspaceIssueType, WorkspaceManagerError,
     WorkspaceSnapshot, WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace,
-    opencode, services::config::AgentProvider,
+    opencode, services::config::AgentProvider, workspace_issue_type_glyph,
 };
 
 const ISSUE_PRIORITY_LABELS: [&str; 4] = [
@@ -1064,10 +1064,13 @@ async fn refresh_existing_task_backing_pr_urls(
         });
         let discovered =
             discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
-        let issue_type = issue.issue_type();
-        if discovered.as_deref() != task.backing_pr_url.as_deref() || issue_type != task.issue_type
+        let issue_type = issue.issue_type().or(task.issue_type);
+        let issue_type_glyph = issue_type.map(|kind| workspace_issue_type_glyph(kind).to_string());
+        if discovered.as_deref() != task.backing_pr_url.as_deref()
+            || issue_type != task.issue_type
+            || issue_type_glyph != task.issue_type_glyph
         {
-            updates.push((task.id.clone(), discovered, issue_type));
+            updates.push((task.id.clone(), discovered, issue_type, issue_type_glyph));
         }
     }
 
@@ -1077,7 +1080,7 @@ async fn refresh_existing_task_backing_pr_urls(
 
     workspace.update(|next| {
         let mut changed = false;
-        for (task_id, backing_pr_url, issue_type) in &updates {
+        for (task_id, backing_pr_url, issue_type, issue_type_glyph) in &updates {
             if let Some(task) = next
                 .persistent
                 .tasks
@@ -1089,7 +1092,10 @@ async fn refresh_existing_task_backing_pr_urls(
                     changed = true;
                 }
                 if task.issue_type != *issue_type {
-                    task.issue_type = *issue_type;
+                    task.set_issue_type(*issue_type);
+                    changed = true;
+                } else if task.issue_type_glyph != *issue_type_glyph {
+                    task.issue_type_glyph = issue_type_glyph.clone();
                     changed = true;
                 }
             }
@@ -1143,8 +1149,15 @@ fn ensure_workspace_task_claim(
                 changed = true;
             }
             if task.issue_type != issue_type {
-                task.issue_type = issue_type;
+                task.set_issue_type(issue_type);
                 changed = true;
+            } else {
+                let issue_type_glyph =
+                    issue_type.map(|kind| workspace_issue_type_glyph(kind).to_string());
+                if task.issue_type_glyph != issue_type_glyph {
+                    task.issue_type_glyph = issue_type_glyph;
+                    changed = true;
+                }
             }
         }
         if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
@@ -1187,8 +1200,15 @@ fn queue_issue_task(
                     changed = true;
                 }
                 if task.issue_type != issue_type {
-                    task.issue_type = issue_type;
+                    task.set_issue_type(issue_type);
                     changed = true;
+                } else {
+                    let issue_type_glyph =
+                        issue_type.map(|kind| workspace_issue_type_glyph(kind).to_string());
+                    if task.issue_type_glyph != issue_type_glyph {
+                        task.issue_type_glyph = issue_type_glyph;
+                        changed = true;
+                    }
                 }
                 return changed;
             }
@@ -6201,6 +6221,66 @@ mod tests {
             assert_eq!(
                 next.persistent.tasks[0].issue_type,
                 Some(WorkspaceIssueType::Bug)
+            );
+            assert_eq!(
+                next.persistent.tasks[0].issue_type_glyph.as_deref(),
+                Some(workspace_issue_type_glyph(WorkspaceIssueType::Bug))
+            );
+        });
+    }
+
+    #[test]
+    fn refresh_existing_task_backing_pr_urls_backfills_missing_issue_glyph_without_fetching_issue()
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[]'\n  exit 0\nfi\nprintf '%s\\n' \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let workspace = Workspace::new(WorkspaceSnapshot::default());
+            workspace.update(|snapshot| {
+                let mut task = WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Scan,
+                );
+                task.issue_type = Some(WorkspaceIssueType::Bug);
+                snapshot.persistent.tasks.push(task);
+                true
+            });
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            let updated = refresh_existing_task_backing_pr_urls(
+                &workspace,
+                &snapshot,
+                "example/repo",
+                "test-token",
+            )
+            .await
+            .expect("refresh should succeed");
+
+            assert_eq!(updated, 1);
+            let next = workspace.subscribe().borrow().clone();
+            assert_eq!(
+                next.persistent.tasks[0].issue_type_glyph.as_deref(),
+                Some(workspace_issue_type_glyph(WorkspaceIssueType::Bug))
             );
         });
     }
