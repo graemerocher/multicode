@@ -27,6 +27,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         cost_width,
         re_width,
         is_width,
+        t_width,
         pr_width,
         build_width,
         review_width,
@@ -69,6 +70,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Cell::from(create_row_server),
             Cell::from(create_row_cpu),
             Cell::from(create_row_ram),
+            Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -154,6 +156,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                     } else {
                         Cell::default()
                     };
+                let task_type_cell = issue_type_cell(workspace_issue_type(snapshot), archived);
                 let (pr_cell, build_cell, review_status_cell) =
                     if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
                         let (kind, color) = pr_icon_kind_and_color(*pr_status);
@@ -224,6 +227,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         Cell::from(cost),
                         review_cell,
                         issue_cell,
+                        task_type_cell,
                         pr_cell,
                         build_cell,
                         review_status_cell,
@@ -350,6 +354,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                     } else {
                         (Cell::default(), Cell::default())
                     };
+                let task_type_cell = issue_type_cell(task.issue_type, archived);
                 rows.push(
                     Row::new(vec![
                         Cell::from(task_row_label(task)),
@@ -360,6 +365,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         Cell::from(cost),
                         Cell::from(""),
                         issue_cell,
+                        task_type_cell,
                         pr_cell,
                         build_cell,
                         review_status_cell,
@@ -382,6 +388,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Constraint::Length(cost_width),
             Constraint::Length(re_width),
             Constraint::Length(is_width),
+            Constraint::Length(t_width),
             Constraint::Length(pr_width),
             Constraint::Length(build_width),
             Constraint::Length(review_width),
@@ -398,6 +405,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Cell::from(right_align_cell_text("Cost", cost_width)),
             Cell::from("RE"),
             Cell::from("IS"),
+            Cell::from("T"),
             Cell::from("PR"),
             Cell::from("B"),
             Cell::from("R"),
@@ -542,6 +550,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                 cost_width,
                 re_width,
                 is_width,
+                t_width,
                 pr_width,
                 build_width,
                 review_width,
@@ -611,7 +620,7 @@ pub(crate) fn selected_link_tooltip_area(
     selected_row: usize,
     selected_link_kind: WorkspaceLinkKind,
     targets: &[(String, bool)],
-    column_widths: [u16; 10],
+    column_widths: [u16; 11],
 ) -> Option<Rect> {
     if selected_row == 0 || targets.is_empty() {
         return None;
@@ -627,7 +636,7 @@ pub(crate) fn selected_link_tooltip_area(
     let tooltip_column_index = match selected_link_kind {
         WorkspaceLinkKind::Review => 5,
         WorkspaceLinkKind::Issue => 6,
-        WorkspaceLinkKind::Pr => 7,
+        WorkspaceLinkKind::Pr => 8,
     };
     let mut x = table_inner.x;
     for width in column_widths.iter().take(tooltip_column_index) {

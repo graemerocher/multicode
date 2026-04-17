@@ -69,6 +69,17 @@ pub enum WorkspaceTaskSource {
     Scan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceIssueType {
+    Bug,
+    Docs,
+    Enhancement,
+    Improvement,
+    Regression,
+    DependencyUpgrade,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTaskPersistentSnapshot {
     pub id: String,
@@ -77,6 +88,8 @@ pub struct WorkspaceTaskPersistentSnapshot {
     pub backing_pr_url: Option<String>,
     #[serde(default)]
     pub dependency_upgrade_backing_pr: bool,
+    #[serde(default)]
+    pub issue_type: Option<WorkspaceIssueType>,
     #[serde(default)]
     pub source: WorkspaceTaskSource,
     #[serde(default)]
@@ -90,6 +103,7 @@ impl WorkspaceTaskPersistentSnapshot {
             issue_url,
             backing_pr_url: None,
             dependency_upgrade_backing_pr: false,
+            issue_type: None,
             source,
             created_at: Some(SystemTime::now()),
         }
@@ -105,6 +119,11 @@ impl WorkspaceTaskPersistentSnapshot {
         dependency_upgrade_backing_pr: bool,
     ) -> Self {
         self.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
+        self
+    }
+
+    pub fn with_issue_type(mut self, issue_type: Option<WorkspaceIssueType>) -> Self {
+        self.issue_type = issue_type;
         self
     }
 }

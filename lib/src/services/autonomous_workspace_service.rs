@@ -29,9 +29,9 @@ use super::{
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
-    AutomationAgentState, RootSessionStatus, WorkspaceManagerError, WorkspaceSnapshot,
-    WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace, opencode,
-    services::config::AgentProvider,
+    AutomationAgentState, RootSessionStatus, WorkspaceIssueType, WorkspaceManagerError,
+    WorkspaceSnapshot, WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace,
+    opencode, services::config::AgentProvider,
 };
 
 const ISSUE_PRIORITY_LABELS: [&str; 4] = [
@@ -55,6 +55,16 @@ const IN_PROGRESS_LABEL: &str = "status: in progress";
 const IN_PROGRESS_LABEL_ALIASES: [&str; 2] = [IN_PROGRESS_LABEL, "status: in-progress"];
 const AWAITING_VALIDATION_LABEL: &str = "status: awaiting validation";
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
+const DOC_ISSUE_LABELS: [&str; 4] = [
+    "type: docs",
+    "type:docs",
+    "status: docs",
+    "status: documentation",
+];
+const BUG_ISSUE_LABELS: [&str; 2] = ["type: bug", "status: bug"];
+const REGRESSION_ISSUE_LABELS: [&str; 2] = ["type: regression", "status: regression"];
+const IMPROVEMENT_ISSUE_LABELS: [&str; 1] = ["type: improvement"];
+const ENHANCEMENT_ISSUE_LABELS: [&str; 1] = ["type: enhancement"];
 
 #[derive(Debug, Clone)]
 struct QueuedIssueCandidate {
@@ -1033,10 +1043,15 @@ async fn refresh_existing_task_backing_pr_urls(
     let mut updates = Vec::new();
 
     for task in &snapshot.persistent.tasks {
+        let fetched_issue = if task.issue_type.is_none() {
+            fetch_issue(assigned_repository, &task.issue_url, token).await?
+        } else {
+            None
+        };
         let Some(issue_number) = issue_number_from_url(&task.issue_url) else {
             continue;
         };
-        let issue = SelectedIssue {
+        let issue = fetched_issue.unwrap_or(SelectedIssue {
             number: issue_number,
             title: String::new(),
             url: task.issue_url.clone(),
@@ -1046,11 +1061,13 @@ async fn refresh_existing_task_backing_pr_urls(
             body: None,
             labels: Vec::new(),
             dependency_upgrade_pr_urls: Vec::new(),
-        };
+        });
         let discovered =
             discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
-        if discovered.as_deref() != task.backing_pr_url.as_deref() {
-            updates.push((task.id.clone(), discovered));
+        let issue_type = issue.issue_type();
+        if discovered.as_deref() != task.backing_pr_url.as_deref() || issue_type != task.issue_type
+        {
+            updates.push((task.id.clone(), discovered, issue_type));
         }
     }
 
@@ -1060,16 +1077,21 @@ async fn refresh_existing_task_backing_pr_urls(
 
     workspace.update(|next| {
         let mut changed = false;
-        for (task_id, backing_pr_url) in &updates {
+        for (task_id, backing_pr_url, issue_type) in &updates {
             if let Some(task) = next
                 .persistent
                 .tasks
                 .iter_mut()
                 .find(|task| &task.id == task_id)
-                && task.backing_pr_url != *backing_pr_url
             {
-                task.backing_pr_url = backing_pr_url.clone();
-                changed = true;
+                if task.backing_pr_url != *backing_pr_url {
+                    task.backing_pr_url = backing_pr_url.clone();
+                    changed = true;
+                }
+                if task.issue_type != *issue_type {
+                    task.issue_type = *issue_type;
+                    changed = true;
+                }
             }
         }
         changed
@@ -1086,6 +1108,7 @@ fn ensure_workspace_task_claim(
     dependency_upgrade_backing_pr: bool,
     source: WorkspaceTaskSource,
 ) {
+    let issue_type = issue.issue_type();
     workspace.update(|snapshot| {
         let mut changed = false;
         if snapshot.persistent.assigned_repository.as_deref() != Some(assigned_repository) {
@@ -1099,6 +1122,7 @@ fn ensure_workspace_task_claim(
                 source,
             )
             .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned))
+            .with_issue_type(issue_type)
             .with_dependency_upgrade_backing_pr(dependency_upgrade_backing_pr);
             let task_id = task.id.clone();
             snapshot.persistent.tasks.push(task);
@@ -1118,6 +1142,10 @@ fn ensure_workspace_task_claim(
                 task.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
                 changed = true;
             }
+            if task.issue_type != issue_type {
+                task.issue_type = issue_type;
+                changed = true;
+            }
         }
         if snapshot.active_task_id.as_deref() != Some(task_id.as_str()) {
             snapshot.active_task_id = Some(task_id);
@@ -1134,6 +1162,7 @@ fn queue_issue_task(
     dependency_upgrade_backing_pr: bool,
     source: WorkspaceTaskSource,
 ) {
+    let issue_type = issue.issue_type();
     workspace.update(|snapshot| {
         if let Some(existing) = snapshot
             .persistent
@@ -1157,6 +1186,10 @@ fn queue_issue_task(
                     task.dependency_upgrade_backing_pr = dependency_upgrade_backing_pr;
                     changed = true;
                 }
+                if task.issue_type != issue_type {
+                    task.issue_type = issue_type;
+                    changed = true;
+                }
                 return changed;
             }
             return false;
@@ -1168,6 +1201,7 @@ fn queue_issue_task(
                 source,
             )
             .with_backing_pr_url(backing_pr_url.map(ToOwned::to_owned))
+            .with_issue_type(issue_type)
             .with_dependency_upgrade_backing_pr(dependency_upgrade_backing_pr),
         );
         true
@@ -4950,6 +4984,37 @@ impl SelectedIssue {
             .as_deref()
             .and_then(extract_dependency_upgrade_pr_marker)
     }
+
+    fn issue_type(&self) -> Option<WorkspaceIssueType> {
+        if self.has_label(DEPENDENCY_UPGRADE_LABEL) {
+            return Some(WorkspaceIssueType::DependencyUpgrade);
+        }
+        if REGRESSION_ISSUE_LABELS
+            .iter()
+            .any(|label| self.has_label(label))
+        {
+            return Some(WorkspaceIssueType::Regression);
+        }
+        if BUG_ISSUE_LABELS.iter().any(|label| self.has_label(label)) {
+            return Some(WorkspaceIssueType::Bug);
+        }
+        if DOC_ISSUE_LABELS.iter().any(|label| self.has_label(label)) {
+            return Some(WorkspaceIssueType::Docs);
+        }
+        if IMPROVEMENT_ISSUE_LABELS
+            .iter()
+            .any(|label| self.has_label(label))
+        {
+            return Some(WorkspaceIssueType::Improvement);
+        }
+        if ENHANCEMENT_ISSUE_LABELS
+            .iter()
+            .any(|label| self.has_label(label))
+        {
+            return Some(WorkspaceIssueType::Enhancement);
+        }
+        None
+    }
 }
 
 fn issue_priority_cmp(left: &SelectedIssue, right: &SelectedIssue) -> std::cmp::Ordering {
@@ -5133,13 +5198,84 @@ mod tests {
     use crate::services::github_status_service::{
         GithubPrBuildState, GithubPrReviewState, GithubPrState, GithubPrStatus,
     };
+    use crate::test_support::ENV_VAR_LOCK;
     use std::{
         collections::HashMap,
         fs,
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::watch;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("multicode-autonomous-tests-{unique}"));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: &std::path::Path) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests in this module serialize env-var mutation with ENV_VAR_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                // SAFETY: tests in this module serialize env-var mutation with ENV_VAR_LOCK.
+                unsafe {
+                    std::env::set_var(&self.key, original);
+                }
+            } else {
+                // SAFETY: tests in this module serialize env-var mutation with ENV_VAR_LOCK.
+                unsafe {
+                    std::env::remove_var(&self.key);
+                }
+            }
+        }
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        let mut permissions = fs::metadata(path)
+            .expect("metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("permissions should be set");
+    }
 
     #[test]
     fn normalize_github_repository_spec_accepts_owner_repo_and_urls() {
@@ -5655,6 +5791,47 @@ mod tests {
     }
 
     #[test]
+    fn selected_issue_derives_issue_type_from_labels() {
+        let regression = test_issue(
+            14,
+            "regression",
+            "https://github.com/example/repo/issues/14",
+            "2026-04-09T12:00:00Z",
+            vec![SelectedIssueLabel {
+                name: "type: regression".to_string(),
+            }],
+        );
+        let docs = test_issue(
+            15,
+            "docs",
+            "https://github.com/example/repo/issues/15",
+            "2026-04-09T12:00:00Z",
+            vec![SelectedIssueLabel {
+                name: "type: docs".to_string(),
+            }],
+        );
+        let dependency = test_issue(
+            16,
+            "deps",
+            "https://github.com/example/repo/issues/16",
+            "2026-04-09T12:00:00Z",
+            vec![SelectedIssueLabel {
+                name: DEPENDENCY_UPGRADE_LABEL.to_string(),
+            }],
+        );
+
+        assert_eq!(
+            regression.issue_type(),
+            Some(WorkspaceIssueType::Regression)
+        );
+        assert_eq!(docs.issue_type(), Some(WorkspaceIssueType::Docs));
+        assert_eq!(
+            dependency.issue_type(),
+            Some(WorkspaceIssueType::DependencyUpgrade)
+        );
+    }
+
+    #[test]
     fn select_validation_issue_candidate_skips_excluded_and_claimed_issues() {
         let excluded = HashSet::from(["https://github.com/example/repo/issues/13".to_string()]);
         let selected = select_validation_issue_candidate(
@@ -5939,7 +6116,9 @@ mod tests {
             "candidate",
             "https://github.com/example/repo/issues/810",
             "2026-04-09T10:00:00Z",
-            vec![],
+            vec![SelectedIssueLabel {
+                name: "type: bug".to_string(),
+            }],
         );
 
         ensure_workspace_task_claim(
@@ -5963,7 +6142,67 @@ mod tests {
             snapshot.persistent.tasks[0].source,
             WorkspaceTaskSource::Scan
         );
+        assert_eq!(
+            snapshot.persistent.tasks[0].issue_type,
+            Some(WorkspaceIssueType::Bug)
+        );
         assert_eq!(snapshot.active_task_id.as_deref(), Some("task-810"));
+    }
+
+    #[test]
+    fn refresh_existing_task_backing_pr_urls_backfills_missing_issue_type() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\\n' '[]'\n  exit 0\nfi\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"view\" ]; then\n  printf '%s\\n' '{\"number\":42,\"title\":\"Investigate redis issue\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T10:00:00Z\",\"state\":\"OPEN\",\"body\":null,\"labels\":[{\"name\":\"type: bug\"}]}'\n  exit 0\nfi\nexit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let workspace = Workspace::new(WorkspaceSnapshot::default());
+            workspace.update(|snapshot| {
+                snapshot
+                    .persistent
+                    .tasks
+                    .push(WorkspaceTaskPersistentSnapshot::new(
+                        "task-42".to_string(),
+                        "https://github.com/example/repo/issues/42".to_string(),
+                        WorkspaceTaskSource::Scan,
+                    ));
+                true
+            });
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            let updated = refresh_existing_task_backing_pr_urls(
+                &workspace,
+                &snapshot,
+                "example/repo",
+                "test-token",
+            )
+            .await
+            .expect("refresh should succeed");
+
+            assert_eq!(updated, 1);
+            let next = workspace.subscribe().borrow().clone();
+            assert_eq!(
+                next.persistent.tasks[0].issue_type,
+                Some(WorkspaceIssueType::Bug)
+            );
+        });
     }
 
     #[test]

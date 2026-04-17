@@ -14,8 +14,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use multicode_lib::{
-    AutomationAgentState, RootSessionStatus, WorkspaceSnapshot, WorkspaceTaskPersistentSnapshot,
-    WorkspaceTaskRuntimeSnapshot, logging, opencode,
+    AutomationAgentState, RootSessionStatus, WorkspaceIssueType, WorkspaceSnapshot,
+    WorkspaceTaskPersistentSnapshot, WorkspaceTaskRuntimeSnapshot, logging, opencode,
     services::{
         CombinedService, GithubIssueState, GithubIssueStatus, GithubPrBuildState,
         GithubPrReviewState, GithubPrState, GithubPrStatus, GithubStatus, ToolConfig, ToolType,
@@ -59,6 +59,7 @@ const OOM_COLOR: Color = Color::Red;
 const RAM_LIMIT_WARNING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 const RAM_COLUMN_WIDTH: u16 = 10;
 const LINK_COLUMN_WIDTH: u16 = 2;
+const TYPE_COLUMN_WIDTH: u16 = 2;
 const STATUS_COLUMN_WIDTH: u16 = 2;
 const REVIEW_STATUS_COLUMN_WIDTH: u16 = 2;
 const CPU_COLUMN_MIN_WIDTH: u16 = 5;
@@ -468,6 +469,40 @@ fn task_pr_created_status(
         .map(github_link_badge)
         .filter(|reference| !reference.is_empty())
         .map(|reference| format!("PR created {reference}"))
+}
+
+fn workspace_active_task<'a>(
+    snapshot: &'a WorkspaceSnapshot,
+) -> Option<&'a WorkspaceTaskPersistentSnapshot> {
+    snapshot
+        .active_task_id
+        .clone()
+        .or_else(|| snapshot.resolved_active_task_id())
+        .and_then(|task_id| snapshot.task_persistent_snapshot(&task_id))
+}
+
+fn workspace_issue_type(snapshot: &WorkspaceSnapshot) -> Option<WorkspaceIssueType> {
+    workspace_active_task(snapshot).and_then(|task| task.issue_type)
+}
+
+fn issue_type_emoji(issue_type: Option<WorkspaceIssueType>) -> &'static str {
+    match issue_type {
+        Some(WorkspaceIssueType::Bug) => "🐞",
+        Some(WorkspaceIssueType::Docs) => "📝",
+        Some(WorkspaceIssueType::Enhancement) => "✨",
+        Some(WorkspaceIssueType::Improvement) => "🔧",
+        Some(WorkspaceIssueType::Regression) => "🔁",
+        Some(WorkspaceIssueType::DependencyUpgrade) => "📦",
+        None => "",
+    }
+}
+
+fn issue_type_cell(issue_type: Option<WorkspaceIssueType>, archived: bool) -> Cell<'static> {
+    let mut cell = Cell::from(issue_type_emoji(issue_type));
+    if archived && issue_type.is_some() {
+        cell = cell.style(Style::default().fg(Color::DarkGray));
+    }
+    cell
 }
 
 fn is_generic_review_task_status(status: &str) -> bool {
@@ -1334,7 +1369,7 @@ fn table_column_widths(
     create_row_server: &str,
     create_row_cpu: &str,
     create_row_ram: &str,
-) -> (u16, u16, u16, u16, u16, u16, u16, u16, u16, u16) {
+) -> (u16, u16, u16, u16, u16, u16, u16, u16, u16, u16, u16) {
     let mut workspace_width = content_width("Workspace").max(content_width(CREATE_ROW_LABEL));
     let mut server_width = content_width("Server").max(content_width(create_row_server));
     let mut cpu_width = content_width("CPU")
@@ -1348,6 +1383,7 @@ fn table_column_widths(
     let mut cost_width = content_width("Cost");
     let re_width = content_width("RE").max(LINK_COLUMN_WIDTH);
     let is_width = content_width("IS").max(LINK_COLUMN_WIDTH);
+    let t_width = content_width("T").max(TYPE_COLUMN_WIDTH);
     let pr_width = content_width("PR").max(LINK_COLUMN_WIDTH);
     let build_width = content_width("B").max(STATUS_COLUMN_WIDTH);
     let review_width = content_width("R").max(REVIEW_STATUS_COLUMN_WIDTH);
@@ -1376,6 +1412,7 @@ fn table_column_widths(
         cost_width,
         re_width,
         is_width,
+        t_width,
         pr_width,
         build_width,
         review_width,

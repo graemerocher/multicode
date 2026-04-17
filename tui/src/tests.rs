@@ -438,6 +438,23 @@ mod tests {
     }
 
     #[test]
+    fn issue_type_emoji_maps_known_issue_types() {
+        assert_eq!(
+            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::Bug)),
+            "🐞"
+        );
+        assert_eq!(
+            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::Docs)),
+            "📝"
+        );
+        assert_eq!(
+            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::DependencyUpgrade)),
+            "📦"
+        );
+        assert_eq!(crate::issue_type_emoji(None), "");
+    }
+
+    #[test]
     fn workspace_links_prefer_active_task_issue_and_pr_when_tasks_exist() {
         let mut started = snapshot(true, Some("http://example"));
         assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
@@ -2128,7 +2145,7 @@ mod tests {
             2,
             WorkspaceLinkKind::Review,
             &targets,
-            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2],
+            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2, 2],
         )
         .expect("tooltip area should exist");
 
@@ -2149,11 +2166,11 @@ mod tests {
             4,
             WorkspaceLinkKind::Pr,
             &targets,
-            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2],
+            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2, 2],
         )
         .expect("tooltip area should exist");
 
-        assert_eq!(area.x, 47);
+        assert_eq!(area.x, 50);
         assert_eq!(area.y, 1);
         assert_eq!(area.height, 5);
     }
@@ -3958,6 +3975,7 @@ mod tests {
             cost_width,
             re_width,
             is_width,
+            t_width,
             pr_width,
             build_width,
             review_width,
@@ -3986,6 +4004,7 @@ mod tests {
         assert!(cost_width >= content_width("$12.34"));
         assert_eq!(re_width, content_width("RE").max(LINK_COLUMN_WIDTH));
         assert_eq!(is_width, content_width("IS").max(LINK_COLUMN_WIDTH));
+        assert_eq!(t_width, content_width("T").max(TYPE_COLUMN_WIDTH));
         assert_eq!(pr_width, content_width("PR").max(LINK_COLUMN_WIDTH));
         assert_eq!(build_width, content_width("B").max(STATUS_COLUMN_WIDTH));
         assert_eq!(
@@ -4017,7 +4036,7 @@ mod tests {
         snapshots.insert("e2e-test".to_string(), workspace);
         let ordered_keys = vec!["e2e-test".to_string()];
 
-        let (_, server_width, _, _, cost_width, _, _, _, _, _) = table_column_widths(
+        let (_, server_width, _, _, cost_width, _, _, _, _, _, _) = table_column_widths(
             &ordered_keys,
             &snapshots,
             "Machine:",
