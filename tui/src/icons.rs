@@ -1,5 +1,18 @@
 use crate::*;
 
+pub(crate) fn issue_type_icon_kind_and_color(
+    issue_type: WorkspaceIssueType,
+) -> (StatusIconKind, Color) {
+    match issue_type {
+        WorkspaceIssueType::Bug => (StatusIconKind::Bug, Color::Red),
+        WorkspaceIssueType::Docs => (StatusIconKind::Docs, Color::LightBlue),
+        WorkspaceIssueType::Enhancement => (StatusIconKind::Enhancement, Color::Green),
+        WorkspaceIssueType::Improvement => (StatusIconKind::Improvement, Color::Yellow),
+        WorkspaceIssueType::Regression => (StatusIconKind::Regression, Color::Magenta),
+        WorkspaceIssueType::DependencyUpgrade => (StatusIconKind::DependencyUpgrade, Color::Cyan),
+    }
+}
+
 pub(crate) fn issue_icon_kind_and_color(state: GithubIssueState) -> (StatusIconKind, Color) {
     match state {
         GithubIssueState::Open => (StatusIconKind::IssueOpened, Color::Green),
@@ -49,6 +62,12 @@ pub(crate) fn icon_glyph(kind: StatusIconKind) -> &'static str {
         StatusIconKind::Eye => "\u{f441}",
         StatusIconKind::Server => "\u{f473}",
         StatusIconKind::FileDiff => "\u{f4d2}",
+        StatusIconKind::Bug => "\u{f188}",
+        StatusIconKind::Docs => "\u{f02d}",
+        StatusIconKind::Enhancement => "\u{f135}",
+        StatusIconKind::Improvement => "\u{f0ad}",
+        StatusIconKind::Regression => "\u{f1da}",
+        StatusIconKind::DependencyUpgrade => "\u{f1b2}",
         StatusIconKind::GitPullRequest => "\u{f407}",
         StatusIconKind::GitPullRequestDraft => "\u{f4dd}",
         StatusIconKind::GitPullRequestClosed => "\u{f4dc}",

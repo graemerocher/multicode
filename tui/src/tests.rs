@@ -438,20 +438,28 @@ mod tests {
     }
 
     #[test]
-    fn issue_type_emoji_maps_known_issue_types() {
+    fn issue_type_icon_mappings_use_expected_glyph_kinds() {
         assert_eq!(
-            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::Bug)),
-            "🐞"
+            crate::icons::issue_type_icon_kind_and_color(multicode_lib::WorkspaceIssueType::Bug),
+            (StatusIconKind::Bug, Color::Red)
         );
         assert_eq!(
-            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::Docs)),
-            "📝"
+            crate::icons::issue_type_icon_kind_and_color(multicode_lib::WorkspaceIssueType::Docs),
+            (StatusIconKind::Docs, Color::LightBlue)
         );
         assert_eq!(
-            crate::issue_type_emoji(Some(multicode_lib::WorkspaceIssueType::DependencyUpgrade)),
-            "📦"
+            crate::icons::issue_type_icon_kind_and_color(
+                multicode_lib::WorkspaceIssueType::DependencyUpgrade
+            ),
+            (StatusIconKind::DependencyUpgrade, Color::Cyan)
         );
-        assert_eq!(crate::issue_type_emoji(None), "");
+    }
+
+    #[test]
+    fn content_width_uses_terminal_display_width() {
+        assert_eq!(crate::content_width("A"), 1);
+        assert_eq!(crate::content_width(icon_glyph(StatusIconKind::Bug)), 1);
+        assert_eq!(crate::content_width(icon_glyph(StatusIconKind::Docs)), 1);
     }
 
     #[test]
@@ -2211,6 +2219,12 @@ mod tests {
             StatusIconKind::Eye,
             StatusIconKind::Server,
             StatusIconKind::FileDiff,
+            StatusIconKind::Bug,
+            StatusIconKind::Docs,
+            StatusIconKind::Enhancement,
+            StatusIconKind::Improvement,
+            StatusIconKind::Regression,
+            StatusIconKind::DependencyUpgrade,
             StatusIconKind::GitPullRequest,
             StatusIconKind::GitPullRequestDraft,
             StatusIconKind::GitPullRequestClosed,

@@ -35,6 +35,7 @@ use tokio::{
     process::Command,
     sync::{oneshot, watch},
 };
+use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use crate::render::draw_ui;
@@ -46,6 +47,8 @@ mod render;
 mod system;
 #[cfg(test)]
 mod tests;
+
+use crate::icons::{icon_glyph, issue_type_icon_kind_and_color};
 
 const CREATE_ROW_LABEL: &str = "Create new workspace…";
 const SECONDARY_ROW_COLOR: Color = Color::DarkGray;
@@ -59,7 +62,7 @@ const OOM_COLOR: Color = Color::Red;
 const RAM_LIMIT_WARNING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 const RAM_COLUMN_WIDTH: u16 = 10;
 const LINK_COLUMN_WIDTH: u16 = 2;
-const TYPE_COLUMN_WIDTH: u16 = 2;
+const TYPE_COLUMN_WIDTH: u16 = 1;
 const STATUS_COLUMN_WIDTH: u16 = 2;
 const REVIEW_STATUS_COLUMN_WIDTH: u16 = 2;
 const CPU_COLUMN_MIN_WIDTH: u16 = 5;
@@ -302,6 +305,12 @@ enum StatusIconKind {
     Eye,
     Server,
     FileDiff,
+    Bug,
+    Docs,
+    Enhancement,
+    Improvement,
+    Regression,
+    DependencyUpgrade,
     GitPullRequest,
     GitPullRequestDraft,
     GitPullRequestClosed,
@@ -485,24 +494,15 @@ fn workspace_issue_type(snapshot: &WorkspaceSnapshot) -> Option<WorkspaceIssueTy
     workspace_active_task(snapshot).and_then(|task| task.issue_type)
 }
 
-fn issue_type_emoji(issue_type: Option<WorkspaceIssueType>) -> &'static str {
-    match issue_type {
-        Some(WorkspaceIssueType::Bug) => "🐞",
-        Some(WorkspaceIssueType::Docs) => "📝",
-        Some(WorkspaceIssueType::Enhancement) => "✨",
-        Some(WorkspaceIssueType::Improvement) => "🔧",
-        Some(WorkspaceIssueType::Regression) => "🔁",
-        Some(WorkspaceIssueType::DependencyUpgrade) => "📦",
-        None => "",
-    }
-}
-
 fn issue_type_cell(issue_type: Option<WorkspaceIssueType>, archived: bool) -> Cell<'static> {
-    let mut cell = Cell::from(issue_type_emoji(issue_type));
-    if archived && issue_type.is_some() {
-        cell = cell.style(Style::default().fg(Color::DarkGray));
-    }
-    cell
+    issue_type.map_or_else(Cell::default, |issue_type| {
+        let (kind, color) = issue_type_icon_kind_and_color(issue_type);
+        Cell::from(icon_glyph(kind)).style(
+            Style::default()
+                .fg(if archived { Color::DarkGray } else { color })
+                .bg(Color::Reset),
+        )
+    })
 }
 
 fn is_generic_review_task_status(status: &str) -> bool {
@@ -1351,7 +1351,7 @@ fn next_link_selection_right(current: Option<usize>, link_count: usize) -> Optio
 }
 
 fn content_width(text: &str) -> u16 {
-    text.chars().count().min(u16::MAX as usize) as u16
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
 fn right_align_cell_text(text: &str, width: u16) -> String {

@@ -422,6 +422,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
 
     let mut table_state = TableState::default();
     table_state.select(Some(app.selected_row));
+    frame.render_widget(Clear, chunks[0]);
     frame.render_stateful_widget(table, chunks[0], &mut table_state);
 
     let help = help_line(
