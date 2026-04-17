@@ -429,16 +429,10 @@ pub(crate) fn should_restart_task_codex_after_attach(
     attached_session_id.is_some() && !fresh_codex_session
 }
 
-fn codex_observer_attach_prompt(task_id: &str) -> String {
-    format!(
-        "Another Codex task session is already actively working on {task_id}. You are attached only for observation and user-directed inspection. Do not make repository changes, do not start duplicate work, and do not send autonomous follow-up prompts to the active task. Briefly confirm you are attached and then wait for the user."
-    )
-}
-
 pub(crate) fn working_codex_task_attach_target(
     snapshot: &WorkspaceSnapshot,
     task_id: Option<&str>,
-    cwd: Option<String>,
+    _cwd: Option<String>,
 ) -> io::Result<Option<AttachTarget>> {
     let Some(task_id) = task_id else {
         return Ok(None);
@@ -453,10 +447,9 @@ pub(crate) fn working_codex_task_attach_target(
     let Some(uri) = codex_attach_uri(snapshot)? else {
         return Ok(None);
     };
-    Ok(Some(AttachTarget::CodexNew {
+    Ok(Some(AttachTarget::Codex {
         uri,
-        cwd,
-        prompt: Some(codex_observer_attach_prompt(task_id)),
+        thread_id: task_state.session_id.clone(),
     }))
 }
 
@@ -1732,6 +1725,13 @@ impl TuiState {
             task_runtime_snapshot(snapshot, task_id)
                 .and_then(|task_state| task_state.session_id.as_deref()),
         ))
+    }
+
+    fn selected_task_default_github_url(&self) -> Option<String> {
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        Some(task_issue_link(task, task_runtime_snapshot(snapshot, task_id)).to_string())
     }
 
     async fn approve_selected_task_for_pr_creation(&mut self) {
@@ -3450,6 +3450,8 @@ impl TuiState {
                 return;
             };
             ("GitHub link", argument.clone())
+        } else if let Some(url) = self.selected_task_default_github_url() {
+            ("GitHub issue", url)
         } else {
             let Some(url) = self.selected_workspace_github_repository_url() else {
                 return;
@@ -3780,9 +3782,6 @@ impl TuiState {
                 self.request_selected_workspace_queue_next_issue();
             }
             KeyCode::Char('o') => {
-                if !link_selected && self.selected_task_id().is_some() {
-                    return;
-                }
                 self.open_selected_github_target().await;
             }
             KeyCode::Char('s') => {

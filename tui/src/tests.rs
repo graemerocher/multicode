@@ -1245,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn working_codex_task_attach_target_uses_fresh_observer_session() {
+    fn working_codex_task_attach_target_uses_existing_task_thread() {
         let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
         assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
         started.task_states.insert(
@@ -1267,10 +1267,9 @@ mod tests {
 
         assert_eq!(
             target,
-            Some(AttachTarget::CodexNew {
+            Some(AttachTarget::Codex {
                 uri: "ws://127.0.0.1:3456/".to_string(),
-                cwd: Some("/tmp/task-42".to_string()),
-                prompt: Some("Another Codex task session is already actively working on task-42. You are attached only for observation and user-directed inspection. Do not make repository changes, do not start duplicate work, and do not send autonomous follow-up prompts to the active task. Briefly confirm you are attached and then wait for the user.".to_string()),
+                thread_id: Some("thread-42".to_string()),
             })
         );
     }
@@ -2849,6 +2848,39 @@ mod tests {
 
         assert!(text.contains("a approve"));
         assert!(text.contains("f fix CI"));
+        assert!(text.contains("o open GitHub"));
+    }
+
+    #[test]
+    fn help_line_shows_open_github_for_task_row_focus_without_selected_link() {
+        let started = snapshot(true, Some("http://example"));
+        let line = help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            2,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("o open GitHub"));
+        assert!(text.contains("x remove issue"));
     }
 
     #[test]

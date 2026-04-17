@@ -1465,6 +1465,7 @@ fn help_line(
                                 push_hotkey(&mut spans, "f", " fix CI  ");
                             }
                         }
+                        push_hotkey(&mut spans, "o", " open GitHub  ");
                         for (tool_key, tool_name) in tool_hotkeys {
                             push_hotkey(&mut spans, tool_key.clone(), format!(" {}  ", tool_name));
                         }
