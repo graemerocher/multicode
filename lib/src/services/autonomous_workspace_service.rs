@@ -34,8 +34,9 @@ use crate::{
     opencode, services::config::AgentProvider, workspace_issue_type_glyph,
 };
 
-const ISSUE_PRIORITY_LABELS: [&str; 4] = [
+const ISSUE_PRIORITY_LABELS: [&str; 5] = [
     "type: bug",
+    "type: docs",
     "type:docs",
     "type: improvement",
     "type: enhancement",
@@ -6094,6 +6095,11 @@ mod tests {
         let args = issue_search_args("example/repo", "type: bug");
         assert!(args.iter().any(|arg| arg == "-linked:pr"));
         assert!(args.windows(2).any(|pair| pair == ["--state", "open"]));
+    }
+
+    #[test]
+    fn issue_priority_labels_include_spaced_docs_label() {
+        assert!(ISSUE_PRIORITY_LABELS.contains(&"type: docs"));
     }
 
     #[test]
