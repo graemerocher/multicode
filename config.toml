@@ -1,10 +1,33 @@
-workspace-directory = "~/dev/agent-work"
+workspace-directory = "~/dev/multicode-workspaces"
 opencode = ["opencode-cli", "opencode"]
 # todo: find a solution that isn't bound to TUI lifecycle
 
+[agent]
+provider = "opencode"
+
+[agent.codex]
+commands = ["codex"]
+# profile = "default"
+# model = "gpt-5-codex"
+# model-provider = "openai"
+# approval-policy = "never"
+# sandbox-mode = "external-sandbox"
+# network-access = "enabled"
+
+[compare]
+tool = "vscode"
+# For JetBrains Toolbox users you can switch to IntelliJ IDEA instead:
+# tool = "intellij"
+# command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
+[runtime]
+backend = "apple-container"
+# Local Apple container image. It should contain Java 25, git, gh, opencode, and codex.
+image = "multicode-java25:latest"
+
 [github]
 #token = {command = "gh auth token"}
-token = {env = "GITHUB_MCP_TOKEN"}
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
 populate-git-credentials = true
 
 [isolation]
@@ -30,6 +53,7 @@ isolated = [
     "~/.local/state/opencode",
 ]
 readable = [
+    "~/.config/opencode",
     "~/.local/share/opencode/auth.json",
 ]
 tmpfs = [
@@ -38,12 +62,11 @@ tmpfs = [
 ]
 inherit-env = [
     "XDG_RUNTIME_DIR",
-    "DISPLAY",
     "HOME",
+    "PATH",
     "LANG",
     "TERM",
     "COLORTERM",
-    "GITHUB_MCP_TOKEN",
 ]
 memory-high = "12 GiB"
 memory-max = "16 GiB"
@@ -51,9 +74,9 @@ cpu = "300%"
 
 
 [handler]
-review = "/usr/bin/smerge ."
+review = "/usr/bin/open ."
 review-pty = false
-web = "/usr/bin/firefox {}"
+web = "/usr/bin/open {}"
 
 [[tool]]
 type = "exec"
@@ -76,7 +99,6 @@ dereference-symlinks = true
 local = "~/.local/share/opencode/auth.json"
 remote = "~/.local/share/opencode/auth.json"
 dereference-symlinks = true
-
 [[remote.sync-bidi]]
 local = "/var/tmp/multicode-remote-workspace"
 remote = "~/dev/agent-work"

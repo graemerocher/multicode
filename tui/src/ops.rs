@@ -1,4 +1,125 @@
 use crate::*;
+use multicode_lib::services::{CompareConfig, CompareTool};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+fn vscode_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    )];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join("Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+        );
+    }
+    candidates
+}
+
+fn intellij_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/Applications/IntelliJ IDEA.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA Ultimate.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA CE.app/Contents/MacOS/idea"),
+        PathBuf::from("/Applications/IntelliJ IDEA Community Edition.app/Contents/MacOS/idea"),
+        PathBuf::from("/usr/local/bin/idea"),
+        PathBuf::from("/opt/idea/bin/idea.sh"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates
+            .push(PathBuf::from(&home).join("Applications/IntelliJ IDEA.app/Contents/MacOS/idea"));
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/IntelliJ IDEA Ultimate.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home).join("Applications/IntelliJ IDEA CE.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/IntelliJ IDEA Community Edition.app/Contents/MacOS/idea"),
+        );
+        candidates.push(
+            PathBuf::from(&home).join("Library/Application Support/JetBrains/Toolbox/scripts/idea"),
+        );
+    }
+    candidates
+}
+
+fn compare_command_candidates(tool: CompareTool) -> Vec<PathBuf> {
+    match tool {
+        CompareTool::Vscode => {
+            let mut candidates = vec![PathBuf::from("code")];
+            candidates.extend(vscode_command_candidates());
+            candidates
+        }
+        CompareTool::Intellij => {
+            let mut candidates = vec![PathBuf::from("idea")];
+            candidates.extend(intellij_command_candidates());
+            candidates
+        }
+    }
+}
+
+pub(crate) fn compare_tool_name(tool: CompareTool) -> &'static str {
+    match tool {
+        CompareTool::Vscode => "VS Code",
+        CompareTool::Intellij => "IntelliJ IDEA",
+    }
+}
+
+fn compare_command_path(config: &CompareConfig) -> Option<PathBuf> {
+    if let Some(command) = config.command.as_deref().map(str::trim)
+        && !command.is_empty()
+        && command_exists(command)
+    {
+        return Some(PathBuf::from(command));
+    }
+
+    compare_command_candidates(config.tool)
+        .into_iter()
+        .find(|candidate| command_exists(candidate.to_string_lossy().as_ref()))
+}
+
+pub(crate) fn compare_tool_is_available(config: &CompareConfig) -> bool {
+    compare_command_path(config).is_some()
+}
+
+fn compare_open_command(
+    config: &CompareConfig,
+    paths: &[PathBuf],
+) -> io::Result<(String, Vec<String>)> {
+    let program = compare_command_path(config).ok_or_else(|| {
+        let configured = config.command.as_deref().map(str::trim).unwrap_or_default();
+        if configured.is_empty() {
+            io::Error::other(format!(
+                "{} is not installed or its CLI launcher is unavailable",
+                compare_tool_name(config.tool)
+            ))
+        } else {
+            io::Error::other(format!(
+                "{} compare command '{}' is unavailable",
+                compare_tool_name(config.tool),
+                configured
+            ))
+        }
+    })?;
+
+    let mut args = Vec::new();
+    if matches!(config.tool, CompareTool::Vscode) {
+        args.push("--reuse-window".to_string());
+    }
+    args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+
+    Ok((program.to_string_lossy().into_owned(), args))
+}
+
+pub(crate) fn compare_open_repo_command(
+    compare: &CompareConfig,
+    repo_path: &Path,
+) -> io::Result<(String, Vec<String>)> {
+    compare_open_command(compare, &[repo_path.to_path_buf()])
+}
 
 pub(crate) fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -37,6 +158,13 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
     let mut parsed = Url::parse(uri)
         .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
 
+    if matches!(parsed.scheme(), "ws" | "wss") {
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: snapshot.root_session_id.clone(),
+        });
+    }
+
     let username = parsed.username().to_string();
     if username.is_empty() {
         return Err(io::Error::other(
@@ -55,11 +183,68 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
         .set_password(None)
         .map_err(|_| io::Error::other("failed to sanitize workspace attach URI password"))?;
 
-    Ok(AttachTarget {
+    Ok(AttachTarget::Opencode {
         uri: parsed.to_string(),
         username,
         password,
         session_id: snapshot.root_session_id.clone(),
+    })
+}
+
+pub(crate) fn task_attach_target(
+    snapshot: &WorkspaceSnapshot,
+    task_state: &multicode_lib::WorkspaceTaskRuntimeSnapshot,
+) -> io::Result<AttachTarget> {
+    if workspace_state(snapshot) != WorkspaceUiState::Started {
+        return Err(io::Error::other(
+            "workspace must be in Started state before attaching",
+        ));
+    }
+
+    let uri = snapshot
+        .transient
+        .as_ref()
+        .map(|transient| transient.uri.as_str())
+        .ok_or_else(|| io::Error::other("workspace is missing transient attach URI"))?;
+
+    let mut parsed = Url::parse(uri)
+        .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
+
+    let session_id = task_state
+        .session_id
+        .clone()
+        .ok_or_else(|| io::Error::other("task does not have a resumable session yet"))?;
+
+    if matches!(parsed.scheme(), "ws" | "wss") {
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: Some(session_id),
+        });
+    }
+
+    let username = parsed.username().to_string();
+    if username.is_empty() {
+        return Err(io::Error::other(
+            "workspace attach URI is missing username credentials",
+        ));
+    }
+    let password = parsed
+        .password()
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::other("workspace attach URI is missing password credentials"))?;
+
+    parsed
+        .set_username("")
+        .map_err(|_| io::Error::other("failed to sanitize workspace attach URI username"))?;
+    parsed
+        .set_password(None)
+        .map_err(|_| io::Error::other("failed to sanitize workspace attach URI password"))?;
+
+    Ok(AttachTarget::Opencode {
+        uri: parsed.to_string(),
+        username,
+        password,
+        session_id: Some(session_id),
     })
 }
 
@@ -118,18 +303,12 @@ pub(crate) async fn validate_workspace_link_target(
             }
 
             let git_dir = repo_path.join(".git");
-            let git_metadata = tokio::fs::metadata(&git_dir).await.map_err(|err| {
+            tokio::fs::symlink_metadata(&git_dir).await.map_err(|err| {
                 io::Error::other(format!(
-                    "review path '{}' must contain a '.git' folder: {err}",
+                    "review path '{}' must contain a '.git' entry: {err}",
                     repo_path.display()
                 ))
             })?;
-            if !git_metadata.is_dir() {
-                return Err(io::Error::other(format!(
-                    "review path '{}' must contain a '.git' folder",
-                    repo_path.display()
-                )));
-            }
 
             Ok(repo_path.to_string_lossy().into_owned())
         }
@@ -154,14 +333,49 @@ pub(crate) async fn validate_workspace_link_target(
     }
 }
 
-pub(crate) fn attach_cli_args(opencode_command: &str, target: &AttachTarget) -> Vec<String> {
-    let mut args = vec![opencode_command.to_string(), "attach".to_string()];
-    if let Some(session_id) = target.session_id.as_deref() {
-        args.push("--session".to_string());
-        args.push(session_id.to_string());
+pub(crate) fn attach_cli_args(agent_command: &str, target: &AttachTarget) -> Vec<String> {
+    match target {
+        AttachTarget::Opencode {
+            uri, session_id, ..
+        } => {
+            let mut args = vec![agent_command.to_string(), "attach".to_string()];
+            if let Some(session_id) = session_id.as_deref() {
+                args.push("--session".to_string());
+                args.push(session_id.to_string());
+            }
+            args.push(uri.clone());
+            args
+        }
+        AttachTarget::Codex { uri, thread_id } => {
+            let mut args = vec![
+                agent_command.to_string(),
+                "resume".to_string(),
+                "--remote".to_string(),
+                uri.clone(),
+            ];
+            if let Some(thread_id) = thread_id.as_deref() {
+                args.push(thread_id.to_string());
+            } else {
+                args.push("--last".to_string());
+            }
+            args
+        }
+        AttachTarget::CodexNew { uri, cwd, prompt } => {
+            let mut args = vec![
+                agent_command.to_string(),
+                "--remote".to_string(),
+                uri.clone(),
+            ];
+            if let Some(cwd) = cwd.as_deref() {
+                args.push("-C".to_string());
+                args.push(cwd.to_string());
+            }
+            if let Some(prompt) = prompt.as_deref() {
+                args.push(prompt.to_string());
+            }
+            args
+        }
     }
-    args.push(target.uri.clone());
-    args
 }
 
 pub(crate) fn tmux_session_command(
@@ -179,22 +393,36 @@ pub(crate) fn tmux_session_command(
 
 pub(crate) async fn attach_in_tmux(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    opencode_command: &str,
+    agent_command: &str,
     target: &AttachTarget,
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
     workspace_key: &str,
     custom_description: &str,
 ) -> io::Result<()> {
     let original_term = std::env::var("TERM").ok();
-    let attach_command = vec![
-        format!("OPENCODE_SERVER_USERNAME={}", target.username),
-        format!("OPENCODE_SERVER_PASSWORD={}", target.password),
-    ];
-    let mut attach_command = tmux_session_command(attach_command, original_term.as_deref());
-    attach_command.extend(attach_cli_args(opencode_command, target));
+    let mut session_env = extra_env.to_vec();
+    if let Some(term) = original_term.as_deref() {
+        session_env.push(("TERM".to_string(), term.to_string()));
+    }
+    let attach_env = extra_env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    if let AttachTarget::Opencode {
+        username, password, ..
+    } = target
+    {
+        session_env.push(("OPENCODE_SERVER_USERNAME".to_string(), username.to_string()));
+        session_env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
+    }
+    let mut attach_command = tmux_session_command(attach_env, None);
+    attach_command.extend(attach_cli_args(agent_command, target));
     run_tmux_new_session_command(
         terminal,
-        &[],
+        &session_env,
         attach_command,
+        cwd,
         workspace_key,
         custom_description,
     )
@@ -205,9 +433,22 @@ pub(crate) async fn run_tmux_new_session_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     env: &[(String, String)],
     command: Vec<String>,
+    cwd: Option<&Path>,
     workspace_key: &str,
     custom_description: &str,
 ) -> io::Result<()> {
+    if !command_exists("tmux") {
+        let debug_command = command
+            .split_first()
+            .map(|(program, args)| format_command_line(program, args))
+            .unwrap_or_else(|| "<empty command>".to_string());
+        tracing::info!(
+            command = %debug_command,
+            "tmux unavailable; running interactive command directly"
+        );
+        return run_interactive_command(terminal, env, &command, cwd).await;
+    }
+
     restore_terminal(terminal)?;
 
     let session_name = generate_tmux_session_name(workspace_key);
@@ -232,11 +473,15 @@ pub(crate) async fn run_tmux_new_session_command(
 
     let mut create_process = Command::new("tmux");
     create_process.env("TERM", "xterm-256color");
-    let create_result = create_process
+    create_process
         .arg("new-session")
         .arg("-d")
         .arg("-s")
-        .arg(&session_name)
+        .arg(&session_name);
+    if let Some(cwd) = cwd {
+        create_process.arg("-c").arg(cwd);
+    }
+    let create_result = create_process
         .arg("env")
         .args(env.iter().map(|(name, value)| format!("{name}={value}")))
         .args(command)
@@ -301,9 +546,11 @@ pub(crate) async fn run_tmux_new_session_command(
         {
             Ok(status) if status.success() => {}
             Ok(status) => {
-                run_error = Some(io::Error::other(format!(
-                    "tmux attach-session exited with status {status}"
-                )));
+                if tmux_session_exists(&session_name).await? {
+                    run_error = Some(io::Error::other(format!(
+                        "tmux attach-session exited with status {status}"
+                    )));
+                }
             }
             Err(err) => {
                 run_error = Some(err);
@@ -319,6 +566,62 @@ pub(crate) async fn run_tmux_new_session_command(
         (_, Err(err)) => Err(err),
         (Some(err), Ok(())) => Err(err),
         (None, Ok(())) => Ok(()),
+    }
+}
+
+pub(crate) fn command_exists(command: &str) -> bool {
+    if command.contains('/') {
+        return is_executable_file(Path::new(command));
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(command))
+        .any(|candidate| is_executable_file(&candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+async fn run_interactive_command(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    env: &[(String, String)],
+    command: &[String],
+    cwd: Option<&Path>,
+) -> io::Result<()> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(io::Error::other("interactive command must not be empty"));
+    };
+
+    restore_terminal(terminal)?;
+    let mut process = Command::new(program);
+    process
+        .args(args)
+        .envs(env.iter().cloned())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    let status = process.status().await;
+    let setup_result = setup_terminal().map(|new_terminal| {
+        *terminal = new_terminal;
+    });
+
+    match (status, setup_result) {
+        (_, Err(err)) => Err(err),
+        (Ok(status), Ok(())) if status.success() => Ok(()),
+        (Ok(status), Ok(())) => Err(io::Error::other(format!(
+            "interactive command exited with status {status}"
+        ))),
+        (Err(err), Ok(())) => Err(err),
     }
 }
 
@@ -356,6 +659,19 @@ pub(crate) async fn set_tmux_session_option(
             "tmux set-option {option} exited with status {status}"
         )))
     }
+}
+
+async fn tmux_session_exists(session_name: &str) -> io::Result<bool> {
+    let status = Command::new("tmux")
+        .arg("has-session")
+        .arg("-t")
+        .arg(session_name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    Ok(status.success())
 }
 
 pub(crate) fn generate_tmux_session_name(workspace_key: &str) -> String {

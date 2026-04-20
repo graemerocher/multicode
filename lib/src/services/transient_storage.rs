@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::workspace_watch::monitor_workspace_snapshots;
+use super::{config::synthesized_xdg_runtime_dir, workspace_watch::monitor_workspace_snapshots};
 use crate::{
     TransientWorkspaceSnapshot, WorkspaceManager, WorkspaceManagerError, WorkspaceSnapshot,
 };
@@ -55,7 +55,7 @@ pub async fn transient_storage(
             let snapshot_path = snapshot_file_path(storage_dir.as_ref(), &key);
             let transient_snapshot = read_transient_snapshot(&snapshot_path).await?;
             workspace.update(|snapshot| {
-                if snapshot.transient != transient_snapshot {
+                if snapshot.transient.is_none() && transient_snapshot.is_some() {
                     snapshot.transient = transient_snapshot.clone();
                     true
                 } else {
@@ -65,6 +65,12 @@ pub async fn transient_storage(
 
             let current_transient = workspace_rx.borrow_and_update().transient.clone();
             tokio::spawn(async move {
+                if let Err(err) =
+                    persist_transient_snapshot(&snapshot_path, current_transient.as_ref()).await
+                {
+                    tracing::error!(error = ?err, "failed to persist initial transient snapshot");
+                    return;
+                }
                 if let Err(err) =
                     watch_workspace_snapshot(snapshot_path, workspace_rx, current_transient).await
                 {
@@ -113,8 +119,9 @@ async fn ensure_storage_directory(
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .or_else(synthesized_xdg_runtime_dir)
                 .ok_or(TransientStorageError::MissingXdgRuntimeDir)?;
-            let runtime_dir = PathBuf::from(runtime_dir);
             if !runtime_dir.is_absolute() {
                 return Err(TransientStorageError::InvalidXdgRuntimeDir(runtime_dir));
             }
@@ -271,14 +278,15 @@ async fn persist_transient_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkspaceManager;
     use crate::test_support::ENV_VAR_LOCK;
+    use crate::{RuntimeBackend, RuntimeHandleSnapshot, WorkspaceManager};
     use std::{
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::Duration,
     };
+    use uuid::Uuid;
 
     struct TestDir {
         path: PathBuf,
@@ -286,14 +294,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos();
             let path = std::env::temp_dir().join(format!(
                 "multicode-transient-storage-{}-{}",
                 std::process::id(),
-                unique
+                Uuid::new_v4().as_simple()
             ));
             fs::create_dir_all(&path).expect("test dir should be created");
             Self { path }
@@ -320,6 +324,14 @@ mod tests {
             let old_value = std::env::var_os(key);
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
             }
             Self { key, old_value }
         }
@@ -397,6 +409,36 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_storage_directory_synthesizes_xdg_runtime_dir_on_macos() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let _guard = EnvVarGuard::remove("XDG_RUNTIME_DIR");
+
+            let link = root.path().join("state/transient-link");
+            let target = ensure_storage_directory(&link)
+                .await
+                .expect("storage directory should be created");
+
+            assert!(
+                target.starts_with(
+                    synthesized_xdg_runtime_dir()
+                        .expect("macOS should synthesize XDG runtime dir")
+                        .join("multicode")
+                )
+            );
+        });
+    }
+
     #[test]
     fn ensure_storage_directory_creates_missing_symlink_target() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -450,7 +492,11 @@ mod tests {
 
             let initial_transient = TransientWorkspaceSnapshot {
                 uri: "file:///initial".to_string(),
-                unit: "run-u-initial.service".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::LinuxSystemdBwrap,
+                    id: "run-u-initial.service".to_string(),
+                    metadata: Default::default(),
+                },
             };
             let snapshot_path = storage_dir.join("alpha.json");
             tokio::fs::write(
@@ -479,7 +525,11 @@ mod tests {
                 .update(|snapshot| {
                     snapshot.transient = Some(TransientWorkspaceSnapshot {
                         uri: "file:///updated".to_string(),
-                        unit: "run-u-updated.service".to_string(),
+                        runtime: RuntimeHandleSnapshot {
+                            backend: RuntimeBackend::LinuxSystemdBwrap,
+                            id: "run-u-updated.service".to_string(),
+                            metadata: Default::default(),
+                        },
                     });
                     true
                 });
@@ -491,7 +541,7 @@ mod tests {
                         .expect("snapshot file should stay readable");
                     let snapshot: TransientWorkspaceSnapshot =
                         serde_json::from_slice(&content).expect("snapshot should parse");
-                    if snapshot.unit == "run-u-updated.service" {
+                    if snapshot.runtime.id == "run-u-updated.service" {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -573,6 +623,76 @@ mod tests {
 
             assert_eq!(alpha_rx.borrow().transient, None);
             assert!(alpha_rx.borrow().opencode_client.is_none());
+            service_task.abort();
+        });
+    }
+
+    #[test]
+    fn transient_storage_does_not_clobber_live_transient_state_when_disk_snapshot_is_missing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let storage_dir = root.path().join("storage");
+            tokio::fs::create_dir_all(&storage_dir)
+                .await
+                .expect("storage dir should exist");
+
+            let link = root.path().join("transient-link");
+            tokio::fs::symlink(&storage_dir, &link)
+                .await
+                .expect("symlink should be created");
+
+            let manager = Arc::new(WorkspaceManager::new());
+            manager
+                .add("alpha")
+                .expect("workspace should be added before service starts");
+
+            let live_transient = TransientWorkspaceSnapshot {
+                uri: "http://opencode:secret@127.0.0.1:31337/".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::AppleContainer,
+                    id: "multicode-alpha".to_string(),
+                    metadata: Default::default(),
+                },
+            };
+            manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .update(|snapshot| {
+                    snapshot.transient = Some(live_transient.clone());
+                    true
+                });
+
+            let alpha_rx = manager
+                .get_workspace("alpha")
+                .expect("workspace should exist")
+                .subscribe();
+            let service_task = tokio::spawn(transient_storage(manager.clone(), link.clone()));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(alpha_rx.borrow().transient, Some(live_transient.clone()));
+
+            let snapshot_path = storage_dir.join("alpha.json");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let content = tokio::fs::read(&snapshot_path)
+                        .await
+                        .expect("snapshot file should be written");
+                    let snapshot: TransientWorkspaceSnapshot =
+                        serde_json::from_slice(&content).expect("snapshot should parse");
+                    if snapshot == live_transient {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("live transient state should be persisted");
+
             service_task.abort();
         });
     }

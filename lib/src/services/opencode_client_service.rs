@@ -7,14 +7,19 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use tokio::{
     process::Command,
     sync::{broadcast, watch},
     task::JoinHandle,
 };
 use tokio_stream::StreamExt;
+use url::Url;
 
-use super::workspace_watch::monitor_workspace_snapshots;
+use super::{
+    runtime::{RuntimeActivity, WorkspaceRuntime},
+    workspace_watch::monitor_workspace_snapshots,
+};
 use crate::{
     OpencodeClientSnapshot, WorkspaceManager, WorkspaceManagerError, WorkspaceSnapshot,
     manager::Workspace, opencode,
@@ -191,8 +196,8 @@ async fn watch_workspace_snapshot(
         abort_event_forward_task(&mut event_forward_task);
         event_generation.fetch_add(1, Ordering::Relaxed);
 
-        match read_unit_activity(&transient.unit).await {
-            UnitActivity::Stopped => {
+        match WorkspaceRuntime::read_activity(&transient.runtime).await {
+            RuntimeActivity::Stopped => {
                 workspace.update(|next| {
                     if next.transient.as_ref() == Some(&transient) {
                         let mut changed = false;
@@ -211,7 +216,7 @@ async fn watch_workspace_snapshot(
                 });
                 last_client_uri = None;
             }
-            UnitActivity::Active | UnitActivity::Unknown => {}
+            RuntimeActivity::Active | RuntimeActivity::Unknown => {}
         }
 
         if !wait_for_change_or_timeout(&mut workspace_rx, HEALTH_RETRY_INTERVAL).await {
@@ -256,10 +261,18 @@ fn create_opencode_client(
     current_uri: &str,
     shared_http_client: Option<&reqwest::Client>,
 ) -> opencode::client::Client {
+    let (baseurl, auth_header) = opencode_client_target(current_uri);
+    if let Some(auth_header) = auth_header {
+        return opencode::client::Client::new_with_client(
+            &baseurl,
+            build_authenticated_http_client(auth_header),
+        );
+    }
+
     if let Some(shared_http_client) = shared_http_client {
-        opencode::client::Client::new_with_client(current_uri, shared_http_client.clone())
+        opencode::client::Client::new_with_client(&baseurl, shared_http_client.clone())
     } else {
-        opencode::client::Client::new(current_uri)
+        opencode::client::Client::new(&baseurl)
     }
 }
 
@@ -270,6 +283,46 @@ fn build_shared_http_client() -> Option<reqwest::Client> {
         .timeout(timeout)
         .build()
         .ok()
+}
+
+fn build_authenticated_http_client(auth_header: String) -> reqwest::Client {
+    let timeout = Duration::from_secs(15);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&auth_header)
+            .expect("generated basic auth header should be valid"),
+    );
+    reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .default_headers(headers)
+        .build()
+        .expect("authenticated opencode http client should build")
+}
+
+fn opencode_client_target(current_uri: &str) -> (String, Option<String>) {
+    let Ok(mut url) = Url::parse(current_uri) else {
+        return (current_uri.to_string(), None);
+    };
+
+    let username = url.username().to_string();
+    let password = url.password().map(str::to_string);
+    if username.is_empty() {
+        return (current_uri.to_string(), None);
+    }
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let credentials = match password {
+        Some(password) => format!("{username}:{password}"),
+        None => format!("{username}:"),
+    };
+    let encoded = BASE64_STANDARD.encode(credentials);
+    (
+        url.to_string().trim_end_matches('/').to_string(),
+        Some(format!("Basic {encoded}")),
+    )
 }
 
 async fn forward_global_events(
@@ -396,14 +449,8 @@ async fn wait_for_change_or_timeout(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnitActivity {
-    Active,
-    Stopped,
-    Unknown,
-}
-
-async fn read_unit_activity(unit: &str) -> UnitActivity {
+#[cfg_attr(not(test), allow(dead_code))]
+async fn read_unit_activity(unit: &str) -> RuntimeActivity {
     let output = match Command::new("systemctl")
         .args([
             "--user",
@@ -420,21 +467,21 @@ async fn read_unit_activity(unit: &str) -> UnitActivity {
         Ok(output) => output,
         Err(err) => {
             if err.kind() == std::io::ErrorKind::NotFound {
-                return UnitActivity::Unknown;
+                return RuntimeActivity::Unknown;
             }
-            return UnitActivity::Unknown;
+            return RuntimeActivity::Unknown;
         }
     };
 
     if !output.status.success() {
-        return UnitActivity::Stopped;
+        return RuntimeActivity::Stopped;
     }
 
     let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if matches!(state.as_str(), "active" | "activating") {
-        UnitActivity::Active
+        RuntimeActivity::Active
     } else {
-        UnitActivity::Stopped
+        RuntimeActivity::Stopped
     }
 }
 
@@ -450,7 +497,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::TransientWorkspaceSnapshot;
+    use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct TestDir {
@@ -509,6 +556,31 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn opencode_client_target_extracts_basic_auth_header_and_strips_userinfo() {
+        let (baseurl, auth_header) =
+            opencode_client_target("http://opencode:secret@127.0.0.1:1234/");
+        assert_eq!(baseurl, "http://127.0.0.1:1234");
+        assert_eq!(
+            auth_header,
+            Some(format!(
+                "Basic {}",
+                BASE64_STANDARD.encode("opencode:secret")
+            ))
+        );
+    }
+
+    fn transient_snapshot(uri: String, runtime_id: &str) -> TransientWorkspaceSnapshot {
+        TransientWorkspaceSnapshot {
+            uri,
+            runtime: RuntimeHandleSnapshot {
+                backend: RuntimeBackend::LinuxSystemdBwrap,
+                id: runtime_id.to_string(),
+                metadata: Default::default(),
+            },
         }
     }
 
@@ -591,10 +663,10 @@ mod tests {
             });
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("http://{addr}"),
-                    unit: "run-u-health.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    format!("http://{addr}"),
+                    "run-u-health.service",
+                ));
                 true
             });
 
@@ -692,10 +764,10 @@ mod tests {
             });
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("http://{addr}/"),
-                    unit: "run-u-health-trailing-slash.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    format!("http://{addr}/"),
+                    "run-u-health-trailing-slash.service",
+                ));
                 true
             });
 
@@ -786,10 +858,10 @@ mod tests {
             });
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("http://{addr}"),
-                    unit: "run-u-events.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    format!("http://{addr}"),
+                    "run-u-events.service",
+                ));
                 true
             });
 
@@ -876,10 +948,10 @@ mod tests {
             let mut workspace_rx = workspace.subscribe();
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:9".to_string(),
-                    unit: "run-u-stopped.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:9".to_string(),
+                    "run-u-stopped.service",
+                ));
                 true
             });
 
@@ -945,10 +1017,10 @@ mod tests {
                 .expect("workspace should exist");
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:9".to_string(),
-                    unit: "run-u-active.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:9".to_string(),
+                    "run-u-active.service",
+                ));
                 true
             });
 
@@ -980,7 +1052,7 @@ mod tests {
             let _path_guard = EnvVarGuard::set("PATH", empty_bin.as_os_str());
 
             let activity = read_unit_activity("missing.service").await;
-            assert_eq!(activity, UnitActivity::Unknown);
+            assert_eq!(activity, RuntimeActivity::Unknown);
         });
     }
 }

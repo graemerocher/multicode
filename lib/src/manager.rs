@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use tokio::sync::watch;
@@ -15,24 +15,45 @@ pub enum WorkspaceManagerError {
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    snapshot_tx: watch::Sender<WorkspaceSnapshot>,
+    snapshot_tx: Arc<RwLock<Option<watch::Sender<WorkspaceSnapshot>>>>,
 }
 
 impl Workspace {
     pub fn new(snapshot: WorkspaceSnapshot) -> Self {
         let (snapshot_tx, _) = watch::channel(snapshot);
-        Self { snapshot_tx }
+        Self {
+            snapshot_tx: Arc::new(RwLock::new(Some(snapshot_tx))),
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<WorkspaceSnapshot> {
-        self.snapshot_tx.subscribe()
+        self.snapshot_tx
+            .read()
+            .expect("workspace lock poisoned")
+            .as_ref()
+            .expect("workspace is closed")
+            .subscribe()
     }
 
     pub fn update<F>(&self, updater: F)
     where
         F: FnOnce(&mut WorkspaceSnapshot) -> bool,
     {
-        let _ = self.snapshot_tx.send_if_modified(updater);
+        if let Some(snapshot_tx) = self
+            .snapshot_tx
+            .read()
+            .expect("workspace lock poisoned")
+            .as_ref()
+        {
+            let _ = snapshot_tx.send_if_modified(updater);
+        }
+    }
+
+    pub fn close(&self) {
+        self.snapshot_tx
+            .write()
+            .expect("workspace lock poisoned")
+            .take();
     }
 }
 
@@ -96,6 +117,18 @@ impl WorkspaceManager {
         self.workspace_keys_tx.subscribe()
     }
 
+    pub fn remove(&self, key: &str) -> Result<(), WorkspaceManagerError> {
+        let workspace = self
+            .workspaces
+            .write()
+            .expect("workspace lock poisoned")
+            .remove(key)
+            .ok_or_else(|| WorkspaceManagerError::WorkspaceNotFound(key.to_string()))?;
+        workspace.close();
+        self.publish_workspace_keys();
+        Ok(())
+    }
+
     fn publish_workspace_keys(&self) {
         let keys = self
             .workspaces
@@ -111,7 +144,10 @@ impl WorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PersistentWorkspaceSnapshot, TransientWorkspaceSnapshot};
+    use crate::{
+        PersistentWorkspaceSnapshot, RuntimeBackend, RuntimeHandleSnapshot,
+        TransientWorkspaceSnapshot,
+    };
 
     #[test]
     fn add_notifies_workspace_set_watch() {
@@ -190,7 +226,11 @@ mod tests {
             snapshot.persistent.description = "incrementally updated".to_string();
             snapshot.transient = Some(TransientWorkspaceSnapshot {
                 uri: "http://opencode:secret@127.0.0.1:31337/".to_string(),
-                unit: "run-u42.service".to_string(),
+                runtime: RuntimeHandleSnapshot {
+                    backend: RuntimeBackend::LinuxSystemdBwrap,
+                    id: "run-u42.service".to_string(),
+                    metadata: Default::default(),
+                },
             });
             true
         });
@@ -199,9 +239,33 @@ mod tests {
         let updated = workspace_rx.borrow_and_update().clone();
         assert_eq!(updated.persistent.description, "incrementally updated");
         assert_eq!(
-            updated.transient.as_ref().map(|t| t.unit.as_str()),
+            updated.transient.as_ref().map(|t| t.runtime.id.as_str()),
             Some("run-u42.service")
         );
         assert!(!workspace_set_rx.has_changed().expect("watch still open"));
+    }
+
+    #[test]
+    fn remove_notifies_workspace_set_watch_and_closes_workspace() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let manager = WorkspaceManager::new();
+            let mut workspace_set_rx = manager.subscribe();
+            let mut workspace_rx = manager.add("alpha").expect("workspace should be added");
+            let _ = workspace_set_rx.borrow_and_update();
+
+            manager
+                .remove("alpha")
+                .expect("workspace should be removed");
+
+            assert!(workspace_set_rx.has_changed().expect("watch still open"));
+            assert!(workspace_set_rx.borrow_and_update().is_empty());
+            assert!(workspace_rx.changed().await.is_err());
+            assert!(manager.get_workspace("alpha").is_err());
+        });
     }
 }

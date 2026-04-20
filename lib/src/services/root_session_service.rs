@@ -244,8 +244,16 @@ async fn query_current_root_session_details(
             .collect::<Vec<_>>(),
     };
 
-    let Some(root_session) = select_root_session(root_session_candidate, &sessions) else {
-        return Ok(None);
+    let root_session = match select_root_session(root_session_candidate, &sessions) {
+        Some(root_session) => root_session,
+        None => match bootstrap_root_session(client).await {
+            Ok(Some(root_session)) => root_session,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to bootstrap root session");
+                return Ok(None);
+            }
+        },
     };
 
     let root_session_id: String = root_session.id.clone().into();
@@ -273,6 +281,20 @@ async fn query_current_root_session_details(
         title: root_session_title,
         status: session_status,
     }))
+}
+
+async fn bootstrap_root_session(
+    client: &opencode::client::Client,
+) -> Result<Option<opencode::client::types::Session>, String> {
+    client
+        .session_create(
+            None,
+            None,
+            &opencode::client::types::SessionCreateBody::default(),
+        )
+        .await
+        .map(|response| Some(response.into_inner()))
+        .map_err(|err| err.to_string())
 }
 
 fn select_root_session(
@@ -395,17 +417,20 @@ fn map_session_status(status: &opencode::client::types::SessionStatus) -> RootSe
 fn should_refresh_from_event(event: &opencode::client::types::GlobalEvent) -> bool {
     matches!(
         &event.payload,
-        opencode::client::types::Event::SessionStatus(_)
-            | opencode::client::types::Event::SessionIdle(_)
-            | opencode::client::types::Event::SessionCompacted(_)
-            | opencode::client::types::Event::SessionCreated(_)
-            | opencode::client::types::Event::SessionUpdated(_)
-            | opencode::client::types::Event::SessionDeleted(_)
-            | opencode::client::types::Event::SessionDiff(_)
-            | opencode::client::types::Event::SessionError(_)
-            | opencode::client::types::Event::QuestionAsked(_)
-            | opencode::client::types::Event::QuestionReplied(_)
-            | opencode::client::types::Event::QuestionRejected(_)
+        opencode::client::types::GlobalEventPayload::EventSessionStatus(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionIdle(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionCompacted(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionCreated(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionUpdated(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionDeleted(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionCreated(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionUpdated(_)
+            | opencode::client::types::GlobalEventPayload::SyncEventSessionDeleted(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionDiff(_)
+            | opencode::client::types::GlobalEventPayload::EventSessionError(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionAsked(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionReplied(_)
+            | opencode::client::types::GlobalEventPayload::EventQuestionRejected(_)
     )
 }
 
@@ -416,7 +441,9 @@ fn normalize_base_uri(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OpencodeClientSnapshot, TransientWorkspaceSnapshot};
+    use crate::{
+        OpencodeClientSnapshot, RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::Notify,
@@ -438,6 +465,33 @@ mod tests {
             }
         ])
         .to_string()
+    }
+
+    fn single_session_json(session_id: &str, title: &str) -> String {
+        serde_json::json!({
+            "directory": "/workspace",
+            "id": session_id,
+            "projectID": "project-1",
+            "slug": "root",
+            "time": {
+                "created": 1,
+                "updated": 1
+            },
+            "title": title,
+            "version": "1"
+        })
+        .to_string()
+    }
+
+    fn transient_snapshot(uri: &str, runtime_id: &str) -> TransientWorkspaceSnapshot {
+        TransientWorkspaceSnapshot {
+            uri: uri.to_string(),
+            runtime: RuntimeHandleSnapshot {
+                backend: RuntimeBackend::LinuxSystemdBwrap,
+                id: runtime_id.to_string(),
+                metadata: Default::default(),
+            },
+        }
     }
 
     fn sessions_json_with_subagent(
@@ -552,6 +606,7 @@ mod tests {
             "payload": {
                 "type": "session.updated",
                 "properties": {
+                    "sessionID": session_id,
                     "info": {
                         "directory": "/workspace",
                         "id": session_id,
@@ -651,10 +706,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -683,6 +738,98 @@ mod tests {
             assert_eq!(snapshot.root_session_status, Some(RootSessionStatus::Busy));
 
             service_task.abort();
+            server_task.abort();
+        });
+    }
+
+    #[test]
+    fn service_bootstraps_root_session_when_server_starts_empty() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("test listener should bind");
+            let addr = listener
+                .local_addr()
+                .expect("listener should expose local addr");
+            let server_task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0_u8; 4096];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+
+                        if request.contains("GET /question") {
+                            let body = "[]";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.contains("GET /session/status") {
+                            let body = "{}";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.starts_with("POST /session") {
+                            let body =
+                                single_session_json("ses-root-created", "Root session created");
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        if request.contains("GET /session") {
+                            let body = "[]";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                            return;
+                        }
+
+                        let response =
+                            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+
+            let base_uri = format!("http://{addr}");
+            let client = opencode::client::Client::new(&base_uri);
+            let root_session = query_current_root_session_details(&client)
+                .await
+                .expect("query should succeed")
+                .expect("root session should be bootstrapped when session list is empty");
+            assert_eq!(root_session.id, "ses-root-created");
+            assert_eq!(root_session.title, "Root session created");
+            assert_eq!(root_session.status, None);
+
             server_task.abort();
         });
     }
@@ -781,10 +928,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -894,10 +1041,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1053,10 +1200,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1194,10 +1341,10 @@ mod tests {
             };
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-session.service",
+                ));
                 snapshot.opencode_client = Some(client_snapshot.clone());
                 true
             });
@@ -1310,10 +1457,8 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-race.service".to_string(),
-                });
+                snapshot.transient =
+                    Some(transient_snapshot(&format!("{base_uri}/"), "run-u-root-race.service"));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: client.clone(),
                     events: event_tx.clone(),
@@ -1437,10 +1582,8 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let old_client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-stale.service".to_string(),
-                });
+                snapshot.transient =
+                    Some(transient_snapshot(&format!("{base_uri}/"), "run-u-root-stale.service"));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client.clone(),
                     events: old_event_tx.clone(),
@@ -1558,10 +1701,10 @@ mod tests {
             let old_client = Arc::new(opencode::client::Client::new(&base_uri));
 
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-same-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-same-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client,
                     events: old_event_tx,
@@ -1688,10 +1831,10 @@ mod tests {
             let base_uri = format!("http://{addr}");
             let client = Arc::new(opencode::client::Client::new(&base_uri));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: format!("{base_uri}/"),
-                    unit: "run-u-root-ignore-non-session.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    &format!("{base_uri}/"),
+                    "run-u-root-ignore-non-session.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: client.clone(),
                     events: event_tx.clone(),
@@ -1750,10 +1893,10 @@ mod tests {
             let (old_event_tx, _) = broadcast::channel(64);
             let old_client = Arc::new(opencode::client::Client::new("http://127.0.0.1:9"));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:9/".to_string(),
-                    unit: "run-u-root-old-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:9/",
+                    "run-u-root-old-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: old_client,
                     events: old_event_tx,
@@ -1774,10 +1917,10 @@ mod tests {
             let (new_event_tx, _) = broadcast::channel(64);
             let new_client = Arc::new(opencode::client::Client::new("http://127.0.0.1:10"));
             workspace.update(|snapshot| {
-                snapshot.transient = Some(TransientWorkspaceSnapshot {
-                    uri: "http://127.0.0.1:10/".to_string(),
-                    unit: "run-u-root-new-uri.service".to_string(),
-                });
+                snapshot.transient = Some(transient_snapshot(
+                    "http://127.0.0.1:10/",
+                    "run-u-root-new-uri.service",
+                ));
                 snapshot.opencode_client = Some(OpencodeClientSnapshot {
                     client: new_client,
                     events: new_event_tx,

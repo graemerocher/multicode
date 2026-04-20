@@ -135,9 +135,15 @@ fn build_probe_binary() -> PathBuf {
         .current_dir(&repo_root)
         .status()
         .expect("cargo build for multicode-tui should run");
-    assert!(build_status.success(), "multicode-tui should build for integration test");
+    assert!(
+        build_status.success(),
+        "multicode-tui should build for integration test"
+    );
     let probe_binary = repo_root.join("target/debug/multicode-tui");
-    assert!(probe_binary.exists(), "built multicode-tui binary should exist");
+    assert!(
+        probe_binary.exists(),
+        "built multicode-tui binary should exist"
+    );
     probe_binary
 }
 
@@ -201,7 +207,11 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     )
     .expect("dockerfile should be written");
 
-    let image = format!("multicode-remote-test-bidi-matrix-{}:{}", case.test_name(), std::process::id());
+    let image = format!(
+        "multicode-remote-test-bidi-matrix-{}:{}",
+        case.test_name(),
+        std::process::id()
+    );
     let build = StdCommand::new("docker")
         .args(["build", "-t", &image, "."])
         .current_dir(root.path())
@@ -210,7 +220,11 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
     assert!(build.success(), "docker build should succeed");
 
     let port = reserve_tcp_port();
-    let container_name = format!("multicode-remote-test-bidi-matrix-{}-{}", case.test_name(), std::process::id());
+    let container_name = format!(
+        "multicode-remote-test-bidi-matrix-{}-{}",
+        case.test_name(),
+        std::process::id()
+    );
     let run = StdCommand::new("docker")
         .args([
             "run",
@@ -229,7 +243,9 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         .status()
         .expect("docker run should execute");
     assert!(run.success(), "docker run should succeed");
-    let _container = DockerContainerGuard { name: container_name.clone() };
+    let _container = DockerContainerGuard {
+        name: container_name.clone(),
+    };
 
     wait_for_ssh(port, &key_path, &known_hosts).await;
 
@@ -320,8 +336,13 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         .output()
         .await
         .expect("remote seed probe should run");
-    assert!(remote_seed.status.success(), "remote seed probe should succeed");
-    let remote_seed_text = String::from_utf8_lossy(&remote_seed.stdout).trim().to_string();
+    assert!(
+        remote_seed.status.success(),
+        "remote seed probe should succeed"
+    );
+    let remote_seed_text = String::from_utf8_lossy(&remote_seed.stdout)
+        .trim()
+        .to_string();
 
     let remote_parent_probe = Command::new("ssh")
         .args([
@@ -339,31 +360,67 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         .status()
         .await
         .expect("remote parent probe should run");
-    assert!(remote_parent_probe.success(), "bidi sync must not place files in the remote parent directory");
+    assert!(
+        remote_parent_probe.success(),
+        "bidi sync must not place files in the remote parent directory"
+    );
 
     let local_seed_path = bidi_local.join("seed.txt");
-    let local_seed_text = fs::read_to_string(&local_seed_path).ok().map(|text| text.trim().to_string());
+    let local_seed_text = fs::read_to_string(&local_seed_path)
+        .ok()
+        .map(|text| text.trim().to_string());
     assert!(
-        !bidi_local.parent().expect("bidi local parent should exist").join("seed.txt").exists(),
+        !bidi_local
+            .parent()
+            .expect("bidi local parent should exist")
+            .join("seed.txt")
+            .exists(),
         "bidi sync must not place files in the local parent directory"
     );
 
     match case {
         BidiExistenceCase::LocalAndRemoteMissing => {
-            assert_eq!(remote_seed_text, "", "remote destination should remain empty when both sides start empty");
-            assert!(!local_seed_path.exists(), "local destination should remain empty when both sides start empty");
+            assert_eq!(
+                remote_seed_text, "",
+                "remote destination should remain empty when both sides start empty"
+            );
+            assert!(
+                !local_seed_path.exists(),
+                "local destination should remain empty when both sides start empty"
+            );
         }
         BidiExistenceCase::LocalOnly => {
-            assert_eq!(remote_seed_text, "local-seed", "initial upload should seed the exact remote destination from the local directory");
-            assert_eq!(local_seed_text.as_deref(), Some("local-seed"), "local seed should remain in the configured local directory");
+            assert_eq!(
+                remote_seed_text, "local-seed",
+                "initial upload should seed the exact remote destination from the local directory"
+            );
+            assert_eq!(
+                local_seed_text.as_deref(),
+                Some("local-seed"),
+                "local seed should remain in the configured local directory"
+            );
         }
         BidiExistenceCase::RemoteOnly => {
-            assert_eq!(remote_seed_text, "remote-seed", "remote-only case should preserve the exact remote destination contents");
-            assert_eq!(local_seed_text.as_deref(), Some("remote-seed"), "final sync-down should place remote contents into the configured local directory");
+            assert_eq!(
+                remote_seed_text, "remote-seed",
+                "remote-only case should preserve the exact remote destination contents"
+            );
+            assert_eq!(
+                local_seed_text.as_deref(),
+                Some("remote-seed"),
+                "final sync-down should place remote contents into the configured local directory"
+            );
         }
         BidiExistenceCase::LocalAndRemotePresent => {
-            assert_eq!(remote_seed_text, "remote-seed", "newer remote content should win within the configured remote destination");
-            assert_eq!(local_seed_text.as_deref(), Some("remote-seed"), "newer remote content should sync down into the configured local directory");
+            assert_eq!(
+                remote_seed_text, "remote-seed",
+                "newer remote content should win within the configured remote destination"
+            );
+            assert_eq!(
+                local_seed_text.as_deref(),
+                Some("remote-seed"),
+                "newer remote content should sync down into the configured local directory"
+            );
         }
     }
 }
@@ -674,7 +731,6 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
         );
     });
 }
-
 
 #[test]
 fn docker_remote_flow_bidi_sync_handles_both_missing() {

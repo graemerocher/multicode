@@ -29,3 +29,5 @@ Some issues may require changes in multiple GitHub repositories, or the fix may 
 report. You are permitted to clone and locally modify other repositories, and propose changes there.
 
 **Do not comment on issues or create pull requests without permission.**
+
+**Do not merge pull requests yourself. PRs should be merged by a human, except for an explicit dependency-upgrade workflow where automated merging is already intended.**

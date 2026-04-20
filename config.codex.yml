@@ -1,0 +1,58 @@
+workspace-directory = "~/dev/multicode-workspaces"
+opencode = ["opencode-cli", "opencode"]
+
+[agent]
+provider = "codex"
+
+[agent.codex]
+commands = ["codex"]
+approval-policy = "never"
+sandbox-mode = "external-sandbox"
+network-access = "enabled"
+
+[compare]
+tool = "intellij"
+command = "~/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
+[runtime]
+backend = "apple-container"
+codex-image = "multicode-codex-java25:latest"
+
+[github]
+token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
+populate-git-credentials = true
+
+[autonomous]
+scan-on-startup = false
+
+[isolation]
+add-skills-from = ["./workspace-skills"]
+writable = [
+    "~/.gradle",
+    "~/.m2/repository",
+    "~/.config/gh",
+    "$XDG_RUNTIME_DIR",
+]
+tmpfs = ["/tmp"]
+inherit-env = [
+    "XDG_RUNTIME_DIR",
+    "HOME",
+    "PATH",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+]
+memory-high = "6 GiB"
+memory-max = "8 GiB"
+cpu = "300%"
+
+[handler]
+review = "/usr/bin/open ."
+review-pty = false
+web = "/usr/bin/open {}"
+
+[[tool]]
+type = "exec"
+name = "bash"
+key = "b"
+exec = "/bin/bash"

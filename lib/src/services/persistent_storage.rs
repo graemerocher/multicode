@@ -282,9 +282,14 @@ mod tests {
                 archived: true,
                 description: "loaded from disk".to_string(),
                 created_at: Some(UNIX_EPOCH + Duration::from_secs(10)),
+                assigned_repository: None,
+                automation_issue: None,
+                automation_paused: false,
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                ignored_issue_urls: Vec::new(),
+                tasks: Vec::new(),
             };
             let snapshot_path = storage_dir.join("alpha.json");
             tokio::fs::write(
@@ -368,9 +373,14 @@ mod tests {
                 archived: true,
                 description: "added later".to_string(),
                 created_at: Some(UNIX_EPOCH + Duration::from_secs(20)),
+                assigned_repository: None,
+                automation_issue: None,
+                automation_paused: false,
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                ignored_issue_urls: Vec::new(),
+                tasks: Vec::new(),
             };
             tokio::fs::write(
                 storage_dir.join("beta.json"),
@@ -484,9 +494,14 @@ mod tests {
                 archived: false,
                 description: "missing created_at".to_string(),
                 created_at: None,
+                assigned_repository: None,
+                automation_issue: None,
+                automation_paused: false,
                 archive_format: None,
                 agent_provided: Default::default(),
                 custom_links: Default::default(),
+                ignored_issue_urls: Vec::new(),
+                tasks: Vec::new(),
             };
             let snapshot_path = storage_dir.join("gamma.json");
             tokio::fs::write(

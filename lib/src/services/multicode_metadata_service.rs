@@ -3,7 +3,11 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch};
 
 use super::{
-    workspace_task_watch::watch_workspace_task, workspace_watch::monitor_workspace_snapshots,
+    codex_app_server::{
+        CodexAppServerClient, CodexServerNotification, forward_codex_notifications_forever,
+    },
+    workspace_task_watch::watch_workspace_task,
+    workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
     WorkspaceManager, WorkspaceManagerError, WorkspaceSnapshot, manager::Workspace, opencode,
@@ -33,6 +37,56 @@ struct MulticodeMetadata {
     prs: BTreeSet<String>,
 }
 
+#[derive(Clone)]
+enum MetadataTaskKey {
+    Opencode {
+        session_id: String,
+        client: Arc<opencode::client::Client>,
+        event_tx: broadcast::Sender<opencode::client::types::GlobalEvent>,
+        uri: String,
+    },
+    Codex {
+        thread_id: String,
+        uri: String,
+    },
+}
+
+impl PartialEq for MetadataTaskKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Opencode {
+                    session_id: left_session_id,
+                    client: left_client,
+                    uri: left_uri,
+                    ..
+                },
+                Self::Opencode {
+                    session_id: right_session_id,
+                    client: right_client,
+                    uri: right_uri,
+                    ..
+                },
+            ) => {
+                left_session_id == right_session_id
+                    && left_uri == right_uri
+                    && Arc::ptr_eq(left_client, right_client)
+            }
+            (
+                Self::Codex {
+                    thread_id: left_thread_id,
+                    uri: left_uri,
+                },
+                Self::Codex {
+                    thread_id: right_thread_id,
+                    uri: right_uri,
+                },
+            ) => left_thread_id == right_thread_id && left_uri == right_uri,
+            _ => false,
+        }
+    }
+}
+
 /// Watch the agent transcript for machine-readable metadata as specified by
 /// /workspace-skills/machine-readable-*
 pub async fn multicode_metadata_service(
@@ -47,22 +101,6 @@ pub async fn multicode_metadata_service(
     .await
 }
 
-#[derive(Clone)]
-struct MetadataTaskKey {
-    session_id: String,
-    client: Arc<opencode::client::Client>,
-    event_tx: broadcast::Sender<opencode::client::types::GlobalEvent>,
-    uri: String,
-}
-
-impl PartialEq for MetadataTaskKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.session_id == other.session_id
-            && self.uri == other.uri
-            && Arc::ptr_eq(&self.client, &other.client)
-    }
-}
-
 async fn watch_workspace_snapshot(
     workspace: Workspace,
     workspace_rx: watch::Receiver<WorkspaceSnapshot>,
@@ -71,30 +109,51 @@ async fn watch_workspace_snapshot(
         workspace,
         workspace_rx,
         |snapshot| {
-            Some(MetadataTaskKey {
-                session_id: snapshot.root_session_id.clone()?,
-                client: snapshot.opencode_client.as_ref()?.client.clone(),
-                event_tx: snapshot.opencode_client.as_ref()?.events.clone(),
-                uri: normalize_base_uri(&snapshot.transient.as_ref()?.uri),
+            let session_or_thread_id = snapshot.root_session_id.clone()?;
+            let transient_uri = snapshot.transient.as_ref()?.uri.clone();
+            let parsed_uri = url::Url::parse(&transient_uri).ok()?;
+
+            if matches!(parsed_uri.scheme(), "ws" | "wss") {
+                return Some(MetadataTaskKey::Codex {
+                    thread_id: session_or_thread_id,
+                    uri: normalize_base_uri(&transient_uri),
+                });
+            }
+
+            let opencode_client = snapshot.opencode_client.as_ref()?;
+            Some(MetadataTaskKey::Opencode {
+                session_id: session_or_thread_id,
+                client: opencode_client.client.clone(),
+                event_tx: opencode_client.events.clone(),
+                uri: normalize_base_uri(&transient_uri),
             })
         },
         |_: &Workspace| {},
         |_: &Workspace, _: &MetadataTaskKey, _: Option<MetadataTaskKey>| {},
         |workspace: &Workspace, key: &MetadataTaskKey| {
             let task_workspace = workspace.clone();
-            let task_client = key.client.clone();
-            let task_session_id = key.session_id.clone();
-            let task_uri = key.uri.clone();
-            let task_event_tx = key.event_tx.clone();
+            let task_key = key.clone();
             tokio::spawn(async move {
-                sync_multicode_metadata_from_history_and_events(
-                    task_workspace,
-                    task_client,
-                    task_event_tx,
-                    task_session_id,
-                    task_uri,
-                )
-                .await;
+                match task_key {
+                    MetadataTaskKey::Opencode {
+                        session_id,
+                        client,
+                        event_tx,
+                        uri,
+                    } => {
+                        sync_multicode_metadata_from_history_and_events(
+                            task_workspace,
+                            client,
+                            event_tx,
+                            session_id,
+                            uri,
+                        )
+                        .await;
+                    }
+                    MetadataTaskKey::Codex { thread_id, uri } => {
+                        sync_codex_multicode_metadata(task_workspace, thread_id, uri).await;
+                    }
+                }
             })
         },
     )
@@ -222,11 +281,17 @@ fn should_refresh_from_event(
     session_id: &str,
 ) -> bool {
     match &event.payload {
-        opencode::client::types::Event::MessageUpdated(message_updated) => {
+        opencode::client::types::GlobalEventPayload::EventMessageUpdated(message_updated) => {
             message_session_id(&message_updated.properties.info) == Some(session_id)
         }
-        opencode::client::types::Event::MessageRemoved(message_removed) => {
+        opencode::client::types::GlobalEventPayload::SyncEventMessageUpdated(message_updated) => {
+            message_session_id(&message_updated.data.info) == Some(session_id)
+        }
+        opencode::client::types::GlobalEventPayload::EventMessageRemoved(message_removed) => {
             message_removed.properties.session_id.as_str() == session_id
+        }
+        opencode::client::types::GlobalEventPayload::SyncEventMessageRemoved(message_removed) => {
+            message_removed.data.session_id.as_str() == session_id
         }
         _ => false,
     }
@@ -340,6 +405,139 @@ fn normalize_base_uri(uri: &str) -> String {
     uri.trim_end_matches('/').to_string()
 }
 
+async fn sync_codex_multicode_metadata(
+    workspace: Workspace,
+    thread_id: String,
+    expected_uri: String,
+) {
+    let client = CodexAppServerClient::new(expected_uri.clone());
+    let event_tx = broadcast::channel(256).0;
+    let forwarder = tokio::spawn(forward_codex_notifications_forever(
+        client.clone(),
+        event_tx.clone(),
+    ));
+    let mut event_rx = event_tx.subscribe();
+
+    refresh_snapshot_codex_multicode_metadata(&workspace, &client, &thread_id, &expected_uri).await;
+
+    loop {
+        match event_rx.recv().await {
+            Ok(CodexServerNotification::ThreadStarted { thread }) if thread.id == thread_id => {
+                refresh_snapshot_codex_multicode_metadata(
+                    &workspace,
+                    &client,
+                    &thread_id,
+                    &expected_uri,
+                )
+                .await;
+            }
+            Ok(CodexServerNotification::TurnCompleted {
+                thread_id: completed_thread_id,
+            }) if completed_thread_id == thread_id => {
+                refresh_snapshot_codex_multicode_metadata(
+                    &workspace,
+                    &client,
+                    &thread_id,
+                    &expected_uri,
+                )
+                .await;
+            }
+            Ok(CodexServerNotification::ThreadStatusChanged {
+                thread_id: changed_thread_id,
+                ..
+            }) if changed_thread_id == thread_id => {
+                refresh_snapshot_codex_multicode_metadata(
+                    &workspace,
+                    &client,
+                    &thread_id,
+                    &expected_uri,
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                refresh_snapshot_codex_multicode_metadata(
+                    &workspace,
+                    &client,
+                    &thread_id,
+                    &expected_uri,
+                )
+                .await;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
+    forwarder.abort();
+}
+
+async fn refresh_snapshot_codex_multicode_metadata(
+    workspace: &Workspace,
+    client: &CodexAppServerClient,
+    thread_id: &str,
+    expected_uri: &str,
+) {
+    let Ok(response) = client.thread_read_with_turns(thread_id, true).await else {
+        return;
+    };
+    let metadata = collect_metadata_from_codex_turns(response.thread.turns.iter());
+    let repositories = metadata.repositories.iter().cloned().collect::<Vec<_>>();
+    let issues = metadata.issues.iter().cloned().collect::<Vec<_>>();
+    let prs = metadata.prs.iter().cloned().collect::<Vec<_>>();
+
+    workspace.update(|snapshot| {
+        let still_tracking_same_session = snapshot.root_session_id.as_deref() == Some(thread_id);
+        let still_attached_to_expected_uri = snapshot
+            .transient
+            .as_ref()
+            .map(|transient| normalize_base_uri(&transient.uri))
+            .as_deref()
+            == Some(expected_uri);
+        let should_update = still_tracking_same_session
+            && still_attached_to_expected_uri
+            && (snapshot.persistent.agent_provided.repo != repositories
+                || snapshot.persistent.agent_provided.issue != issues
+                || snapshot.persistent.agent_provided.pr != prs);
+        if should_update {
+            snapshot.persistent.agent_provided.repo = repositories;
+            snapshot.persistent.agent_provided.issue = issues;
+            snapshot.persistent.agent_provided.pr = prs;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn collect_metadata_from_codex_turns<'a>(
+    turns: impl IntoIterator<Item = &'a super::codex_app_server::CodexThreadTurn>,
+) -> MulticodeMetadata {
+    let mut metadata = MulticodeMetadata::default();
+    for turn in turns {
+        for item in &turn.items {
+            merge_json_metadata(item, &mut metadata);
+        }
+    }
+    metadata
+}
+
+fn merge_json_metadata(item: &serde_json::Value, metadata: &mut MulticodeMetadata) {
+    match item {
+        serde_json::Value::String(text) => merge_text_metadata(text, metadata),
+        serde_json::Value::Array(items) => {
+            for value in items {
+                merge_json_metadata(value, metadata);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for value in entries.values() {
+                merge_json_metadata(value, metadata);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,7 +639,8 @@ mod tests {
             "payload": {
                 "type": "message.updated",
                 "properties": {
-                    "info": assistant_message_json(message_id, session_id, text)
+                    "info": assistant_message_json(message_id, session_id, text),
+                    "sessionID": session_id
                 }
             }
         }))
@@ -575,5 +774,61 @@ mod tests {
             ),
             "ses-root",
         ));
+    }
+
+    #[test]
+    fn collects_metadata_from_codex_turn_items() {
+        let turns = vec![super::super::codex_app_server::CodexThreadTurn {
+            items: vec![
+                serde_json::json!({
+                    "type": "agentMessage",
+                    "text": "<multicode:repo>/srv/work/core</multicode:repo>"
+                }),
+                serde_json::json!({
+                    "type": "agentMessage",
+                    "text": "<multicode:issue>https://github.com/acme/core/issue/42</multicode:issue>"
+                }),
+                serde_json::json!({
+                    "type": "agentMessage",
+                    "text": "<multicode:pr>https://github.com/acme/core/pull/99</multicode:pr>"
+                }),
+                serde_json::json!({
+                    "type": "userMessage",
+                    "content": [{ "type": "text", "text": "ignored" }]
+                }),
+            ],
+        }];
+
+        let metadata = collect_metadata_from_codex_turns(turns.iter());
+
+        assert_eq!(
+            metadata.repositories,
+            BTreeSet::from(["/srv/work/core".to_string()])
+        );
+        assert_eq!(
+            metadata.issues,
+            BTreeSet::from(["https://github.com/acme/core/issue/42".to_string()])
+        );
+        assert_eq!(
+            metadata.prs,
+            BTreeSet::from(["https://github.com/acme/core/pull/99".to_string()])
+        );
+    }
+
+    #[test]
+    fn collects_metadata_from_codex_tool_output_items() {
+        let turns = vec![super::super::codex_app_server::CodexThreadTurn {
+            items: vec![serde_json::json!({
+                "type": "toolCallOutput",
+                "output": "stdout\n<multicode:pr>https://github.com/acme/core/pull/101</multicode:pr>\n"
+            })],
+        }];
+
+        let metadata = collect_metadata_from_codex_turns(turns.iter());
+
+        assert_eq!(
+            metadata.prs,
+            BTreeSet::from(["https://github.com/acme/core/pull/101".to_string()])
+        );
     }
 }

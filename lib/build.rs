@@ -1,8 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use serde_json::{Map, Value};
-const OPENAPI_SPEC_URL: &str =
-    "https://raw.githubusercontent.com/anomalyco/opencode/refs/heads/dev/packages/sdk/openapi.json";
+const OPENAPI_SPEC_URL: &str = "https://raw.githubusercontent.com/anomalyco/opencode/c98f61638535c9cc57a2b710decc780f7289fc2f/packages/sdk/openapi.json";
 const GENERATED_FILE_NAME: &str = "opencode_client.rs";
 
 fn main() {

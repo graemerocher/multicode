@@ -9,14 +9,24 @@ use serde::{Deserialize, Serialize};
 use size::Size;
 
 use super::CombinedServiceError;
+use crate::RuntimeBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
+    #[serde(default = "default_workspace_directory")]
     pub workspace_directory: String,
     pub isolation: IsolationConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub autonomous: AutonomousConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default = "default_opencode_commands")]
     pub opencode: Vec<String>,
+    #[serde(default)]
+    pub compare: CompareConfig,
     #[serde(default)]
     pub tool: Vec<ToolConfig>,
     #[serde(default)]
@@ -25,6 +35,142 @@ pub struct Config {
     pub remote: Option<RemoteConfig>,
     #[serde(default)]
     pub github: GithubConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutonomousConfig {
+    #[serde(
+        default = "default_issue_scan_delay_seconds",
+        alias = "issue-scan-delay-seconds"
+    )]
+    pub issue_scan_delay_seconds: u64,
+    #[serde(default = "default_max_parallel_issues", alias = "max-parallel-issues")]
+    pub max_parallel_issues: usize,
+    #[serde(default = "default_scan_on_startup", alias = "scan-on-startup")]
+    pub scan_on_startup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CompareConfig {
+    #[serde(default)]
+    pub tool: CompareTool,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompareTool {
+    #[default]
+    Vscode,
+    Intellij,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProvider {
+    #[default]
+    Opencode,
+    Codex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub provider: AgentProvider,
+    #[serde(default)]
+    pub opencode: OpencodeAgentConfig,
+    #[serde(default)]
+    pub codex: CodexAgentConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OpencodeAgentConfig {
+    #[serde(default)]
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CodexAgentConfig {
+    #[serde(default = "default_codex_commands")]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub approval_policy: CodexApprovalPolicy,
+    #[serde(default)]
+    pub sandbox_mode: CodexSandboxMode,
+    #[serde(default)]
+    pub network_access: CodexNetworkAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    Untrusted,
+    OnFailure,
+    #[default]
+    OnRequest,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    ReadOnly,
+    #[default]
+    WorkspaceWrite,
+    DangerFullAccess,
+    ExternalSandbox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexNetworkAccess {
+    Restricted,
+    #[default]
+    Enabled,
+}
+
+impl Default for AutonomousConfig {
+    fn default() -> Self {
+        Self {
+            issue_scan_delay_seconds: default_issue_scan_delay_seconds(),
+            max_parallel_issues: default_max_parallel_issues(),
+            scan_on_startup: default_scan_on_startup(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub backend: RuntimeBackend,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub opencode_image: Option<String>,
+    #[serde(default)]
+    pub codex_image: Option<String>,
+}
+
+impl RuntimeConfig {
+    pub fn resolved_image(&self, provider: AgentProvider) -> Option<&str> {
+        self.image.as_deref().or(match provider {
+            AgentProvider::Opencode => self.opencode_image.as_deref(),
+            AgentProvider::Codex => self.codex_image.as_deref(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -43,6 +189,10 @@ pub struct GithubTokenConfig {
     pub env: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default)]
+    pub keychain_service: Option<String>,
+    #[serde(default)]
+    pub keychain_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -99,8 +249,28 @@ fn default_opencode_commands() -> Vec<String> {
     vec!["opencode-cli".to_string(), "opencode".to_string()]
 }
 
+fn default_workspace_directory() -> String {
+    "~/dev/multicode-workspaces".to_string()
+}
+
+fn default_codex_commands() -> Vec<String> {
+    vec!["codex".to_string()]
+}
+
 fn default_remote_sync_interval_seconds() -> u64 {
     2
+}
+
+fn default_issue_scan_delay_seconds() -> u64 {
+    15 * 60
+}
+
+fn default_max_parallel_issues() -> usize {
+    5
+}
+
+fn default_scan_on_startup() -> bool {
+    true
 }
 
 fn default_handler_review() -> String {
@@ -260,9 +430,7 @@ pub async fn read_config(config_path: &Path) -> Result<Config, CombinedServiceEr
     Ok(toml::from_str(&raw)?)
 }
 
-pub(super) fn resolve_opencode_command(
-    candidates: &[String],
-) -> Result<String, CombinedServiceError> {
+pub(super) fn resolve_agent_command(candidates: &[String]) -> Result<String, CombinedServiceError> {
     let normalized = candidates
         .iter()
         .map(|candidate| candidate.trim())
@@ -276,7 +444,7 @@ pub(super) fn resolve_opencode_command(
         }
     }
 
-    Err(CombinedServiceError::OpencodeCommandNotFound {
+    Err(CombinedServiceError::AgentCommandNotFound {
         candidates: normalized,
     })
 }
@@ -303,7 +471,10 @@ fn is_executable_file(path: &Path) -> bool {
 pub(super) fn path_looks_like_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains('.'))
+        .is_some_and(|name| {
+            let trimmed = name.trim_start_matches('.');
+            !trimmed.is_empty() && trimmed.contains('.')
+        })
 }
 
 pub(super) fn validate_workspace_key(key: &str) -> Result<String, CombinedServiceError> {
@@ -315,9 +486,42 @@ pub(super) fn validate_workspace_key(key: &str) -> Result<String, CombinedServic
 }
 
 pub(super) fn expand_shell_path(value: &str) -> Result<PathBuf, CombinedServiceError> {
-    let expanded = shellexpand::full(value)
-        .map_err(|err| CombinedServiceError::ShellExpand(err.to_string()))?;
+    let expanded = shellexpand::full_with_context(
+        value,
+        || env::var("HOME").ok(),
+        |name| match env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(synthesized_env_value(name)),
+            Err(err) => Err(err.to_string()),
+        },
+    )
+    .map_err(|err| CombinedServiceError::ShellExpand(err.to_string()))?;
     Ok(PathBuf::from(expanded.into_owned()))
+}
+
+pub(super) fn inherited_env_value(name: &str) -> Option<String> {
+    env::var(name).ok().or_else(|| synthesized_env_value(name))
+}
+
+pub(super) fn synthesized_env_value(name: &str) -> Option<String> {
+    match name {
+        "XDG_RUNTIME_DIR" => {
+            synthesized_xdg_runtime_dir().map(|path| path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn synthesized_xdg_runtime_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(env::temp_dir().join("multicode-runtime"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn expand_isolation_paths(
@@ -375,7 +579,7 @@ pub(super) fn validate_tool_config_entries(
     tools: &[ToolConfig],
 ) -> Result<(), CombinedServiceError> {
     let mut seen_keys = HashSet::new();
-    let reserved = ['q', 'a', 'd', 's'];
+    let reserved = ['q', 'a', 'd', 'f', 's'];
 
     for (index, tool) in tools.iter().enumerate() {
         if tool.name.trim().is_empty() {
@@ -556,4 +760,102 @@ fn validate_handler_template(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old_value = env::var_os(key);
+            unsafe {
+                env::remove_var(key);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe {
+                    env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expand_shell_path_expands_existing_environment_variables() {
+        let _env_lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let runtime_dir = env::temp_dir().join(format!("multicode-config-test-{unique}"));
+        let _guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+        let path =
+            expand_shell_path("$XDG_RUNTIME_DIR/opencode").expect("runtime dir should expand");
+
+        assert_eq!(path, runtime_dir.join("opencode"));
+    }
+
+    #[test]
+    fn config_defaults_workspace_directory_when_omitted() {
+        let config: Config = toml::from_str("[isolation]\n")
+            .expect("config without workspace-directory should parse");
+
+        assert_eq!(config.workspace_directory, "~/dev/multicode-workspaces");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn expand_shell_path_synthesizes_xdg_runtime_dir_on_macos() {
+        let _env_lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = EnvVarGuard::remove("XDG_RUNTIME_DIR");
+
+        let path =
+            expand_shell_path("$XDG_RUNTIME_DIR/opencode").expect("runtime dir should expand");
+
+        assert_eq!(
+            path,
+            synthesized_xdg_runtime_dir()
+                .expect("macOS should synthesize XDG runtime dir")
+                .join("opencode")
+        );
+        assert_eq!(
+            inherited_env_value("XDG_RUNTIME_DIR"),
+            synthesized_xdg_runtime_dir().map(|path| path.to_string_lossy().into_owned())
+        );
+    }
 }

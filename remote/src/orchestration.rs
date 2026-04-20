@@ -529,7 +529,9 @@ fn should_sync_bidirectional_mapping_up(
     remote_latest: Option<SystemTime>,
 ) -> bool {
     match (local_latest, remote_latest) {
-        (Some(_), Some(_)) => compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less,
+        (Some(_), Some(_)) => {
+            compare_sync_tree_recency(local_latest, remote_latest) != Ordering::Less
+        }
         (Some(_), None) => true,
         (None, Some(_)) => false,
         (None, None) => true,
@@ -1408,8 +1410,7 @@ fn remote_tui_sync_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use multicode_lib::services::config::IsolationConfig;
-    use multicode_lib::services::config::RemoteConfig;
+    use multicode_lib::services::config::{AgentConfig, IsolationConfig, RemoteConfig};
     use std::fs;
 
     #[test]
@@ -1489,7 +1490,11 @@ mod tests {
         Config {
             workspace_directory: "~/dev/agent-work".to_string(),
             isolation: Default::default(),
+            runtime: Default::default(),
+            autonomous: Default::default(),
+            agent: AgentConfig::default(),
             opencode: vec!["opencode-cli".to_string()],
+            compare: Default::default(),
             tool: Vec::new(),
             handler: Default::default(),
             remote: Some(sample_remote_config()),
@@ -1655,7 +1660,11 @@ mod tests {
             &Config {
                 workspace_directory: "~/dev/agent-work".to_string(),
                 isolation: Default::default(),
+                runtime: Default::default(),
+                autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(config),
@@ -1707,7 +1716,11 @@ mod tests {
                     add_skills_from: vec!["extra-skills".to_string()],
                     ..Default::default()
                 },
+                runtime: Default::default(),
+                autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(sample_remote_config()),
@@ -1721,7 +1734,10 @@ mod tests {
         .expect("config should resolve");
 
         assert_eq!(resolved.config_support_sync_up.len(), 1);
-        assert_eq!(resolved.config_support_sync_up[0].local, skill_dir);
+        assert_eq!(
+            resolved.config_support_sync_up[0].local,
+            std::fs::canonicalize(&skill_dir).expect("skill dir should canonicalize")
+        );
         assert_eq!(
             resolved.config_support_sync_up[0].remote,
             PathBuf::from(
@@ -1742,7 +1758,11 @@ mod tests {
                     add_skills_from: vec!["workspace-skills".to_string()],
                     ..Default::default()
                 },
+                runtime: Default::default(),
+                autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(sample_remote_config()),
@@ -1869,7 +1889,6 @@ mod tests {
                 "-e".to_string(),
                 "ssh -o StrictHostKeyChecking=yes".to_string(),
                 "--update".to_string(),
-                "--mkpath".to_string(),
                 "--delete".to_string(),
                 "--exclude".to_string(),
                 "target".to_string(),
@@ -2115,7 +2134,7 @@ mod tests {
             Path::new(".multicode/remote/relay/file.sock"),
             &exclude
         ));
-        assert!(!tree_scan::is_excluded_relative_path(
+        assert!(tree_scan::is_excluded_relative_path(
             Path::new(".multicode"),
             &exclude
         ));
@@ -2179,7 +2198,9 @@ mod tests {
         std::fs::create_dir_all(&local_dir).expect("local dir should be created");
         let mapping = ResolvedSyncPathMapping {
             local: local_dir.clone(),
-            remote: PathBuf::from("/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha"),
+            remote: PathBuf::from(
+                "/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha",
+            ),
             exclude: Vec::new(),
             dereference_symlinks: false,
             local_is_dir: true,
@@ -2194,7 +2215,10 @@ mod tests {
         )
         .expect("directory sync args should build");
 
-        assert!(args.iter().any(|arg| arg == &format!("{}/", local_dir.to_string_lossy())));
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("{}/", local_dir.to_string_lossy()))
+        );
         assert!(!args.iter().any(|arg| arg == "--mkpath"));
         assert!(args.iter().any(|arg| {
             arg == "alice@example.com:/home/alice/dev/agent-work/.multicode/remote/added-skills/workspace-skills/skill-alpha/"
@@ -2300,7 +2324,11 @@ mod tests {
             &Config {
                 workspace_directory: "~/dev/agent-work".to_string(),
                 isolation: Default::default(),
+                runtime: Default::default(),
+                autonomous: Default::default(),
+                agent: AgentConfig::default(),
                 opencode: vec!["opencode-cli".to_string()],
+                compare: Default::default(),
                 tool: Vec::new(),
                 handler: Default::default(),
                 remote: Some(config),

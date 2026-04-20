@@ -6,7 +6,7 @@ build = "build.rs"
 license = "Apache-2.0"
 
 [dependencies]
-tokio = { version = "1", features = ["sync", "fs", "rt", "time", "process", "net"] }
+tokio = { version = "1", features = ["sync", "fs", "rt", "time", "process", "net", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shellexpand = "3"
@@ -16,6 +16,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 progenitor-client = "0.13"
 regress = "0.10"
 tokio-stream = "0.1"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 diesel = { version = "2", features = ["sqlite", "r2d2"] }
 diesel_migrations = "2"
 libsqlite3-sys = { version = "0", features = ["bundled"] }
@@ -25,6 +27,7 @@ tracing = "0"
 tracing-subscriber = { version = "0", features = ["fmt", "ansi"] }
 shell-words = "1"
 size = "0"
+base64 = "0.22"
 
 [build-dependencies]
 openapiv3 = "2"
