@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     CombinedService, GithubStatus,
-    codex_app_server::CodexAppServerClient,
+    codex_app_server::{CodexAppServerClient, codex_app_server_endpoint_from_transient},
     runtime::{
         automation_state_file_source, automation_task_state_file_source,
         synthetic_codex_home_source,
@@ -401,19 +401,36 @@ async fn watch_workspace(
                 }
                 continue;
             }
+            tracing::info!(
+                workspace_key,
+                repository_label,
+                automation_status = snapshot.automation_status.as_deref(),
+                scan_request_nonce = snapshot.automation_scan_request_nonce,
+                "autonomous workspace requesting runtime start"
+            );
             set_automation_status(&workspace, Some(format!("Start {repository_label}")));
             match service.start_workspace(&workspace_key).await {
                 Ok(()) => {
+                    tracing::info!(
+                        workspace_key,
+                        repository_label,
+                        "autonomous workspace runtime start succeeded"
+                    );
                     blocked_start_scan_request_nonce = None;
                 }
                 Err(err) => {
+                    let summary = err.summary();
+                    tracing::error!(
+                        workspace_key,
+                        repository_label,
+                        error = ?err,
+                        summary,
+                        "autonomous workspace runtime start failed"
+                    );
                     blocked_start_scan_request_nonce = Some(snapshot.automation_scan_request_nonce);
                     set_automation_status(
                         &workspace,
-                        Some(format!(
-                            "Start failed {repository_label}: {}",
-                            err.summary()
-                        )),
+                        Some(format!("Start failed {repository_label}: {}", summary)),
                     );
                     if workspace_rx.changed().await.is_err() {
                         break;
@@ -424,15 +441,7 @@ async fn watch_workspace(
             continue;
         }
 
-        let agent_ready = snapshot
-            .transient
-            .as_ref()
-            .and_then(|transient| url::Url::parse(&transient.uri).ok())
-            .map(|uri| match uri.scheme() {
-                "ws" | "wss" => snapshot.root_session_id.is_some(),
-                _ => snapshot.opencode_client.is_some() && snapshot.root_session_id.is_some(),
-            })
-            .unwrap_or(false);
+        let agent_ready = workspace_agent_ready(&snapshot);
         if !agent_ready {
             set_automation_status(&workspace, Some(format!("Wait server {repository_label}")));
             previous_root_status = snapshot.root_session_status;
@@ -1704,6 +1713,18 @@ fn set_automation_status(workspace: &Workspace, next_status: Option<String>) {
     });
 }
 
+fn workspace_agent_ready(snapshot: &WorkspaceSnapshot) -> bool {
+    snapshot
+        .transient
+        .as_ref()
+        .and_then(|transient| url::Url::parse(&transient.uri).ok())
+        .map(|uri| match uri.scheme() {
+            "ws" | "wss" => snapshot.root_session_status.is_some(),
+            _ => snapshot.opencode_client.is_some() && snapshot.root_session_id.is_some(),
+        })
+        .unwrap_or(false)
+}
+
 fn effective_automation_agent_state(snapshot: &WorkspaceSnapshot) -> Option<AutomationAgentState> {
     snapshot
         .active_task_id
@@ -1912,7 +1933,7 @@ async fn reconcile_codex_task_runtime_states(
     let Some(uri) = snapshot
         .transient
         .as_ref()
-        .map(|transient| transient.uri.clone())
+        .map(codex_app_server_endpoint_from_transient)
     else {
         return;
     };
@@ -3328,7 +3349,7 @@ async fn ensure_task_session(
             let Some(uri) = snapshot
                 .transient
                 .as_ref()
-                .map(|transient| transient.uri.clone())
+                .map(codex_app_server_endpoint_from_transient)
             else {
                 return Err("workspace has no active runtime uri".to_string());
             };
@@ -3402,7 +3423,7 @@ async fn ensure_task_session(
             let uri = snapshot
                 .transient
                 .as_ref()
-                .map(|transient| transient.uri.clone())
+                .map(codex_app_server_endpoint_from_transient)
                 .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
             let client = CodexAppServerClient::new(uri);
             let session_id = client
@@ -3508,7 +3529,7 @@ async fn prompt_task_session(
             let uri = snapshot
                 .transient
                 .as_ref()
-                .map(|transient| transient.uri.clone())
+                .map(codex_app_server_endpoint_from_transient)
                 .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
             let _ = cwd;
             let client = CodexAppServerClient::new(uri);
@@ -5214,12 +5235,14 @@ fn version_token_candidates(text: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WorkspaceSnapshot;
     use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
     use crate::services::github_status_service::{
         GithubPrBuildState, GithubPrReviewState, GithubPrState, GithubPrStatus,
     };
     use crate::test_support::ENV_VAR_LOCK;
+    use crate::{
+        RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot, WorkspaceSnapshot,
+    };
     use std::{
         collections::HashMap,
         fs,
@@ -8062,6 +8085,22 @@ mod tests {
             false,
             RootSessionStatus::Idle,
         ));
+    }
+
+    #[test]
+    fn codex_workspace_agent_ready_when_root_status_is_known_without_thread_id() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.transient = Some(TransientWorkspaceSnapshot {
+            uri: "ws://127.0.0.1:31337".to_string(),
+            runtime: RuntimeHandleSnapshot {
+                backend: RuntimeBackend::AppleContainer,
+                id: "runtime-1".to_string(),
+                metadata: Default::default(),
+            },
+        });
+        snapshot.root_session_status = Some(RootSessionStatus::Idle);
+
+        assert!(workspace_agent_ready(&snapshot));
     }
 
     #[test]
