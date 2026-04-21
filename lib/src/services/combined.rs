@@ -26,7 +26,7 @@ use super::{
     GithubStatusService, GithubStatusServiceError, WorkspaceDirectoryError,
     automation_state_file_service::automation_state_file_service,
     autonomous_workspace_service::autonomous_workspace_service,
-    codex_app_server::CodexAppServerClient,
+    codex_app_server::{CodexAppServerClient, codex_app_server_endpoint_from_transient},
     codex_root_session_service::codex_root_session_service,
     config::{
         AddedSkillMount, AgentProvider, CodexAgentConfig, Config, ExpandedIsolationConfig,
@@ -36,7 +36,10 @@ use super::{
     },
     multicode_metadata_service, opencode_client_service, persistent_storage,
     resource_usage_service, root_session_service,
-    runtime::{WorkspaceRuntime, automation_task_state_file_source},
+    runtime::{
+        WorkspaceRuntime, automation_task_state_file_source, prepare_synthetic_codex_home,
+        synthetic_codex_home_source,
+    },
     runtime_reconciliation_service::runtime_reconciliation_service,
     transient_storage, usage_aggregation_service,
     workspace_archive::ArchiveWorkspaceEntry,
@@ -182,6 +185,29 @@ impl CombinedService {
         &self.github_status_service
     }
 
+    pub async fn refresh_workspace_codex_home(
+        &self,
+        key: &str,
+    ) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        if self.agent_provider != AgentProvider::Codex {
+            return Ok(());
+        }
+
+        let workspace_path = self.workspace_directory_path.join(&key);
+        tokio::fs::create_dir_all(&workspace_path).await?;
+        let source = synthetic_codex_home_source(&self.workspace_directory_path, &key);
+        prepare_synthetic_codex_home(
+            &source,
+            &workspace_path,
+            &self.expanded_isolation.added_skills,
+            &self.config.agent.codex,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn create_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
 
@@ -222,7 +248,24 @@ impl CombinedService {
         let inherited_env = self
             .sandbox_env_pairs(Vec::<(String, String)>::new())
             .await?;
-        let start = self.runtime.start_server(&key, &inherited_env).await?;
+        tracing::info!(
+            workspace_key = %key,
+            backend = ?self.config.runtime.backend,
+            "starting workspace runtime"
+        );
+        let start = match self.runtime.start_server(&key, &inherited_env).await {
+            Ok(start) => start,
+            Err(err) => {
+                tracing::error!(
+                    workspace_key = %key,
+                    backend = ?self.config.runtime.backend,
+                    error = ?err,
+                    summary = %err.summary(),
+                    "workspace runtime start failed before snapshot update"
+                );
+                return Err(err);
+            }
+        };
         tracing::info!(
             workspace_key = %key,
             backend = ?self.config.runtime.backend,
@@ -994,7 +1037,7 @@ impl CombinedService {
                 let uri = snapshot
                     .transient
                     .as_ref()
-                    .map(|transient| transient.uri.clone())
+                    .map(codex_app_server_endpoint_from_transient)
                     .ok_or_else(|| "workspace has no active runtime uri".to_string())?;
                 tracing::info!(
                     session_id,
@@ -1082,7 +1125,7 @@ impl CombinedService {
         let uri = snapshot
             .transient
             .as_ref()
-            .map(|transient| transient.uri.clone())
+            .map(codex_app_server_endpoint_from_transient)
             .ok_or_else(|| {
                 format!("workspace '{workspace_key}' does not have an active runtime")
             })?;
@@ -1204,7 +1247,7 @@ impl CombinedService {
         let uri = snapshot
             .transient
             .as_ref()
-            .map(|transient| transient.uri.clone())
+            .map(codex_app_server_endpoint_from_transient)
             .ok_or_else(|| {
                 format!("workspace '{workspace_key}' does not have an active runtime")
             })?;
@@ -2215,6 +2258,12 @@ pub fn summarize_workspace_start_failure(status: Option<i32>, stderr: &str) -> S
             exit_status_suffix(status),
         );
     }
+    if reports_apple_container_xpc_connection_invalid(&stderr) {
+        return format!(
+            "Apple container backend unavailable{}; restart the Apple container backend (XPC connection invalid)",
+            exit_status_suffix(status),
+        );
+    }
 
     if stderr.is_empty() {
         format!("workspace start failed{}", exit_status_suffix(status))
@@ -2246,6 +2295,11 @@ fn compact_process_stderr(stderr: &str) -> String {
         .trim()
         .trim_matches('"')
         .to_string()
+}
+
+fn reports_apple_container_xpc_connection_invalid(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("xpc connection error") && stderr.contains("connection invalid")
 }
 
 fn exit_status_suffix(status: Option<i32>) -> String {
@@ -2449,6 +2503,19 @@ mod tests {
         assert_eq!(
             summary,
             "Apple container vmnet allocator exhausted (exit 1); restart the Apple container backend"
+        );
+    }
+
+    #[test]
+    fn summarize_workspace_start_failure_reports_xpc_backend_hint() {
+        let summary = summarize_workspace_start_failure(
+            Some(1),
+            r#"Error: interrupted: "XPC connection error: Connection invalid""#,
+        );
+
+        assert_eq!(
+            summary,
+            "Apple container backend unavailable (exit 1); restart the Apple container backend (XPC connection invalid)"
         );
     }
 

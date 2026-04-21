@@ -13,6 +13,7 @@ use super::{
 use crate::{WorkspaceManager, WorkspaceManagerError, WorkspaceSnapshot, manager::Workspace};
 
 const RESOURCE_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+const RUNTIME_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum ResourceUsageServiceError {
@@ -44,6 +45,7 @@ async fn watch_workspace_snapshot(
     let mut previous_cpu_sample: Option<(u64, Instant)> = None;
     let mut sampled_unit: Option<String> = None;
     let mut next_sample_at: Option<Instant> = None;
+    let mut runtime_seen_since: Option<Instant> = None;
 
     loop {
         let snapshot = workspace_rx.borrow().clone();
@@ -54,6 +56,7 @@ async fn watch_workspace_snapshot(
             previous_cpu_sample = None;
             sampled_unit = None;
             next_sample_at = None;
+            runtime_seen_since = None;
             if workspace_rx.changed().await.is_err() {
                 break;
             }
@@ -65,12 +68,28 @@ async fn watch_workspace_snapshot(
             previous_cpu_sample = None;
             sampled_unit = Some(transient.runtime.id.clone());
             next_sample_at = None;
+            runtime_seen_since = Some(Instant::now());
         }
 
         let now = Instant::now();
         if should_sample_usage(now, next_sample_at) {
             match WorkspaceRuntime::read_activity(&transient.runtime).await {
                 RuntimeActivity::Stopped => {
+                    let within_startup_grace =
+                        runtime_within_startup_grace(runtime_seen_since, now);
+                    if within_startup_grace {
+                        tracing::info!(
+                            runtime_id = %transient.runtime.id,
+                            grace_seconds = RUNTIME_STARTUP_GRACE_PERIOD.as_secs(),
+                            "ignoring transient stopped runtime sample during startup grace period"
+                        );
+                        next_sample_at = Some(now + RESOURCE_MONITOR_INTERVAL);
+                        let wait_timeout = next_poll_timeout(Instant::now(), next_sample_at);
+                        if !wait_for_change_or_timeout(&mut workspace_rx, wait_timeout).await {
+                            break;
+                        }
+                        continue;
+                    }
                     previous_cpu_sample = None;
                     clear_stale_runtime_for_unit(&workspace, &transient.runtime.id);
                     next_sample_at = Some(now + RESOURCE_MONITOR_INTERVAL);
@@ -119,6 +138,12 @@ fn should_sample_usage(now: Instant, next_sample_at: Option<Instant>) -> bool {
         None => true,
         Some(next_sample_at) => now >= next_sample_at,
     }
+}
+
+fn runtime_within_startup_grace(runtime_seen_since: Option<Instant>, now: Instant) -> bool {
+    runtime_seen_since
+        .map(|seen_since| now.saturating_duration_since(seen_since))
+        .is_some_and(|elapsed| elapsed < RUNTIME_STARTUP_GRACE_PERIOD)
 }
 
 fn next_poll_timeout(now: Instant, next_sample_at: Option<Instant>) -> Duration {
@@ -506,6 +531,20 @@ mod tests {
         assert!(should_sample_usage(
             now,
             Some(now - Duration::from_millis(1))
+        ));
+    }
+
+    #[test]
+    fn runtime_within_startup_grace_is_true_only_within_grace_window() {
+        let now = Instant::now();
+        assert!(!runtime_within_startup_grace(None, now));
+        assert!(runtime_within_startup_grace(
+            Some(now - Duration::from_secs(1)),
+            now
+        ));
+        assert!(!runtime_within_startup_grace(
+            Some(now - RUNTIME_STARTUP_GRACE_PERIOD - Duration::from_secs(1)),
+            now
         ));
     }
 

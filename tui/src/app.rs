@@ -3,7 +3,9 @@ use crate::system::*;
 use crate::*;
 use multicode_lib::services::{
     GithubTokenConfig,
-    codex_app_server::{CodexAppServerClient, CodexThreadStatus},
+    codex_app_server::{
+        CodexAppServerClient, CodexThreadStatus, codex_app_server_endpoint_from_transient,
+    },
 };
 use std::os::unix::fs::FileTypeExt;
 
@@ -484,13 +486,10 @@ pub(crate) fn working_codex_task_attach_target(
         return Ok(None);
     }
 
-    let Some(uri) = codex_attach_uri(snapshot)? else {
-        return Ok(None);
-    };
-    Ok(Some(AttachTarget::Codex {
-        uri,
-        thread_id: task_state.session_id.clone(),
-    }))
+    Ok(codex_resume_attach_target(
+        snapshot,
+        task_state.session_id.clone(),
+    )?)
 }
 
 pub(crate) fn should_retry_codex_task_attach_with_last_thread(
@@ -514,13 +513,7 @@ pub(crate) fn should_retry_codex_task_attach_with_last_thread(
         return None;
     }
 
-    let Ok(Some(uri)) = codex_attach_uri(snapshot) else {
-        return None;
-    };
-    Some(AttachTarget::Codex {
-        uri,
-        thread_id: None,
-    })
+    codex_resume_attach_target(snapshot, None).ok().flatten()
 }
 
 pub(crate) fn should_start_fresh_codex_task_session_after_failed_attach(
@@ -1600,9 +1593,17 @@ impl TuiState {
                 .attach_cwd_for_workspace(key)
                 .map(|path| path.to_string_lossy().into_owned());
             if let Some(target) =
-                working_codex_task_attach_target(snapshot, self.selected_task_id(), cwd)?
+                working_codex_task_attach_target(snapshot, self.selected_task_id(), cwd.clone())?
             {
                 return Ok(target);
+            }
+            if codex_workspace_reachable_without_root_thread(snapshot) {
+                return build_fresh_codex_attach_target(
+                    snapshot,
+                    cwd,
+                    self.selected_task_id()
+                        .map(|_| "Continue work on this task.".to_string()),
+                );
             }
         }
         snapshot_attach_target_for_selection(snapshot, self.selected_task_id())
@@ -1610,7 +1611,10 @@ impl TuiState {
 
     fn record_attached_session(&mut self, key: &str, target: &AttachTarget) {
         let task_id = self.selected_task_id().map(str::to_string);
-        let fresh_codex_session = matches!(target, AttachTarget::CodexNew { .. });
+        let fresh_codex_session = matches!(
+            target,
+            AttachTarget::CodexNew { .. } | AttachTarget::CodexContainerNew { .. }
+        );
         let initial_agent_state = self.snapshots.get(key).and_then(|snapshot| {
             task_id
                 .as_deref()
@@ -1626,8 +1630,9 @@ impl TuiState {
         });
         let session_id = match target {
             AttachTarget::Opencode { session_id, .. } => session_id.clone(),
+            AttachTarget::CodexContainerExec { thread_id, .. } => thread_id.clone(),
             AttachTarget::Codex { thread_id, .. } => thread_id.clone(),
-            AttachTarget::CodexNew { .. } => None,
+            AttachTarget::CodexContainerNew { .. } | AttachTarget::CodexNew { .. } => None,
         };
         let initial_turn_metrics =
             if self.service.agent_provider() == multicode_lib::services::AgentProvider::Codex {
@@ -1690,6 +1695,16 @@ impl TuiState {
             &self.workspace_link_validation_results,
             &workspace_path,
         )
+    }
+
+    async fn refresh_codex_home_for_attach(&mut self, key: &str) -> Result<(), String> {
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return Ok(());
+        }
+        self.service
+            .refresh_workspace_codex_home(key)
+            .await
+            .map_err(|err| err.summary())
     }
 
     fn selected_task_can_request_pr_creation(&self) -> bool {
@@ -2093,6 +2108,10 @@ impl TuiState {
 
         match self.snapshot_attach_target(&key) {
             Ok(target) => {
+                if let Err(err) = self.refresh_codex_home_for_attach(&key).await {
+                    self.status = format!("Failed to prepare Codex for workspace '{key}': {err}");
+                    return;
+                }
                 self.record_attached_session(&key, &target);
                 let custom_description = self
                     .snapshots
@@ -2209,6 +2228,10 @@ impl TuiState {
             previous_session_id,
             "retrying codex task attach with last thread after explicit thread exited"
         );
+        if let Err(err) = self.refresh_codex_home_for_attach(key).await {
+            self.status = format!("Failed to prepare Codex for workspace '{key}': {err}");
+            return false;
+        }
         self.record_attached_session(key, &target);
         match attach_in_tmux(
             terminal,
@@ -2260,11 +2283,13 @@ impl TuiState {
                 .and_then(|snapshot| snapshot.transient.as_ref()),
             session_id,
         ) {
-            (Some(transient), Some(session_id)) => CodexAppServerClient::new(transient.uri.clone())
-                .thread_read(session_id)
-                .await
-                .ok()
-                .and_then(|response| response.thread.status),
+            (Some(transient), Some(session_id)) => {
+                CodexAppServerClient::new(codex_app_server_endpoint_from_transient(transient))
+                    .thread_read(session_id)
+                    .await
+                    .ok()
+                    .and_then(|response| response.thread.status)
+            }
             _ => None,
         };
         let should_start_fresh = should_start_fresh_codex_task_session_after_failed_attach(
@@ -2301,9 +2326,6 @@ impl TuiState {
         let Some(snapshot) = self.snapshots.get(key) else {
             return false;
         };
-        let Ok(Some(uri)) = codex_attach_uri(snapshot) else {
-            return false;
-        };
         let cwd = self
             .attach_cwd_for_workspace(key)
             .map(|path| path.to_string_lossy().into_owned());
@@ -2321,7 +2343,18 @@ impl TuiState {
         } else {
             Some("Continue work on this task.".to_string())
         };
-        let target = AttachTarget::CodexNew { uri, cwd, prompt };
+        let target = if let Some(runtime_id) = codex_container_runtime_id(snapshot) {
+            AttachTarget::CodexContainerNew {
+                runtime_id,
+                cwd,
+                prompt,
+            }
+        } else {
+            let Ok(Some(uri)) = codex_attach_uri(snapshot) else {
+                return false;
+            };
+            AttachTarget::CodexNew { uri, cwd, prompt }
+        };
         let custom_description = self
             .snapshots
             .get(key)
@@ -2335,6 +2368,10 @@ impl TuiState {
                 .unwrap_or("<none>"),
             "starting fresh codex task session after failed resume attach"
         );
+        if let Err(err) = self.refresh_codex_home_for_attach(key).await {
+            self.status = format!("Failed to prepare Codex for workspace '{key}': {err}");
+            return true;
+        }
         self.record_attached_session(key, &target);
         match attach_in_tmux(
             terminal,
@@ -2905,11 +2942,13 @@ impl TuiState {
             session_id,
         );
         let current_thread_status = match snapshot.transient.as_ref() {
-            Some(transient) => CodexAppServerClient::new(transient.uri.clone())
-                .thread_read(session_id)
-                .await
-                .ok()
-                .and_then(|response| response.thread.status),
+            Some(transient) => {
+                CodexAppServerClient::new(codex_app_server_endpoint_from_transient(transient))
+                    .thread_read(session_id)
+                    .await
+                    .ok()
+                    .and_then(|response| response.thread.status)
+            }
             None => None,
         };
         let should_resume = should_resume_codex_task_after_incomplete_attached_turn(
@@ -3622,6 +3661,13 @@ impl TuiState {
                             }
                             match self.snapshot_attach_target(&key) {
                                 Ok(target) => {
+                                    if let Err(err) = self.refresh_codex_home_for_attach(&key).await
+                                    {
+                                        self.status = format!(
+                                            "Failed to prepare Codex for workspace '{key}': {err}"
+                                        );
+                                        return;
+                                    }
                                     self.record_attached_session(&key, &target);
                                     let custom_description = self
                                         .snapshots
@@ -4369,11 +4415,8 @@ pub(crate) fn snapshot_attach_target_for_selection(
                     .and_then(|task_state| task_state.session_id.as_deref())
                     .is_none());
         if should_use_last_codex_thread {
-            if let Some(uri) = codex_attach_uri(snapshot)? {
-                return Ok(AttachTarget::Codex {
-                    uri,
-                    thread_id: None,
-                });
+            if let Some(target) = codex_resume_attach_target(snapshot, None)? {
+                return Ok(target);
             }
             return workspace_attach_target(snapshot);
         }
@@ -4395,6 +4438,56 @@ fn codex_attach_uri(snapshot: &WorkspaceSnapshot) -> io::Result<Option<String>> 
     let parsed = Url::parse(uri)
         .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
     Ok(matches!(parsed.scheme(), "ws" | "wss").then(|| parsed.to_string()))
+}
+
+fn codex_container_runtime_id(snapshot: &WorkspaceSnapshot) -> Option<String> {
+    snapshot
+        .transient
+        .as_ref()
+        .filter(|transient| {
+            transient.runtime.backend == multicode_lib::RuntimeBackend::AppleContainer
+        })
+        .map(|transient| transient.runtime.id.clone())
+}
+
+fn codex_workspace_reachable_without_root_thread(snapshot: &WorkspaceSnapshot) -> bool {
+    snapshot
+        .transient
+        .as_ref()
+        .and_then(|transient| Url::parse(&transient.uri).ok())
+        .is_some_and(|uri| matches!(uri.scheme(), "ws" | "wss"))
+        && snapshot.root_session_id.is_none()
+        && snapshot.root_session_status.is_some()
+}
+
+pub(crate) fn build_fresh_codex_attach_target(
+    snapshot: &WorkspaceSnapshot,
+    cwd: Option<String>,
+    prompt: Option<String>,
+) -> io::Result<AttachTarget> {
+    if let Some(runtime_id) = codex_container_runtime_id(snapshot) {
+        return Ok(AttachTarget::CodexContainerNew {
+            runtime_id,
+            cwd,
+            prompt,
+        });
+    }
+    let uri = codex_attach_uri(snapshot)?
+        .ok_or_else(|| io::Error::other("workspace does not have an active codex attach URI"))?;
+    Ok(AttachTarget::CodexNew { uri, cwd, prompt })
+}
+
+fn codex_resume_attach_target(
+    snapshot: &WorkspaceSnapshot,
+    thread_id: Option<String>,
+) -> io::Result<Option<AttachTarget>> {
+    if let Some(runtime_id) = codex_container_runtime_id(snapshot) {
+        return Ok(Some(AttachTarget::CodexContainerExec {
+            runtime_id,
+            thread_id,
+        }));
+    }
+    Ok(codex_attach_uri(snapshot)?.map(|uri| AttachTarget::Codex { uri, thread_id }))
 }
 
 pub(crate) fn snapshot_attach_cwd_for_selection(

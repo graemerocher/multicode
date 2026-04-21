@@ -4,7 +4,8 @@ use tokio::sync::{broadcast, watch};
 
 use super::{
     codex_app_server::{
-        CodexAppServerClient, CodexServerNotification, forward_codex_notifications_forever,
+        CodexAppServerClient, CodexServerNotification, codex_app_server_endpoint_from_transient,
+        forward_codex_notifications_forever,
     },
     workspace_task_watch::watch_workspace_task,
     workspace_watch::monitor_workspace_snapshots,
@@ -110,7 +111,10 @@ async fn watch_workspace_snapshot(
         workspace_rx,
         |snapshot| {
             let session_or_thread_id = snapshot.root_session_id.clone()?;
-            let transient_uri = snapshot.transient.as_ref()?.uri.clone();
+            let transient_uri = snapshot
+                .transient
+                .as_ref()
+                .map(codex_app_server_endpoint_from_transient)?;
             let parsed_uri = url::Url::parse(&transient_uri).ok()?;
 
             if matches!(parsed_uri.scheme(), "ws" | "wss") {
@@ -381,7 +385,8 @@ fn refresh_snapshot_multicode_metadata(
         let still_attached_to_expected_uri = snapshot
             .transient
             .as_ref()
-            .map(|transient| normalize_base_uri(&transient.uri))
+            .map(codex_app_server_endpoint_from_transient)
+            .map(|uri| normalize_base_uri(&uri))
             .as_deref()
             == Some(expected_uri);
         let should_update = still_tracking_same_client
@@ -402,7 +407,13 @@ fn refresh_snapshot_multicode_metadata(
 }
 
 fn normalize_base_uri(uri: &str) -> String {
-    uri.trim_end_matches('/').to_string()
+    match url::Url::parse(uri) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => uri.trim_end_matches('/').to_string(),
+    }
 }
 
 async fn sync_codex_multicode_metadata(
@@ -490,7 +501,8 @@ async fn refresh_snapshot_codex_multicode_metadata(
         let still_attached_to_expected_uri = snapshot
             .transient
             .as_ref()
-            .map(|transient| normalize_base_uri(&transient.uri))
+            .map(codex_app_server_endpoint_from_transient)
+            .map(|uri| normalize_base_uri(&uri))
             .as_deref()
             == Some(expected_uri);
         let should_update = still_tracking_same_session

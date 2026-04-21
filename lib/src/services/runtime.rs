@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::OnceLock,
@@ -22,7 +22,13 @@ use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 pub(super) const RUNTIME_SPEC_METADATA_KEY: &str = "runtime-spec";
 const APPLE_GITCONFIG_DIR: &str = "/multicode-host/git";
 const APPLE_GITCONFIG_FILE_NAME: &str = ".gitconfig";
+const APPLE_DOCKER_SOCKET_METADATA_KEY: &str = "docker-socket-mounted";
+const APPLE_DOCKER_SOCKET_TARGET: &str = "/run/docker.sock";
+const APPLE_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+const APPLE_TESTCONTAINERS_HOST_OVERRIDE: &str = "host.multicode.test";
 const SYNTHETIC_CODEX_HOME: &str = "/multicode-agent/codex-home";
+const APPLE_RUNTIME_ID_KEY_LIMIT: usize = 12;
+const APPLE_RUNTIME_ID_SUFFIX_LEN: usize = 12;
 pub(crate) const AUTOMATION_STATE_DIR: &str = "/multicode-agent/automation";
 pub(crate) const AUTOMATION_STATE_ENV: &str = "MULTICODE_AUTONOMOUS_STATE_PATH";
 pub(crate) const AUTOMATION_STATE_FILE_NAME: &str = "state";
@@ -126,6 +132,10 @@ fn server_uri(context: &RuntimeContext, password: &str, port: u16) -> String {
     }
 }
 
+fn apple_container_codex_server_uri(port: u16, container_name: &str) -> String {
+    format!("ws://127.0.0.1:{port}/?multicode-container-id={container_name}")
+}
+
 pub(crate) fn synthetic_codex_home_source(workspace_directory_path: &Path, key: &str) -> PathBuf {
     workspace_directory_path
         .join(".multicode")
@@ -160,8 +170,9 @@ pub(crate) fn automation_task_state_file_source(
     automation_task_state_dir_source(workspace_directory_path, key).join(format!("{task_id}.state"))
 }
 
-async fn prepare_synthetic_codex_home(
+pub(crate) async fn prepare_synthetic_codex_home(
     source_root: &Path,
+    workspace_root: &Path,
     added_skills: &[super::config::AddedSkillMount],
     config: &CodexAgentConfig,
     materialize_host_auth: bool,
@@ -173,7 +184,12 @@ async fn prepare_synthetic_codex_home(
     let host_auth = host_codex_auth_path()?;
 
     copy_optional_host_file(&host_codex_home.join("config.toml"), &target_config).await?;
-    write_synthetic_codex_config(&target_config, config).await?;
+    write_synthetic_codex_config(
+        &target_config,
+        config,
+        &collect_synthetic_codex_trusted_projects(workspace_root),
+    )
+    .await?;
     match tokio::fs::remove_file(&target_auth).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -241,17 +257,21 @@ fn host_codex_auth_path() -> Result<Option<PathBuf>, CombinedServiceError> {
 async fn write_synthetic_codex_config(
     target: &Path,
     config: &CodexAgentConfig,
+    trusted_projects: &[PathBuf],
 ) -> Result<(), std::io::Error> {
     let contents = match tokio::fs::read_to_string(target).await {
         Ok(existing) => existing,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-    let contents = rewrite_synthetic_codex_config(&contents, config);
+    let contents = rewrite_synthetic_codex_config(&contents, config, trusted_projects);
     tokio::fs::write(target, contents).await
 }
 
-fn render_multicode_codex_config_overrides(config: &CodexAgentConfig) -> String {
+fn render_multicode_codex_config_overrides(
+    config: &CodexAgentConfig,
+    trusted_projects: &[PathBuf],
+) -> String {
     let mut lines = vec!["# Managed by multicode".to_string()];
 
     if let Some(profile) = config.profile.as_deref() {
@@ -280,15 +300,42 @@ fn render_multicode_codex_config_overrides(config: &CodexAgentConfig) -> String 
         "sandbox_mode = {}",
         toml::Value::String(codex_sandbox_mode_config_value(config.sandbox_mode).to_string())
     ));
+    lines.push(format!(
+        "trust_level = {}",
+        toml::Value::String("trusted".to_string())
+    ));
+    lines.push("check_for_update_on_startup = false".to_string());
+    for trusted_project in trusted_projects {
+        lines.push(String::new());
+        lines.push(format!(
+            "[projects.{}]",
+            toml::Value::String(trusted_project.to_string_lossy().into_owned())
+        ));
+        lines.push("trust_level = \"trusted\"".to_string());
+    }
 
     lines.join("\n") + "\n"
 }
 
-fn rewrite_synthetic_codex_config(existing: &str, config: &CodexAgentConfig) -> String {
+fn rewrite_synthetic_codex_config(
+    existing: &str,
+    config: &CodexAgentConfig,
+    trusted_projects: &[PathBuf],
+) -> String {
     let mut root_lines = Vec::new();
     let mut section_lines = Vec::new();
     let mut in_root = true;
     let mut skipping_managed_block = false;
+    let managed_project_headers = trusted_projects
+        .iter()
+        .map(|path| {
+            format!(
+                "[projects.{}]",
+                toml::Value::String(path.to_string_lossy().into_owned())
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut skipping_managed_project_section = false;
 
     for line in existing.lines() {
         let trimmed = line.trim();
@@ -305,6 +352,11 @@ fn rewrite_synthetic_codex_config(existing: &str, config: &CodexAgentConfig) -> 
 
         if trimmed.starts_with('[') {
             in_root = false;
+            skipping_managed_project_section = managed_project_headers.contains(trimmed);
+        }
+
+        if skipping_managed_project_section {
+            continue;
         }
 
         if in_root && is_root_codex_override_line(trimmed, config) {
@@ -330,7 +382,10 @@ fn rewrite_synthetic_codex_config(existing: &str, config: &CodexAgentConfig) -> 
             rewritten.push('\n');
         }
     }
-    rewritten.push_str(&render_multicode_codex_config_overrides(config));
+    rewritten.push_str(&render_multicode_codex_config_overrides(
+        config,
+        trusted_projects,
+    ));
 
     let section_body = section_lines.join("\n");
     if !section_body.trim().is_empty() {
@@ -346,8 +401,52 @@ fn rewrite_synthetic_codex_config(existing: &str, config: &CodexAgentConfig) -> 
     rewritten
 }
 
+fn collect_synthetic_codex_trusted_projects(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut trusted_projects = vec![workspace_root.to_path_buf()];
+
+    let add_repo_root = |trusted_projects: &mut Vec<PathBuf>, candidate: PathBuf| {
+        let git_path = candidate.join(".git");
+        if std::fs::metadata(&git_path).is_ok() && !trusted_projects.contains(&candidate) {
+            trusted_projects.push(candidate);
+        }
+    };
+
+    let Ok(entries) = std::fs::read_dir(workspace_root) else {
+        return trusted_projects;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        add_repo_root(&mut trusted_projects, path.clone());
+        let Ok(children) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let child_path = child.path();
+            let Ok(child_type) = child.file_type() else {
+                continue;
+            };
+            if child_type.is_dir() {
+                add_repo_root(&mut trusted_projects, child_path);
+            }
+        }
+    }
+
+    trusted_projects.sort();
+    trusted_projects
+}
+
 fn is_root_codex_override_line(line: &str, config: &CodexAgentConfig) -> bool {
-    if line.starts_with("approval_policy =") || line.starts_with("sandbox_mode =") {
+    if line.starts_with("approval_policy =")
+        || line.starts_with("sandbox_mode =")
+        || line.starts_with("trust_level =")
+        || line.starts_with("check_for_update_on_startup =")
+    {
         return true;
     }
     if config.profile.is_some() && line.starts_with("profile =") {
@@ -819,6 +918,7 @@ impl LinuxSystemdBwrapRuntime {
             let source = synthetic_codex_home_source(&self.context.workspace_directory_path, key);
             prepare_synthetic_codex_home(
                 &source,
+                &workspace_path,
                 &self.context.expanded_isolation.added_skills,
                 &self.context.codex,
                 false,
@@ -989,13 +1089,23 @@ impl AppleContainerRuntime {
         metadata.insert("workspace-key".to_string(), key.to_string());
         metadata.insert("port".to_string(), port.to_string());
         metadata.insert(
+            APPLE_DOCKER_SOCKET_METADATA_KEY.to_string(),
+            resolve_host_docker_socket_path()
+                .await
+                .is_some()
+                .to_string(),
+        );
+        metadata.insert(
             RUNTIME_SPEC_METADATA_KEY.to_string(),
             WorkspaceRuntime::AppleContainer(self.clone()).runtime_spec(),
         );
 
         Ok(RuntimeStartResult {
             transient: TransientWorkspaceSnapshot {
-                uri: server_uri(&self.context, &password, port),
+                uri: match self.context.agent_provider {
+                    AgentProvider::Opencode => server_uri(&self.context, &password, port),
+                    AgentProvider::Codex => apple_container_codex_server_uri(port, &container_name),
+                },
                 runtime: RuntimeHandleSnapshot {
                     backend: RuntimeBackend::AppleContainer,
                     id: container_name,
@@ -1016,6 +1126,49 @@ impl AppleContainerRuntime {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if container_start_reports_xpc_connection_invalid(&stderr) {
+            tracing::warn!(
+                stderr = %stderr.trim(),
+                "apple container backend unavailable; starting container system before retry"
+            );
+            let system_start_output = run_blocking_process(
+                container_program(),
+                vec!["system".to_string(), "start".to_string()],
+            )
+            .await?;
+            if !system_start_output.status.success() {
+                let system_start_stderr = String::from_utf8_lossy(&system_start_output.stderr)
+                    .trim()
+                    .to_string();
+                return Err(CombinedServiceError::StartWorkspaceFailed {
+                    status: output.status.code(),
+                    stderr: if system_start_stderr.is_empty() {
+                        format!("{stderr}\nautomatic container system start failed")
+                    } else {
+                        format!(
+                            "{stderr}\nautomatic container system start failed: {system_start_stderr}"
+                        )
+                    },
+                });
+            }
+
+            tracing::info!("apple container system start succeeded; retrying workspace startup");
+            let retry_output = run_blocking_process(program, args).await?;
+            if !retry_output.status.success()
+                && container_start_reports_xpc_connection_invalid(&String::from_utf8_lossy(
+                    &retry_output.stderr,
+                ))
+            {
+                return Err(CombinedServiceError::StartWorkspaceFailed {
+                    status: retry_output.status.code(),
+                    stderr: format!(
+                        "{}\nautomatic container system start was insufficient; restart the Apple container backend",
+                        String::from_utf8_lossy(&retry_output.stderr).trim()
+                    ),
+                });
+            }
+            return Ok(retry_output);
+        }
         if !container_start_reports_allocator_exhaustion(&stderr) {
             return Ok(output);
         }
@@ -1116,8 +1269,13 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let host_docker_socket = resolve_host_docker_socket_path().await;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            host_docker_socket.is_some(),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let mut args = vec![
@@ -1131,8 +1289,13 @@ impl AppleContainerRuntime {
             workspace_path.to_string_lossy().into_owned(),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(args.as_mut(), key, host_gitconfig.as_deref())
-            .await?;
+        self.append_container_mounts(
+            args.as_mut(),
+            key,
+            host_gitconfig.as_deref(),
+            host_docker_socket.as_deref(),
+        )
+        .await?;
         args.push(image.to_string());
         args.extend(command);
 
@@ -1153,8 +1316,15 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            runtime_handle
+                .metadata
+                .get(APPLE_DOCKER_SOCKET_METADATA_KEY)
+                .is_some_and(|value| value == "true"),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let args = vec![
@@ -1277,8 +1447,13 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         append_agent_env(&self.context, &mut env, password);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let host_docker_socket = resolve_host_docker_socket_path().await;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            host_docker_socket.is_some(),
+        )
+        .await?;
 
         let workspace_path = self.context.workspace_directory_path.join(key);
         tokio::fs::create_dir_all(&workspace_path).await?;
@@ -1298,8 +1473,13 @@ impl AppleContainerRuntime {
             format!("127.0.0.1:{port}:{port}/tcp"),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(&mut args, key, host_gitconfig.as_deref())
-            .await?;
+        self.append_container_mounts(
+            &mut args,
+            key,
+            host_gitconfig.as_deref(),
+            host_docker_socket.as_deref(),
+        )
+        .await?;
         args.push(image.to_string());
         args.extend(start_command_args(
             &self.context,
@@ -1343,6 +1523,7 @@ impl AppleContainerRuntime {
         args: &mut Vec<String>,
         key: &str,
         host_gitconfig: Option<&Path>,
+        host_docker_socket: Option<&Path>,
     ) -> Result<(), CombinedServiceError> {
         let workspace_path = self.context.workspace_directory_path.join(key);
         let implicit_gitconfig_mount = self
@@ -1412,6 +1593,13 @@ impl AppleContainerRuntime {
         if let Some(implicit_gitconfig_mount) = implicit_gitconfig_mount {
             mount_specs.push(implicit_gitconfig_mount);
         }
+        if let Some(host_docker_socket) = host_docker_socket {
+            mount_specs.push(MountSpec::new(
+                PathBuf::from(APPLE_DOCKER_SOCKET_TARGET),
+                Some(host_docker_socket.to_path_buf()),
+                MountKind::Writable,
+            ));
+        }
         mount_specs.push(MountSpec::new(
             PathBuf::from(AUTOMATION_STATE_DIR),
             Some(automation_state_dir_source(
@@ -1424,6 +1612,7 @@ impl AppleContainerRuntime {
             let source = synthetic_codex_home_source(&self.context.workspace_directory_path, key);
             prepare_synthetic_codex_home(
                 &source,
+                &workspace_path,
                 &self.context.expanded_isolation.added_skills,
                 &self.context.codex,
                 true,
@@ -1473,6 +1662,7 @@ impl AppleContainerRuntime {
         &self,
         env: &mut Vec<(String, String)>,
         host_gitconfig: Option<&Path>,
+        docker_socket_mounted: bool,
     ) -> Result<(), CombinedServiceError> {
         env.push((
             AUTOMATION_STATE_ENV.to_string(),
@@ -1486,6 +1676,17 @@ impl AppleContainerRuntime {
                 "GIT_CONFIG_GLOBAL".to_string(),
                 format!("{APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"),
             ));
+        }
+        if docker_socket_mounted {
+            env.push(("DOCKER_HOST".to_string(), APPLE_DOCKER_HOST.to_string()));
+            if let Some(host_override) = resolve_apple_container_host_override().await {
+                env.push(("TESTCONTAINERS_HOST_OVERRIDE".to_string(), host_override));
+            } else {
+                tracing::warn!(
+                    domain = APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+                    "apple container local DNS rule is missing; docker is available in-container but Testcontainers host-port access will not work until the host DNS rule is created"
+                );
+            }
         }
         Ok(())
     }
@@ -1648,7 +1849,13 @@ impl AppleContainerRuntime {
     }
 
     fn generate_runtime_id(&self, key: &str) -> String {
-        format!("multicode-{key}-{}", Uuid::new_v4().as_simple())
+        let key_segment: String = key.chars().take(APPLE_RUNTIME_ID_KEY_LIMIT).collect();
+        let random = Uuid::new_v4().simple().to_string();
+        format!(
+            "mc-{}-{}",
+            key_segment,
+            &random[..APPLE_RUNTIME_ID_SUFFIX_LEN]
+        )
     }
 }
 
@@ -1708,6 +1915,35 @@ fn parse_apple_container_usage(output: &str) -> RuntimeUsageSample {
             .map(|value| value.saturating_mul(1_000)),
         state: Some(RuntimeUsageState::Active),
     }
+}
+
+fn apple_container_dns_list_contains_domain(output: &str, domain: &str) -> bool {
+    output.lines().any(|line| line.trim() == domain)
+}
+
+async fn resolve_apple_container_host_override() -> Option<String> {
+    if let Some(override_value) = std::env::var("MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(override_value);
+    }
+
+    let output = run_blocking_process(
+        container_program(),
+        vec!["system".to_string(), "dns".to_string(), "list".to_string()],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    apple_container_dns_list_contains_domain(
+        &String::from_utf8_lossy(&output.stdout),
+        APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+    )
+    .then(|| APPLE_TESTCONTAINERS_HOST_OVERRIDE.to_string())
 }
 
 fn format_skill_mounts(skills: &[super::config::AddedSkillMount]) -> String {
@@ -1816,6 +2052,10 @@ fn container_program() -> String {
     std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
 }
 
+fn docker_program() -> String {
+    std::env::var("MULTICODE_DOCKER_COMMAND").unwrap_or_else(|_| "docker".to_string())
+}
+
 fn apple_container_start_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -1833,6 +2073,51 @@ fn container_start_reports_allocator_exhaustion(stderr: &str) -> bool {
     stderr
         .to_ascii_lowercase()
         .contains("no free indices are available for allocation")
+}
+
+fn container_start_reports_xpc_connection_invalid(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("xpc connection error") && stderr.contains("connection invalid")
+}
+
+fn docker_context_host_to_socket_path(host: &str) -> Option<PathBuf> {
+    let path = host.trim().strip_prefix("unix://")?;
+    let expanded = if let Some(relative) = path.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+    } else {
+        PathBuf::from(path)
+    };
+    let expanded = expanded.is_absolute().then_some(expanded)?;
+    if let Ok(canonical_path) = std::fs::canonicalize(&expanded) {
+        return Some(canonical_path);
+    }
+
+    let file_name = expanded.file_name()?.to_owned();
+    let parent = expanded.parent()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    Some(canonical_parent.join(file_name))
+}
+
+async fn resolve_host_docker_socket_path() -> Option<PathBuf> {
+    let output = run_blocking_process(
+        docker_program(),
+        vec![
+            "context".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Endpoints.docker.Host}}".to_string(),
+        ],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let socket_path =
+        docker_context_host_to_socket_path(String::from_utf8_lossy(&output.stdout).trim())?;
+    let metadata = std::fs::metadata(&socket_path).ok()?;
+    metadata.file_type().is_socket().then_some(socket_path)
 }
 
 async fn run_blocking_process(
@@ -1905,16 +2190,16 @@ impl MountSpec {
     pub(crate) fn new(target: PathBuf, source: Option<PathBuf>, kind: MountKind) -> Self {
         let is_file = match source.as_ref() {
             Some(source) => std::fs::metadata(source)
-                .map(|metadata| metadata.is_file())
+                .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                 .unwrap_or_else(|_| {
                     std::fs::metadata(&target)
-                        .map(|metadata| metadata.is_file())
+                        .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                         .unwrap_or_else(|_| {
                             path_looks_like_file(source) || path_looks_like_file(&target)
                         })
                 }),
             None => std::fs::metadata(&target)
-                .map(|metadata| metadata.is_file())
+                .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                 .unwrap_or_else(|_| path_looks_like_file(&target)),
         };
         Self {
@@ -2084,6 +2369,20 @@ impl ResolvedMountSpec {
             return;
         }
 
+        if self.mount.is_file {
+            args.push("--volume".to_string());
+            let mut volume = format!(
+                "{}:{}",
+                self.effective_source.to_string_lossy(),
+                self.mount.target.to_string_lossy()
+            );
+            if matches!(self.mount.kind, MountKind::Readable) {
+                volume.push_str(":ro");
+            }
+            args.push(volume);
+            return;
+        }
+
         match self.mount.kind {
             MountKind::Tmpfs => {
                 args.push("--tmpfs".to_string());
@@ -2119,10 +2418,42 @@ mod tests {
         AddedSkillMount, AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess,
         CodexSandboxMode, IsolationConfig,
     };
-    use std::fs;
+    use std::{
+        fs,
+        os::unix::{fs::symlink, net::UnixListener},
+    };
 
     struct TestDir {
         path: PathBuf,
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 
     impl TestDir {
@@ -2200,6 +2531,19 @@ mod tests {
                 .map(String::as_str)
                 .eq(sequence.iter().copied())
         })
+    }
+
+    fn write_fake_docker_cli(path: &Path, context_host: &str) {
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"context\" ] && [ \"$2\" = \"inspect\" ] && [ \"$3\" = \"--format\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nexit 1\n",
+            context_host.replace('\'', "'\"'\"'")
+        );
+        fs::write(path, script).expect("fake docker script should be written");
+        let mut permissions = fs::metadata(path)
+            .expect("fake docker metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake docker script should be executable");
     }
 
     #[test]
@@ -2311,6 +2655,12 @@ mod tests {
                     .iter()
                     .any(|arg| arg.contains("/var/tmp") && arg.contains("type=bind"))
             );
+            assert!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "ghcr.io/example/multicode-java25:latest")
+            );
             assert!(contains_sequence(
                 &command.args,
                 &[
@@ -2323,6 +2673,194 @@ mod tests {
                     "31337"
                 ]
             ));
+        });
+    }
+
+    #[test]
+    fn apple_container_runtime_id_fits_internal_socket_path_budget() {
+        let root = TestDir::new();
+        let runtime = apple_runtime(&root, IsolationConfig::default());
+        let runtime_id = runtime.generate_runtime_id("oraclecloud");
+        let socket_path = format!(
+            "/run/container/{runtime_id}/sockets/4C0A8C4B-AA53-4ED1-AEF1-2F594DB6B0A7.sock"
+        );
+
+        assert!(runtime_id.starts_with("mc-oraclecloud-"));
+        assert!(
+            socket_path.len() < 104,
+            "apple internal unix socket path must remain under sun_path budget: {socket_path}"
+        );
+    }
+
+    #[test]
+    fn docker_context_host_to_socket_path_expands_home_relative_socket() {
+        let previous_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir().join(format!(
+            "multicode-docker-home-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().as_simple()
+        ));
+        let docker_socket = fake_home.join(".rd/docker.sock");
+        fs::create_dir_all(&fake_home).expect("fake home should exist");
+        fs::create_dir_all(
+            docker_socket
+                .parent()
+                .expect("docker socket should have a parent directory"),
+        )
+        .expect("fake rancher desktop directory should exist");
+        fs::write(&docker_socket, "").expect("fake docker socket file should exist");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let resolved = docker_context_host_to_socket_path("unix://~/.rd/docker.sock")
+            .expect("home-relative socket should resolve");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        let expected =
+            std::fs::canonicalize(&docker_socket).expect("docker socket path should canonicalize");
+        let _ = fs::remove_dir_all(&fake_home);
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn docker_context_host_to_socket_path_resolves_symlinked_socket_to_real_target() {
+        let root = std::env::temp_dir().join(format!("mc-sock-{}", Uuid::new_v4().as_simple()));
+        let real_socket = root.join("real.sock");
+        let symlinked_socket = root.join("docker.sock");
+        fs::create_dir_all(
+            real_socket
+                .parent()
+                .expect("real socket should have a parent directory"),
+        )
+        .expect("real socket directory should exist");
+        fs::create_dir_all(
+            symlinked_socket
+                .parent()
+                .expect("symlinked socket should have a parent directory"),
+        )
+        .expect("symlinked socket directory should exist");
+        let _listener = UnixListener::bind(&real_socket).expect("real socket should bind");
+        symlink(&real_socket, &symlinked_socket).expect("symlinked socket should exist");
+
+        let resolved =
+            docker_context_host_to_socket_path(&format!("unix://{}", symlinked_socket.display()))
+                .expect("symlinked socket should resolve");
+        let expected =
+            std::fs::canonicalize(&real_socket).expect("real socket should canonicalize");
+
+        let _ = fs::remove_file(&symlinked_socket);
+        let _ = fs::remove_file(&real_socket);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn apple_container_run_command_mounts_host_docker_socket_and_exports_docker_host() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let bin_dir = root.path().join("bin");
+            let _host_override_guard = EnvVarGuard::set(
+                "MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE",
+                APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+            );
+            let socket_path =
+                std::env::temp_dir().join(format!("mc-docker-{}.sock", Uuid::new_v4().as_simple()));
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            let _listener = UnixListener::bind(&socket_path).expect("socket should bind");
+            write_fake_docker_cli(
+                &bin_dir.join("docker"),
+                &format!("unix://{}", socket_path.display()),
+            );
+
+            let previous_path = std::env::var_os("PATH");
+            let previous_docker = std::env::var_os("MULTICODE_DOCKER_COMMAND");
+            unsafe {
+                std::env::set_var("PATH", bin_dir.to_string_lossy().into_owned());
+                std::env::set_var("MULTICODE_DOCKER_COMMAND", bin_dir.join("docker"));
+            }
+
+            let runtime = apple_runtime(&root, IsolationConfig::default());
+            let command = runtime
+                .build_run_command(
+                    "alpha",
+                    "multicode-alpha",
+                    "secret",
+                    31337,
+                    &[(
+                        "HOME".to_string(),
+                        root.path().to_string_lossy().into_owned(),
+                    )],
+                )
+                .await
+                .expect("command should build");
+            let server_env = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("server.env");
+
+            if let Some(previous_path) = previous_path {
+                unsafe {
+                    std::env::set_var("PATH", previous_path);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("PATH");
+                }
+            }
+            if let Some(previous_docker) = previous_docker {
+                unsafe {
+                    std::env::set_var("MULTICODE_DOCKER_COMMAND", previous_docker);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("MULTICODE_DOCKER_COMMAND");
+                }
+            }
+
+            let docker_mount = format!(
+                "{}:{}",
+                docker_context_host_to_socket_path(&format!("unix://{}", socket_path.display()))
+                    .expect("docker socket path should canonicalize")
+                    .display(),
+                APPLE_DOCKER_SOCKET_TARGET
+            );
+            assert!(
+                command.args.iter().any(|arg| arg == &docker_mount),
+                "apple backend should mount the active host docker socket into the container"
+            );
+            let env_contents =
+                fs::read_to_string(&server_env).expect("server env file should be written");
+            assert!(
+                env_contents.contains(&format!("DOCKER_HOST={APPLE_DOCKER_HOST}\n")),
+                "apple backend should point docker at the mounted in-container socket path"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={}\n",
+                    APPLE_TESTCONTAINERS_HOST_OVERRIDE
+                )),
+                "apple backend should point Testcontainers at the host DNS alias"
+            );
+            let _ = fs::remove_file(&socket_path);
         });
     }
 
@@ -2392,6 +2930,12 @@ mod tests {
                 }
             }
 
+            assert!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "ghcr.io/example/multicode-java25:latest")
+            );
             assert!(contains_sequence(
                 &command.args,
                 &[
@@ -2445,25 +2989,29 @@ mod tests {
                 server_env_mode, 0o600,
                 "apple backend should write env files with 0600 permissions"
             );
-            assert_eq!(
-                fs::read_to_string(
-                    workspace_root
-                        .join(".multicode")
-                        .join("codex")
-                        .join("alpha")
-                        .join("home")
-                        .join("config.toml")
-                )
-                .expect("synthetic codex config should exist"),
-                concat!(
-                    "# Managed by multicode\n",
-                    "profile = \"default\"\n",
-                    "model = \"gpt-5-codex\"\n",
-                    "model_provider = \"openai\"\n",
-                    "approval_policy = \"never\"\n",
-                    "sandbox_mode = \"danger-full-access\"\n",
-                )
-            );
+            let config_contents = fs::read_to_string(
+                workspace_root
+                    .join(".multicode")
+                    .join("codex")
+                    .join("alpha")
+                    .join("home")
+                    .join("config.toml"),
+            )
+            .expect("synthetic codex config should exist");
+            assert!(config_contents.starts_with(concat!(
+                "# Managed by multicode\n",
+                "profile = \"default\"\n",
+                "model = \"gpt-5-codex\"\n",
+                "model_provider = \"openai\"\n",
+                "approval_policy = \"never\"\n",
+                "sandbox_mode = \"danger-full-access\"\n",
+                "trust_level = \"trusted\"\n",
+                "check_for_update_on_startup = false\n",
+            )));
+            assert!(config_contents.contains(&format!(
+                "\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                workspace_root.join("alpha").display()
+            )));
             let persisted_auth = workspace_root
                 .join(".multicode")
                 .join("codex")
@@ -2480,15 +3028,18 @@ mod tests {
     #[test]
     fn synthetic_codex_config_overrides_external_sandbox_with_dangerous_access() {
         assert_eq!(
-            render_multicode_codex_config_overrides(&CodexAgentConfig {
-                commands: vec!["codex".to_string()],
-                profile: Some("default".to_string()),
-                model: Some("gpt-5-codex".to_string()),
-                model_provider: Some("openai".to_string()),
-                approval_policy: CodexApprovalPolicy::Never,
-                sandbox_mode: CodexSandboxMode::ExternalSandbox,
-                network_access: CodexNetworkAccess::Enabled,
-            }),
+            render_multicode_codex_config_overrides(
+                &CodexAgentConfig {
+                    commands: vec!["codex".to_string()],
+                    profile: Some("default".to_string()),
+                    model: Some("gpt-5-codex".to_string()),
+                    model_provider: Some("openai".to_string()),
+                    approval_policy: CodexApprovalPolicy::Never,
+                    sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                    network_access: CodexNetworkAccess::Enabled,
+                },
+                &[],
+            ),
             concat!(
                 "# Managed by multicode\n",
                 "profile = \"default\"\n",
@@ -2496,6 +3047,8 @@ mod tests {
                 "model_provider = \"openai\"\n",
                 "approval_policy = \"never\"\n",
                 "sandbox_mode = \"danger-full-access\"\n",
+                "trust_level = \"trusted\"\n",
+                "check_for_update_on_startup = false\n",
             )
         );
     }
@@ -2508,6 +3061,8 @@ mod tests {
             "model = \"gpt-5.4\"\n",
             "profile = \"gpt-5-3-codex\"\n",
             "sandbox_mode = \"workspace-write\"\n",
+            "trust_level = \"untrusted\"\n",
+            "check_for_update_on_startup = true\n",
             "web_search_request = true\n",
             "\n",
             "[profiles.gpt-5-4]\n",
@@ -2518,6 +3073,8 @@ mod tests {
             "# Managed by multicode\n",
             "approval_policy = \"never\"\n",
             "sandbox_mode = \"danger-full-access\"\n",
+            "trust_level = \"trusted\"\n",
+            "check_for_update_on_startup = false\n",
         );
 
         let rewritten = rewrite_synthetic_codex_config(
@@ -2531,6 +3088,7 @@ mod tests {
                 sandbox_mode: CodexSandboxMode::ExternalSandbox,
                 network_access: CodexNetworkAccess::Enabled,
             },
+            &[],
         );
 
         assert_eq!(
@@ -2544,6 +3102,8 @@ mod tests {
                 "model_provider = \"openai\"\n",
                 "approval_policy = \"never\"\n",
                 "sandbox_mode = \"danger-full-access\"\n",
+                "trust_level = \"trusted\"\n",
+                "check_for_update_on_startup = false\n",
                 "\n",
                 "[profiles.gpt-5-4]\n",
                 "model = \"gpt-5.4\"\n",
@@ -2562,6 +3122,8 @@ mod tests {
             "model = \"gpt-5.4\"\n",
             "profile = \"gpt-5-3-codex\"\n",
             "sandbox_mode = \"workspace-write\"\n",
+            "trust_level = \"untrusted\"\n",
+            "check_for_update_on_startup = true\n",
             "web_search_request = true\n",
             "\n",
             "[profiles.gpt-5-4]\n",
@@ -2579,6 +3141,7 @@ mod tests {
                 sandbox_mode: CodexSandboxMode::ExternalSandbox,
                 network_access: CodexNetworkAccess::Enabled,
             },
+            &[],
         );
 
         assert_eq!(
@@ -2592,11 +3155,54 @@ mod tests {
                 "# Managed by multicode\n",
                 "approval_policy = \"never\"\n",
                 "sandbox_mode = \"danger-full-access\"\n",
+                "trust_level = \"trusted\"\n",
+                "check_for_update_on_startup = false\n",
                 "\n",
                 "[profiles.gpt-5-4]\n",
                 "model = \"gpt-5.4\"\n",
             )
         );
+    }
+
+    #[test]
+    fn synthetic_codex_config_adds_trusted_project_entries_for_workspace_paths() {
+        let rewritten = rewrite_synthetic_codex_config(
+            "",
+            &CodexAgentConfig {
+                commands: vec!["codex".to_string()],
+                profile: None,
+                model: None,
+                model_provider: None,
+                approval_policy: CodexApprovalPolicy::Never,
+                sandbox_mode: CodexSandboxMode::ExternalSandbox,
+                network_access: CodexNetworkAccess::Enabled,
+            },
+            &[
+                PathBuf::from("/tmp/workspace"),
+                PathBuf::from("/tmp/workspace/repo"),
+            ],
+        );
+
+        assert!(rewritten.contains("[projects.\"/tmp/workspace\"]\ntrust_level = \"trusted\"\n"));
+        assert!(
+            rewritten.contains("[projects.\"/tmp/workspace/repo\"]\ntrust_level = \"trusted\"\n")
+        );
+    }
+
+    #[test]
+    fn collect_synthetic_codex_trusted_projects_includes_workspace_and_repo_dirs() {
+        let root = TestDir::new();
+        let workspace = root.path().join("workspace");
+        let repo = workspace.join("repo");
+        let worktree = workspace.join("work/task-1");
+        fs::create_dir_all(repo.join(".git")).expect("repo git dir should exist");
+        fs::create_dir_all(worktree.join(".git")).expect("worktree git dir should exist");
+
+        let trusted = collect_synthetic_codex_trusted_projects(&workspace);
+
+        assert!(trusted.contains(&workspace));
+        assert!(trusted.contains(&repo));
+        assert!(trusted.contains(&worktree));
     }
 
     #[test]
@@ -2740,12 +3346,19 @@ mod tests {
         runtime.block_on(async {
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
+            let _host_override_guard = EnvVarGuard::set(
+                "MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE",
+                APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+            );
             fs::create_dir_all(workspace_root.join("alpha")).expect("workspace should exist");
             let runtime = apple_runtime(&root, IsolationConfig::default());
             let runtime_handle = RuntimeHandleSnapshot {
                 backend: RuntimeBackend::AppleContainer,
                 id: "multicode-alpha-running".to_string(),
-                metadata: BTreeMap::new(),
+                metadata: BTreeMap::from([(
+                    APPLE_DOCKER_SOCKET_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                )]),
             };
 
             let command = runtime
@@ -2794,6 +3407,17 @@ mod tests {
             assert!(
                 env_contents.contains("COLORTERM=truecolor\n"),
                 "apple PTY exec should set a portable COLORTERM for container shells"
+            );
+            assert!(
+                env_contents.contains(&format!("DOCKER_HOST={APPLE_DOCKER_HOST}\n")),
+                "apple PTY exec should inherit the mounted docker socket configuration"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={}\n",
+                    APPLE_TESTCONTAINERS_HOST_OVERRIDE
+                )),
+                "apple PTY exec should point Testcontainers at the host DNS alias"
             );
             assert!(command.inherited_env.is_empty());
         });
@@ -3202,5 +3826,17 @@ mod tests {
                 state: Some(RuntimeUsageState::Unknown),
             }
         );
+    }
+
+    #[test]
+    fn apple_container_dns_list_contains_domain_matches_domain_entries() {
+        assert!(apple_container_dns_list_contains_domain(
+            "DOMAIN\nhost.multicode.test\nexample.test\n",
+            "host.multicode.test"
+        ));
+        assert!(!apple_container_dns_list_contains_domain(
+            "DOMAIN\nexample.test\n",
+            "host.multicode.test"
+        ));
     }
 }

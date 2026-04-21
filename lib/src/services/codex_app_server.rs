@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    process::Stdio,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicI64, Ordering},
@@ -10,15 +11,21 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::config::{CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode};
+use crate::{RuntimeBackend, TransientWorkspaceSnapshot};
 
 const INITIALIZE_REQUEST_ID: i64 = 1;
 const INITIAL_REQUEST_ID: i64 = 2;
 
 type CodexSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type CodexStdoutLines = Lines<BufReader<ChildStdout>>;
 
 static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(INITIAL_REQUEST_ID);
 static SHARED_CONNECTIONS: OnceLock<std::sync::Mutex<HashMap<String, Arc<SharedCodexConnection>>>> =
@@ -31,8 +38,27 @@ pub struct CodexAppServerClient {
 
 #[derive(Debug)]
 struct SharedCodexConnection {
-    uri: String,
-    socket: tokio::sync::Mutex<Option<CodexSocket>>,
+    endpoint: CodexTransportEndpoint,
+    connection: tokio::sync::Mutex<Option<CodexConnection>>,
+}
+
+#[derive(Debug, Clone)]
+enum CodexTransportEndpoint {
+    WebSocket { uri: String },
+    AppleContainer { runtime_id: String },
+}
+
+#[derive(Debug)]
+enum CodexConnection {
+    WebSocket(CodexSocket),
+    AppleContainerStdio(StdioCodexConnection),
+}
+
+#[derive(Debug)]
+struct StdioCodexConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: CodexStdoutLines,
 }
 
 impl CodexAppServerClient {
@@ -117,17 +143,33 @@ impl CodexAppServerClient {
         &self,
         tx: tokio::sync::broadcast::Sender<CodexServerNotification>,
     ) -> Result<(), String> {
-        let mut socket = self.connect_initialized().await?;
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(|err| err.to_string())?;
-            let Some(text) = message_to_text(message) else {
-                continue;
-            };
-            let Ok(notification) = serde_json::from_str::<CodexServerNotificationEnvelope>(&text)
-            else {
-                continue;
-            };
-            let _ = tx.send(notification.into_notification());
+        match codex_transport_endpoint(&self.uri) {
+            CodexTransportEndpoint::WebSocket { uri } => {
+                let mut socket = connect_initialized_socket(&uri).await?;
+                while let Some(message) = socket.next().await {
+                    let message = message.map_err(|err| err.to_string())?;
+                    let Some(text) = message_to_text(message) else {
+                        continue;
+                    };
+                    let Ok(notification) =
+                        serde_json::from_str::<CodexServerNotificationEnvelope>(&text)
+                    else {
+                        continue;
+                    };
+                    let _ = tx.send(notification.into_notification());
+                }
+            }
+            CodexTransportEndpoint::AppleContainer { runtime_id } => {
+                let mut connection = connect_initialized_stdio_app_server(&runtime_id).await?;
+                while let Some(value) = read_stdio_json(&mut connection.stdout).await? {
+                    let Ok(notification) =
+                        serde_json::from_value::<CodexServerNotificationEnvelope>(value)
+                    else {
+                        continue;
+                    };
+                    let _ = tx.send(notification.into_notification());
+                }
+            }
         }
         Ok(())
     }
@@ -142,10 +184,6 @@ impl CodexAppServerClient {
             .await
     }
 
-    async fn connect_initialized(&self) -> Result<CodexSocket, String> {
-        connect_initialized_socket(&self.uri).await
-    }
-
     fn shared_connection(&self) -> Arc<SharedCodexConnection> {
         let registry = SHARED_CONNECTIONS.get_or_init(Default::default);
         let mut registry = registry
@@ -155,12 +193,35 @@ impl CodexAppServerClient {
             .entry(self.uri.clone())
             .or_insert_with(|| {
                 Arc::new(SharedCodexConnection {
-                    uri: self.uri.clone(),
-                    socket: tokio::sync::Mutex::new(None),
+                    endpoint: codex_transport_endpoint(&self.uri),
+                    connection: tokio::sync::Mutex::new(None),
                 })
             })
             .clone()
     }
+}
+
+pub fn codex_app_server_endpoint_from_transient(transient: &TransientWorkspaceSnapshot) -> String {
+    if transient.runtime.backend != RuntimeBackend::AppleContainer {
+        return transient.uri.clone();
+    }
+
+    let Ok(mut parsed) = url::Url::parse(&transient.uri) else {
+        return transient.uri.clone();
+    };
+    if !matches!(parsed.scheme(), "ws" | "wss") {
+        return transient.uri.clone();
+    }
+
+    let has_runtime_id = parsed
+        .query_pairs()
+        .any(|(name, _)| name == "multicode-container-id");
+    if !has_runtime_id && !transient.runtime.id.is_empty() {
+        parsed
+            .query_pairs_mut()
+            .append_pair("multicode-container-id", transient.runtime.id.as_str());
+    }
+    parsed.to_string()
 }
 
 impl SharedCodexConnection {
@@ -176,95 +237,93 @@ impl SharedCodexConnection {
         })
         .to_string();
 
-        let mut socket = self.socket.lock().await;
+        let mut connection = self.connection.lock().await;
         for attempt in 0..2 {
-            if socket.is_none() {
-                *socket = Some(connect_initialized_socket(&self.uri).await?);
+            if connection.is_none() {
+                *connection = Some(connect_initialized_connection(&self.endpoint).await?);
             }
 
-            let Some(active_socket) = socket.as_mut() else {
+            let Some(active_connection) = connection.as_mut() else {
                 continue;
             };
 
-            if let Err(err) = active_socket
-                .send(Message::Text(request.clone().into()))
-                .await
-            {
-                *socket = None;
-                if attempt == 0 {
-                    continue;
+            let endpoint_label = endpoint_label(&self.endpoint);
+            let result = match active_connection {
+                CodexConnection::WebSocket(socket) => {
+                    request_over_websocket(socket, request_id, &request, &endpoint_label).await
                 }
-                return Err(err.to_string());
-            }
-
-            loop {
-                match active_socket.next().await {
-                    Some(Ok(message)) => {
-                        let Some(text) = message_to_text(message) else {
-                            continue;
-                        };
-                        let value: Value =
-                            serde_json::from_str(&text).map_err(|err| err.to_string())?;
-                        if value.get("id").and_then(Value::as_i64) != Some(request_id) {
-                            continue;
-                        }
-                        if let Some(result) = value.get("result") {
-                            return serde_json::from_value(result.clone())
-                                .map_err(|err| err.to_string());
-                        }
-                        if let Some(error) = value.get("error") {
-                            return Err(error.to_string());
-                        }
+                CodexConnection::AppleContainerStdio(connection) => {
+                    request_over_stdio(connection, request_id, &request, &endpoint_label).await
+                }
+            };
+            match result {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    *connection = None;
+                    if attempt == 0 {
+                        continue;
                     }
-                    Some(Err(err)) => {
-                        *socket = None;
-                        if attempt == 0 {
-                            break;
-                        }
-                        return Err(err.to_string());
-                    }
-                    None => {
-                        *socket = None;
-                        if attempt == 0 {
-                            break;
-                        }
-                        return Err(format!(
-                            "codex app-server connection to '{}' closed",
-                            self.uri
-                        ));
-                    }
+                    return Err(err);
                 }
             }
         }
 
         Err(format!(
             "failed to complete codex app-server request '{}' for '{}'",
-            method, self.uri
+            method,
+            endpoint_label(&self.endpoint)
         ))
+    }
+}
+
+fn codex_transport_endpoint(uri: &str) -> CodexTransportEndpoint {
+    let Ok(mut parsed) = url::Url::parse(uri) else {
+        return CodexTransportEndpoint::WebSocket {
+            uri: uri.to_string(),
+        };
+    };
+    if matches!(parsed.scheme(), "ws" | "wss")
+        && let Some(runtime_id) = parsed
+            .query_pairs()
+            .find(|(name, _)| name == "multicode-container-id")
+            .map(|(_, value)| value.into_owned())
+    {
+        return CodexTransportEndpoint::AppleContainer { runtime_id };
+    }
+    parsed.set_query(None);
+    CodexTransportEndpoint::WebSocket {
+        uri: parsed.to_string(),
+    }
+}
+
+fn endpoint_label(endpoint: &CodexTransportEndpoint) -> String {
+    match endpoint {
+        CodexTransportEndpoint::WebSocket { uri } => uri.clone(),
+        CodexTransportEndpoint::AppleContainer { runtime_id } => {
+            format!("container://{runtime_id}")
+        }
+    }
+}
+
+async fn connect_initialized_connection(
+    endpoint: &CodexTransportEndpoint,
+) -> Result<CodexConnection, String> {
+    match endpoint {
+        CodexTransportEndpoint::WebSocket { uri } => connect_initialized_socket(uri)
+            .await
+            .map(CodexConnection::WebSocket),
+        CodexTransportEndpoint::AppleContainer { runtime_id } => {
+            connect_initialized_stdio_app_server(runtime_id)
+                .await
+                .map(CodexConnection::AppleContainerStdio)
+        }
     }
 }
 
 async fn connect_initialized_socket(uri: &str) -> Result<CodexSocket, String> {
     let (mut socket, _) = connect_async(uri).await.map_err(|err| err.to_string())?;
     socket
-        .send(Message::Text(
-            json!({
-                "jsonrpc": "2.0",
-                "id": INITIALIZE_REQUEST_ID,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "multicode",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": {
-                        "experimentalApi": true,
-                    },
-                }
-            })
-            .to_string()
-            .into(),
-        ))
+        .send(Message::Text(initialize_request().to_string().into()))
         .await
         .map_err(|err| err.to_string())?;
 
@@ -281,14 +340,7 @@ async fn connect_initialized_socket(uri: &str) -> Result<CodexSocket, String> {
             return Err(value["error"].to_string());
         }
         socket
-            .send(Message::Text(
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "initialized",
-                })
-                .to_string()
-                .into(),
-            ))
+            .send(Message::Text(initialized_notification().to_string().into()))
             .await
             .map_err(|err| err.to_string())?;
         return Ok(socket);
@@ -298,6 +350,192 @@ async fn connect_initialized_socket(uri: &str) -> Result<CodexSocket, String> {
         "codex app-server initialize did not complete for '{}'",
         uri
     ))
+}
+
+async fn connect_initialized_stdio_app_server(
+    runtime_id: &str,
+) -> Result<StdioCodexConnection, String> {
+    let mut command = Command::new(container_program());
+    command
+        .args([
+            "exec",
+            "--interactive",
+            runtime_id,
+            "codex",
+            "app-server",
+            "--listen",
+            "stdio://",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        format!("failed to open stdin for container '{runtime_id}' codex app-server")
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        format!("failed to open stdout for container '{runtime_id}' codex app-server")
+    })?;
+    let mut connection = StdioCodexConnection {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout).lines(),
+    };
+    write_stdio_message(&mut connection.stdin, &initialize_request()).await?;
+    while let Some(value) = read_stdio_json(&mut connection.stdout).await? {
+        if value.get("id").and_then(Value::as_i64) != Some(INITIALIZE_REQUEST_ID) {
+            continue;
+        }
+        if value.get("error").is_some() {
+            return Err(value["error"].to_string());
+        }
+        write_stdio_message(&mut connection.stdin, &initialized_notification()).await?;
+        return Ok(connection);
+    }
+    Err(format!(
+        "codex app-server initialize did not complete for 'container://{runtime_id}'"
+    ))
+}
+
+async fn request_over_websocket<T>(
+    socket: &mut CodexSocket,
+    request_id: i64,
+    request: &str,
+    endpoint_label: &str,
+) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .await
+        .map_err(|err| err.to_string())?;
+
+    loop {
+        match socket.next().await {
+            Some(Ok(message)) => {
+                let Some(text) = message_to_text(message) else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+                if value.get("id").and_then(Value::as_i64) != Some(request_id) {
+                    continue;
+                }
+                if let Some(result) = value.get("result") {
+                    return serde_json::from_value(result.clone()).map_err(|err| err.to_string());
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(error.to_string());
+                }
+            }
+            Some(Err(err)) => return Err(err.to_string()),
+            None => {
+                return Err(format!(
+                    "codex app-server connection to '{}' closed",
+                    endpoint_label
+                ));
+            }
+        }
+    }
+}
+
+async fn request_over_stdio<T>(
+    connection: &mut StdioCodexConnection,
+    request_id: i64,
+    request: &str,
+    endpoint_label: &str,
+) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    connection
+        .stdin
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|err| err.to_string())?;
+    connection
+        .stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|err| err.to_string())?;
+    connection
+        .stdin
+        .flush()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    while let Some(value) = read_stdio_json(&mut connection.stdout).await? {
+        if value.get("id").and_then(Value::as_i64) != Some(request_id) {
+            continue;
+        }
+        if let Some(result) = value.get("result") {
+            return serde_json::from_value(result.clone()).map_err(|err| err.to_string());
+        }
+        if let Some(error) = value.get("error") {
+            return Err(error.to_string());
+        }
+    }
+
+    let _ = connection.child.kill().await;
+    Err(format!(
+        "codex app-server connection to '{}' closed",
+        endpoint_label
+    ))
+}
+
+async fn read_stdio_json(stdout: &mut CodexStdoutLines) -> Result<Option<Value>, String> {
+    loop {
+        let Some(line) = stdout.next_line().await.map_err(|err| err.to_string())? else {
+            return Ok(None);
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(trimmed).map_err(|err| err.to_string())?;
+        return Ok(Some(value));
+    }
+}
+
+async fn write_stdio_message(stdin: &mut ChildStdin, value: &Value) -> Result<(), String> {
+    stdin
+        .write_all(value.to_string().as_bytes())
+        .await
+        .map_err(|err| err.to_string())?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|err| err.to_string())?;
+    stdin.flush().await.map_err(|err| err.to_string())
+}
+
+fn initialize_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": INITIALIZE_REQUEST_ID,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "multicode",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            },
+        }
+    })
+}
+
+fn initialized_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+    })
+}
+
+fn container_program() -> String {
+    std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
 }
 
 fn build_thread_start_params(cwd: &str, config: &CodexAgentConfig) -> Value {
