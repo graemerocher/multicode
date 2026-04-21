@@ -11,6 +11,8 @@ If you are using `gh`, prefer:
 gh pr edit --add-assignee @me
 ```
 
+When creating or editing a pull request body with `gh`, do not embed literal `\n` escape sequences in a single shell argument such as `--body "line1\nline2"`, because GitHub will store the backslash characters literally. Use actual multiline text or prefer `--body-file` so the description contains real newlines.
+
 For Micronaut projects, also assign the PR to the next Micronaut project release at the organization level under `https://github.com/orgs/micronaut-projects/projects`.
 
 - Prefer the next semantically versioned release project.

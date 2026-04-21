@@ -11,6 +11,7 @@ mod tests {
 
     use super::*;
     use crate::app::{
+        CODEX_CREATE_PR_APPROVAL_PROMPT,
         build_codex_fix_ci_prompt, build_fresh_codex_attach_target, compact_github_tooltip_target,
         count_codex_session_turn_metrics, github_repository_spec, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
@@ -425,6 +426,16 @@ mod tests {
             last_user_message_from_codex_session_log_contents(contents).as_deref(),
             Some("create a PR")
         );
+    }
+
+    #[test]
+    fn codex_create_pr_prompt_requires_real_multiline_bodies() {
+        assert!(
+            CODEX_CREATE_PR_APPROVAL_PROMPT
+                .contains("actual newlines instead of literal `\\n` escape sequences")
+        );
+        assert!(CODEX_CREATE_PR_APPROVAL_PROMPT.contains("`gh pr create --body-file`"));
+        assert!(CODEX_CREATE_PR_APPROVAL_PROMPT.contains("`gh pr edit --body-file`"));
     }
 
     #[test]

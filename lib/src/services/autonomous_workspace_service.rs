@@ -3733,7 +3733,8 @@ fn build_issue_prompt(
     } else {
         "7. Do not commit, push, comment, or open/update a pull request until the user explicitly approves publishing.\n\
 8. When the change is ready for review, stage the full task checkout with `git add -A` so new files are included, then stop and ask for permission.\n\
-9. When you do create or update the pull request after approval, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements."
+9. When you do create or update the pull request after approval, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements.\n\
+10. Write the pull request body with actual newlines instead of literal `\\n` escape sequences, and prefer `gh pr create --body-file` or `gh pr edit --body-file` for multiline descriptions."
             .to_string()
     };
     format!(
@@ -8143,6 +8144,11 @@ mod tests {
         assert!(prompt.contains("`type: bug`"));
         assert!(prompt.contains("`type: improvement`"));
         assert!(prompt.contains("`type: enhancement`"));
+        assert!(prompt.contains(
+            "Write the pull request body with actual newlines instead of literal `\\n` escape sequences"
+        ));
+        assert!(prompt.contains("`gh pr create --body-file`"));
+        assert!(prompt.contains("`gh pr edit --body-file`"));
     }
 
     #[test]
