@@ -11,8 +11,7 @@ pub(crate) fn started_workspace_attach_ready(
         return (false, None);
     }
 
-    if snapshot.root_session_id.is_some() || codex_workspace_reachable_without_root_thread(snapshot)
-    {
+    if snapshot.root_session_id.is_some() {
         return (true, None);
     }
 
@@ -23,16 +22,6 @@ pub(crate) fn started_workspace_attach_ready(
         }
         Some(_) => (true, None),
     }
-}
-
-fn codex_workspace_reachable_without_root_thread(snapshot: &WorkspaceSnapshot) -> bool {
-    snapshot
-        .transient
-        .as_ref()
-        .and_then(|transient| url::Url::parse(&transient.uri).ok())
-        .is_some_and(|uri| matches!(uri.scheme(), "ws" | "wss"))
-        && snapshot.root_session_id.is_none()
-        && snapshot.root_session_status.is_some()
 }
 
 pub(crate) async fn read_machine_cpu_totals() -> io::Result<ProcCpuTotals> {

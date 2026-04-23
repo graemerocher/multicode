@@ -100,10 +100,6 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
   run)
-    if [ "${MULTICODE_FAKE_CONTAINER_XPC_INVALID_ONCE:-}" = "1" ] && [ ! -e "$root/system-started" ]; then
-      printf 'Error: interrupted: "XPC connection error: Connection invalid"\n' >&2
-      exit 1
-    fi
     name=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
@@ -123,14 +119,6 @@ case "$cmd" in
   rm)
     if [ "${1:-}" = "-f" ] && [ -n "${2:-}" ]; then
       rm -f "$state_dir/$2"
-    fi
-    ;;
-  system)
-    if [ "${1:-}" = "start" ]; then
-      : > "$root/system-started"
-    elif [ "${1:-}" = "dns" ] && [ "${2:-}" = "list" ]; then
-      printf 'DOMAIN\n'
-      printf '%s\n' "${MULTICODE_FAKE_CONTAINER_DNS_DOMAIN:-host.multicode.test}"
     fi
     ;;
   inspect)
@@ -210,6 +198,7 @@ fn starts_and_stops_workspace_with_apple_container_backend() {
         let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
         let _fake_root_guard =
             EnvVarGuard::set("MULTICODE_FAKE_CONTAINER_ROOT", &fake_container_root);
+
         let config_path = root.path().join("config.toml");
         fs::write(
             &config_path,
@@ -260,7 +249,7 @@ cpu = "300%"
             .expect("transient snapshot should be present");
         assert_eq!(transient.runtime.backend, RuntimeBackend::AppleContainer);
         assert!(
-            transient.runtime.id.starts_with("mc-alpha-"),
+            transient.runtime.id.starts_with("multicode-alpha-"),
             "apple runtime id should include the workspace key and a unique suffix"
         );
         assert!(transient.uri.starts_with("http://opencode:"));
@@ -287,7 +276,6 @@ cpu = "300%"
         assert!(env_contents.contains("OPENCODE_SERVER_USERNAME=opencode"));
         assert!(env_contents.contains("OPENCODE_SERVER_PASSWORD="));
         assert!(env_contents.contains(&format!("HOME={}", home.display())));
-        assert!(env_contents.contains("TESTCONTAINERS_HOST_OVERRIDE=host.multicode.test"));
 
         service
             .stop_workspace("alpha")
@@ -318,109 +306,6 @@ cpu = "300%"
                 .iter()
                 .any(|line| line == &format!("rm -f {}", transient.runtime.id)),
             "stop should remove the container"
-        );
-    });
-}
-
-#[test]
-fn start_workspace_retries_after_xpc_invalid_by_starting_container_system() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime should build");
-
-    runtime.block_on(async {
-        let _env_lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let root = TestDir::new();
-        let workspace_directory = root.path().join("workspaces");
-        let home = root.path().join("home");
-        let runtime_dir = root.path().join("runtime");
-        let bin_dir = root.path().join("bin");
-        let fake_container_root = root.path().join("fake-container");
-        fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
-        fs::create_dir_all(&home).expect("home should exist");
-        fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
-        fs::create_dir_all(&bin_dir).expect("bin dir should exist");
-        fs::create_dir_all(&fake_container_root).expect("fake container root should exist");
-
-        write_fake_container_cli(&bin_dir.join("container"));
-        write_fake_opencode(&bin_dir.join("opencode"));
-
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        let test_path = format!("{}:{}", bin_dir.display(), old_path);
-        let _path_guard = EnvVarGuard::set("PATH", &test_path);
-        let _container_guard =
-            EnvVarGuard::set("MULTICODE_CONTAINER_COMMAND", bin_dir.join("container"));
-        let _port_guard = EnvVarGuard::set("MULTICODE_FIXED_PORT", "43126");
-        let _home_guard = EnvVarGuard::set("HOME", &home);
-        let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
-        let _fake_root_guard =
-            EnvVarGuard::set("MULTICODE_FAKE_CONTAINER_ROOT", &fake_container_root);
-        let _xpc_guard = EnvVarGuard::set("MULTICODE_FAKE_CONTAINER_XPC_INVALID_ONCE", "1");
-
-        let config_path = root.path().join("config.toml");
-        fs::write(
-            &config_path,
-            format!(
-                r#"workspace-directory = "{workspace_directory}"
-opencode = ["opencode"]
-
-[runtime]
-backend = "apple-container"
-image = "ghcr.io/example/multicode-java25:latest"
-
-[isolation]
-inherit-env = ["HOME", "XDG_RUNTIME_DIR", "PATH"]
-"#,
-                workspace_directory = workspace_directory.display(),
-            ),
-        )
-        .expect("config should be written");
-
-        let service = CombinedService::from_config_path(&config_path)
-            .await
-            .expect("combined service should start");
-        service
-            .create_workspace("alpha")
-            .await
-            .expect("workspace should be created");
-        service
-            .start_workspace("alpha")
-            .await
-            .expect("workspace should start after recovering the Apple container backend");
-
-        let transient = service
-            .manager
-            .get_workspace("alpha")
-            .expect("workspace should exist")
-            .subscribe()
-            .borrow()
-            .clone()
-            .transient
-            .expect("transient snapshot should be present");
-        assert_eq!(transient.runtime.backend, RuntimeBackend::AppleContainer);
-
-        let commands = read_commands(&fake_container_root.join("commands.log"));
-        let system_start_index = commands
-            .iter()
-            .position(|line| line == "system start")
-            .expect("container system start should be attempted after XPC failure");
-        let run_indices = commands
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| line.starts_with("run ").then_some(index))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            run_indices.len(),
-            2,
-            "workspace start should retry the container run after system start"
-        );
-        assert!(
-            run_indices[0] < system_start_index && system_start_index < run_indices[1],
-            "container system start should happen between the failed and retried run"
         );
     });
 }
@@ -478,6 +363,7 @@ fn starts_workspace_with_apple_container_backend_and_codex_provider() {
         let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
         let _fake_root_guard =
             EnvVarGuard::set("MULTICODE_FAKE_CONTAINER_ROOT", &fake_container_root);
+
         let config_path = root.path().join("config.toml");
         fs::write(
             &config_path,
@@ -533,17 +419,7 @@ cpu = "300%"
             .clone()
             .expect("transient snapshot should be present");
         assert_eq!(transient.runtime.backend, RuntimeBackend::AppleContainer);
-        let parsed_uri = url::Url::parse(&transient.uri).expect("codex transient URI should parse");
-        assert_eq!(parsed_uri.scheme(), "ws");
-        assert_eq!(parsed_uri.host_str(), Some("127.0.0.1"));
-        assert_eq!(parsed_uri.port(), Some(43124));
-        assert_eq!(
-            parsed_uri
-                .query_pairs()
-                .find(|(name, _)| name == "multicode-container-id")
-                .map(|(_, value)| value.into_owned()),
-            Some(transient.runtime.id.clone())
-        );
+        assert!(transient.uri.starts_with("ws://127.0.0.1:43124"));
 
         let commands = read_commands(&fake_container_root.join("commands.log"));
         let run_command = commands
@@ -565,7 +441,6 @@ cpu = "300%"
             fs::read_to_string(&server_env).expect("server env file should be written");
         assert!(env_contents.contains("CODEX_HOME=/multicode-agent/codex-home"));
         assert!(env_contents.contains(&format!("HOME={}", home.display())));
-        assert!(env_contents.contains("TESTCONTAINERS_HOST_OVERRIDE=host.multicode.test"));
         let server_env_mode = fs::metadata(&server_env)
             .expect("server env metadata should exist")
             .permissions()

@@ -159,28 +159,10 @@ pub(crate) fn workspace_attach_target(snapshot: &WorkspaceSnapshot) -> io::Resul
         .map_err(|err| io::Error::other(format!("workspace attach URI is invalid: {err}")))?;
 
     if matches!(parsed.scheme(), "ws" | "wss") {
-        return Ok(
-            match snapshot
-                .transient
-                .as_ref()
-                .map(|transient| transient.runtime.backend)
-            {
-                Some(multicode_lib::RuntimeBackend::AppleContainer) => {
-                    AttachTarget::CodexContainerExec {
-                        runtime_id: snapshot
-                            .transient
-                            .as_ref()
-                            .map(|transient| transient.runtime.id.clone())
-                            .unwrap_or_default(),
-                        thread_id: snapshot.root_session_id.clone(),
-                    }
-                }
-                _ => AttachTarget::Codex {
-                    uri: parsed.to_string(),
-                    thread_id: snapshot.root_session_id.clone(),
-                },
-            },
-        );
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: snapshot.root_session_id.clone(),
+        });
     }
 
     let username = parsed.username().to_string();
@@ -234,28 +216,10 @@ pub(crate) fn task_attach_target(
         .ok_or_else(|| io::Error::other("task does not have a resumable session yet"))?;
 
     if matches!(parsed.scheme(), "ws" | "wss") {
-        return Ok(
-            match snapshot
-                .transient
-                .as_ref()
-                .map(|transient| transient.runtime.backend)
-            {
-                Some(multicode_lib::RuntimeBackend::AppleContainer) => {
-                    AttachTarget::CodexContainerExec {
-                        runtime_id: snapshot
-                            .transient
-                            .as_ref()
-                            .map(|transient| transient.runtime.id.clone())
-                            .unwrap_or_default(),
-                        thread_id: Some(session_id),
-                    }
-                }
-                _ => AttachTarget::Codex {
-                    uri: parsed.to_string(),
-                    thread_id: Some(session_id),
-                },
-            },
-        );
+        return Ok(AttachTarget::Codex {
+            uri: parsed.to_string(),
+            thread_id: Some(session_id),
+        });
     }
 
     let username = parsed.username().to_string();
@@ -383,64 +347,25 @@ pub(crate) fn attach_cli_args(agent_command: &str, target: &AttachTarget) -> Vec
             args
         }
         AttachTarget::Codex { uri, thread_id } => {
-            let mut args = codex_interactive_base_args(agent_command);
-            args.push("resume".to_string());
-            args.push("--remote".to_string());
-            args.push(uri.clone());
+            let mut args = vec![
+                agent_command.to_string(),
+                "resume".to_string(),
+                "--remote".to_string(),
+                uri.clone(),
+            ];
             if let Some(thread_id) = thread_id.as_deref() {
                 args.push(thread_id.to_string());
             } else {
                 args.push("--last".to_string());
-            }
-            args
-        }
-        AttachTarget::CodexContainerExec {
-            runtime_id,
-            thread_id,
-        } => {
-            let mut args = vec![
-                container_program(),
-                "exec".to_string(),
-                "--tty".to_string(),
-                "--interactive".to_string(),
-                runtime_id.clone(),
-                "codex".to_string(),
-            ];
-            args.extend(codex_interactive_args_after_binary(["resume".to_string()]));
-            if let Some(thread_id) = thread_id.as_deref() {
-                args.push(thread_id.to_string());
-            } else {
-                args.push("--last".to_string());
-            }
-            args
-        }
-        AttachTarget::CodexContainerNew {
-            runtime_id,
-            cwd,
-            prompt,
-        } => {
-            let mut args = vec![
-                container_program(),
-                "exec".to_string(),
-                "--tty".to_string(),
-                "--interactive".to_string(),
-            ];
-            if let Some(cwd) = cwd.as_deref() {
-                args.push("--workdir".to_string());
-                args.push(cwd.to_string());
-            }
-            args.push(runtime_id.clone());
-            args.push("codex".to_string());
-            args.extend(codex_interactive_args_after_binary(Vec::new()));
-            if let Some(prompt) = prompt.as_deref() {
-                args.push(prompt.to_string());
             }
             args
         }
         AttachTarget::CodexNew { uri, cwd, prompt } => {
-            let mut args = codex_interactive_base_args(agent_command);
-            args.push("--remote".to_string());
-            args.push(uri.clone());
+            let mut args = vec![
+                agent_command.to_string(),
+                "--remote".to_string(),
+                uri.clone(),
+            ];
             if let Some(cwd) = cwd.as_deref() {
                 args.push("-C".to_string());
                 args.push(cwd.to_string());
@@ -491,100 +416,17 @@ pub(crate) async fn attach_in_tmux(
         session_env.push(("OPENCODE_SERVER_USERNAME".to_string(), username.to_string()));
         session_env.push(("OPENCODE_SERVER_PASSWORD".to_string(), password.to_string()));
     }
-    let effective_cwd = attach_tmux_cwd(target, cwd);
     let mut attach_command = tmux_session_command(attach_env, None);
-    attach_command.extend(match target {
-        AttachTarget::CodexContainerExec {
-            runtime_id,
-            thread_id,
-        } => {
-            let mut args = vec![
-                container_program(),
-                "exec".to_string(),
-                "--tty".to_string(),
-                "--interactive".to_string(),
-            ];
-            if let Some(cwd) = effective_cwd {
-                args.push("--workdir".to_string());
-                args.push(cwd.to_string_lossy().into_owned());
-            }
-            args.push(runtime_id.clone());
-            args.push("codex".to_string());
-            args.extend(codex_interactive_args_after_binary(["resume".to_string()]));
-            if let Some(thread_id) = thread_id.as_deref() {
-                args.push(thread_id.to_string());
-            } else {
-                args.push("--last".to_string());
-            }
-            args
-        }
-        AttachTarget::CodexContainerNew {
-            runtime_id,
-            cwd: target_cwd,
-            prompt,
-        } => {
-            let mut args = vec![
-                container_program(),
-                "exec".to_string(),
-                "--tty".to_string(),
-                "--interactive".to_string(),
-            ];
-            if let Some(cwd) = target_cwd
-                .as_deref()
-                .map(std::borrow::Cow::from)
-                .or_else(|| {
-                    effective_cwd
-                        .map(|cwd| std::borrow::Cow::from(cwd.to_string_lossy().into_owned()))
-                })
-            {
-                args.push("--workdir".to_string());
-                args.push(cwd.into_owned());
-            }
-            args.push(runtime_id.clone());
-            args.push("codex".to_string());
-            args.extend(codex_interactive_args_after_binary(Vec::new()));
-            if let Some(prompt) = prompt.as_deref() {
-                args.push(prompt.to_string());
-            }
-            args
-        }
-        _ => attach_cli_args(agent_command, target),
-    });
+    attach_command.extend(attach_cli_args(agent_command, target));
     run_tmux_new_session_command(
         terminal,
         &session_env,
         attach_command,
-        effective_cwd,
+        cwd,
         workspace_key,
         custom_description,
     )
     .await
-}
-
-pub(crate) fn attach_tmux_cwd<'a>(
-    target: &AttachTarget,
-    cwd: Option<&'a Path>,
-) -> Option<&'a Path> {
-    match target {
-        AttachTarget::Codex { .. } | AttachTarget::CodexContainerExec { .. } => None,
-        _ => cwd,
-    }
-}
-
-fn container_program() -> String {
-    std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
-}
-
-fn codex_interactive_base_args(agent_command: &str) -> Vec<String> {
-    let mut args = vec![agent_command.to_string()];
-    args.extend(codex_interactive_args_after_binary(Vec::new()));
-    args
-}
-
-fn codex_interactive_args_after_binary(rest: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut args = Vec::new();
-    args.extend(rest);
-    args
 }
 
 pub(crate) async fn run_tmux_new_session_command(

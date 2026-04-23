@@ -12,8 +12,8 @@ mod tests {
     use super::*;
     use crate::app::{
         CODEX_CREATE_PR_APPROVAL_PROMPT,
-        build_codex_fix_ci_prompt, build_fresh_codex_attach_target, compact_github_tooltip_target,
-        count_codex_session_turn_metrics, github_repository_spec, github_repository_url,
+        build_codex_fix_ci_prompt, compact_github_tooltip_target, count_codex_session_turn_metrics,
+        github_repository_spec, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,
@@ -31,7 +31,7 @@ mod tests {
         pr_review_icon_color,
     };
     use crate::ops::{
-        SessionWaitState, attach_cli_args, attach_tmux_cwd, build_handler_command, command_exists,
+        SessionWaitState, attach_cli_args, build_handler_command, command_exists,
         compare_tool_is_available, compare_tool_name, session_wait_state_for_entry,
         task_attach_target, tmux_session_command, tmux_status_left, validate_workspace_link_target,
         workspace_attach_target, workspace_ordering,
@@ -203,16 +203,6 @@ mod tests {
     }
 
     fn snapshot(started: bool, uri: Option<&str>) -> WorkspaceSnapshot {
-        let root_session_status = if started
-            && uri.is_some_and(|uri| {
-                url::Url::parse(uri)
-                    .ok()
-                    .is_some_and(|uri| matches!(uri.scheme(), "ws" | "wss"))
-            }) {
-            Some(RootSessionStatus::Idle)
-        } else {
-            None
-        };
         WorkspaceSnapshot {
             persistent: PersistentWorkspaceSnapshot::default(),
             transient: uri.map(|uri| TransientWorkspaceSnapshot {
@@ -231,7 +221,7 @@ mod tests {
             }),
             root_session_id: None,
             root_session_title: None,
-            root_session_status,
+            root_session_status: None,
             automation_session_id: None,
             automation_session_status: None,
             automation_agent_state: None,
@@ -1031,77 +1021,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_attach_target_uses_container_exec_for_apple_container_codex() {
-        let mut started = snapshot(
-            false,
-            Some("ws://127.0.0.1:3456/?multicode-container-id=ctr-1"),
-        );
-        started.root_session_id = Some("thread-123".to_string());
-        started
-            .transient
-            .as_mut()
-            .expect("transient snapshot should exist")
-            .runtime = RuntimeHandleSnapshot {
-            backend: RuntimeBackend::AppleContainer,
-            id: "ctr-1".to_string(),
-            metadata: Default::default(),
-        };
-
-        let target = workspace_attach_target(&started)
-            .expect("apple-container codex workspace should use container exec attach target");
-
-        assert_eq!(
-            target,
-            AttachTarget::CodexContainerExec {
-                runtime_id: "ctr-1".to_string(),
-                thread_id: Some("thread-123".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn codex_workspace_state_is_started_when_root_status_is_known_without_thread_id() {
-        let mut started = snapshot(false, Some("ws://127.0.0.1:3456/"));
-        started.root_session_status = Some(RootSessionStatus::Idle);
-
-        assert_eq!(workspace_state(&started), WorkspaceUiState::Started);
-    }
-
-    #[test]
-    fn snapshot_attach_target_for_selection_starts_fresh_codex_when_root_thread_is_missing() {
-        let mut started = snapshot(
-            false,
-            Some("ws://127.0.0.1:3456/?multicode-container-id=ctr-1"),
-        );
-        started
-            .transient
-            .as_mut()
-            .expect("transient snapshot should exist")
-            .runtime = RuntimeHandleSnapshot {
-            backend: RuntimeBackend::AppleContainer,
-            id: "ctr-1".to_string(),
-            metadata: Default::default(),
-        };
-        started.root_session_status = Some(RootSessionStatus::Idle);
-
-        let target = build_fresh_codex_attach_target(
-            &started,
-            Some("/tmp/task".to_string()),
-            Some("Continue work on this task.".to_string()),
-        )
-        .expect("fresh codex attach target should be created");
-
-        assert_eq!(
-            target,
-            AttachTarget::CodexContainerNew {
-                runtime_id: "ctr-1".to_string(),
-                cwd: Some("/tmp/task".to_string()),
-                prompt: Some("Continue work on this task.".to_string()),
-            }
-        );
-    }
-
-    #[test]
     fn task_attach_target_uses_task_session_for_opencode() {
         let started = snapshot(true, Some("http://opencode:secret@127.0.0.1:3000/"));
         let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
@@ -1139,39 +1058,6 @@ mod tests {
             target,
             AttachTarget::Codex {
                 uri: "ws://127.0.0.1:3456/".to_string(),
-                thread_id: Some("thread-task-1".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn task_attach_target_uses_container_exec_for_apple_container_codex() {
-        let mut started = snapshot(
-            false,
-            Some("ws://127.0.0.1:3456/?multicode-container-id=ctr-1"),
-        );
-        started.root_session_id = Some("thread-root".to_string());
-        started
-            .transient
-            .as_mut()
-            .expect("transient snapshot should exist")
-            .runtime = RuntimeHandleSnapshot {
-            backend: RuntimeBackend::AppleContainer,
-            id: "ctr-1".to_string(),
-            metadata: Default::default(),
-        };
-        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
-            session_id: Some("thread-task-1".to_string()),
-            ..Default::default()
-        };
-
-        let target = task_attach_target(&started, &task_state)
-            .expect("task attach target should use container exec for apple-container codex");
-
-        assert_eq!(
-            target,
-            AttachTarget::CodexContainerExec {
-                runtime_id: "ctr-1".to_string(),
                 thread_id: Some("thread-task-1".to_string()),
             }
         );
@@ -1471,28 +1357,6 @@ mod tests {
     }
 
     #[test]
-    fn attach_cli_args_use_container_exec_for_apple_container_codex_target() {
-        let target = AttachTarget::CodexContainerExec {
-            runtime_id: "ctr-1".to_string(),
-            thread_id: Some("thread-123".to_string()),
-        };
-
-        assert_eq!(
-            attach_cli_args("codex", &target),
-            vec![
-                "container".to_string(),
-                "exec".to_string(),
-                "--tty".to_string(),
-                "--interactive".to_string(),
-                "ctr-1".to_string(),
-                "codex".to_string(),
-                "resume".to_string(),
-                "thread-123".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn attach_cli_args_use_last_for_codex_when_thread_is_unavailable() {
         let target = AttachTarget::Codex {
             uri: "ws://127.0.0.1:3456".to_string(),
@@ -1529,60 +1393,6 @@ mod tests {
                 "/tmp/task".to_string(),
                 "Continue work on this task.".to_string(),
             ]
-        );
-    }
-
-    #[test]
-    fn attach_tmux_cwd_ignores_cwd_for_codex_resume_targets() {
-        let cwd = Path::new("/tmp/task");
-
-        assert_eq!(
-            attach_tmux_cwd(
-                &AttachTarget::Codex {
-                    uri: "ws://127.0.0.1:3456".to_string(),
-                    thread_id: Some("thread-123".to_string()),
-                },
-                Some(cwd),
-            ),
-            None
-        );
-        assert_eq!(
-            attach_tmux_cwd(
-                &AttachTarget::CodexContainerExec {
-                    runtime_id: "ctr-1".to_string(),
-                    thread_id: Some("thread-123".to_string()),
-                },
-                Some(cwd),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn attach_tmux_cwd_preserves_cwd_for_fresh_codex_targets() {
-        let cwd = Path::new("/tmp/task");
-
-        assert_eq!(
-            attach_tmux_cwd(
-                &AttachTarget::CodexNew {
-                    uri: "ws://127.0.0.1:3456".to_string(),
-                    cwd: Some("/tmp/task".to_string()),
-                    prompt: None,
-                },
-                Some(cwd),
-            ),
-            Some(cwd)
-        );
-        assert_eq!(
-            attach_tmux_cwd(
-                &AttachTarget::CodexContainerNew {
-                    runtime_id: "ctr-1".to_string(),
-                    cwd: Some("/tmp/task".to_string()),
-                    prompt: None,
-                },
-                Some(cwd),
-            ),
-            Some(cwd)
         );
     }
 
@@ -3678,17 +3488,6 @@ mod tests {
     fn started_workspace_attach_ready_attaches_immediately_when_root_session_exists() {
         let mut started = snapshot(true, Some("http://example"));
         started.root_session_id = Some("ses-root-latest".to_string());
-        let now = Instant::now();
-
-        let (ready, wait_since) = started_workspace_attach_ready(&started, None, now);
-
-        assert!(ready);
-        assert_eq!(wait_since, None);
-    }
-
-    #[test]
-    fn started_workspace_attach_ready_attaches_immediately_when_codex_session_is_reachable() {
-        let started = snapshot(true, Some("ws://127.0.0.1:31337"));
         let now = Instant::now();
 
         let (ready, wait_since) = started_workspace_attach_ready(&started, None, now);

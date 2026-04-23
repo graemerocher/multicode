@@ -357,15 +357,6 @@ enum AttachTarget {
         uri: String,
         thread_id: Option<String>,
     },
-    CodexContainerExec {
-        runtime_id: String,
-        thread_id: Option<String>,
-    },
-    CodexContainerNew {
-        runtime_id: String,
-        cwd: Option<String>,
-        prompt: Option<String>,
-    },
     CodexNew {
         uri: String,
         cwd: Option<String>,
@@ -398,9 +389,7 @@ fn workspace_state(snapshot: &WorkspaceSnapshot) -> WorkspaceUiState {
         .as_ref()
         .and_then(|transient| url::Url::parse(&transient.uri).ok())
         .map(|uri| match uri.scheme() {
-            "ws" | "wss" => {
-                snapshot.root_session_status.is_some() || snapshot.root_session_id.is_some()
-            }
+            "ws" | "wss" => snapshot.root_session_id.is_some(),
             _ => snapshot.opencode_client.is_some(),
         })
         .unwrap_or(false);

@@ -5,7 +5,7 @@ use tokio::sync::broadcast;
 use super::{
     codex_app_server::{
         CodexAppServerClient, CodexServerNotification, CodexThread,
-        codex_app_server_endpoint_from_transient, forward_codex_notifications_forever,
+        forward_codex_notifications_forever,
     },
     config::CodexAgentConfig,
     workspace_task_watch::watch_workspace_task,
@@ -63,13 +63,12 @@ async fn watch_workspace_snapshot(
         workspace_rx,
         |snapshot| {
             let transient = snapshot.transient.as_ref()?;
-            let endpoint = codex_app_server_endpoint_from_transient(transient);
-            let parsed = url::Url::parse(&endpoint).ok()?;
+            let parsed = url::Url::parse(&transient.uri).ok()?;
             if !matches!(parsed.scheme(), "ws" | "wss") {
                 return None;
             }
             Some(RootSessionTaskKey {
-                uri: endpoint,
+                uri: transient.uri.clone(),
                 cwd: cwd.clone(),
             })
         },
@@ -117,7 +116,12 @@ fn clear_root_session_on_uri_change(
     }
 
     workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, next_key.uri.as_str()) {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(next_key.uri.as_str())
+        {
             return false;
         }
         let changed = snapshot.root_session_id.is_some()
@@ -173,7 +177,12 @@ async fn sync_root_session(
                     }
                     Ok(CodexServerNotification::ThreadStatusChanged { thread_id, status }) => {
                         workspace.update(|snapshot| {
-                            if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
+                            if snapshot
+                                .transient
+                                .as_ref()
+                                .map(|transient| transient.uri.as_str())
+                                != Some(key.uri.as_str())
+                            {
                                 return false;
                             }
                             if snapshot.root_session_id.as_deref() != Some(thread_id.as_str()) {
@@ -266,10 +275,6 @@ async fn refresh_root_session(
     );
 
     let current_root_session_id = workspace.subscribe().borrow().root_session_id.clone();
-    if current_root_session_id.is_none() && response.data.is_empty() {
-        mark_root_session_reachable(workspace, key);
-        return;
-    }
     let thread = match select_thread_for_tracking(
         current_root_session_id.as_deref(),
         &response.data,
@@ -394,7 +399,12 @@ fn update_from_started_thread(
     active_turn_thread_id: Option<&str>,
 ) {
     workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
             return false;
         }
         if snapshot.root_session_id.is_some()
@@ -426,7 +436,12 @@ fn update_from_thread(
     active_turn_thread_id: Option<&str>,
 ) {
     workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
             return false;
         }
 
@@ -454,7 +469,12 @@ fn update_from_read(
     active_turn_thread_id: Option<&str>,
 ) {
     workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
             return false;
         }
         if snapshot.root_session_id.as_deref() != Some(thread_id) {
@@ -477,7 +497,12 @@ fn clear_tracked_root_session(
     expected_thread_id: Option<&str>,
 ) {
     workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
+        if snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.as_str())
+            != Some(key.uri.as_str())
+        {
             return false;
         }
         if expected_thread_id.is_some() && snapshot.root_session_id.as_deref() != expected_thread_id
@@ -492,28 +517,6 @@ fn clear_tracked_root_session(
         snapshot.root_session_status = None;
         changed
     });
-}
-
-fn mark_root_session_reachable(workspace: &Workspace, key: &RootSessionTaskKey) {
-    workspace.update(|snapshot| {
-        if !snapshot_matches_key_uri(snapshot, key.uri.as_str()) {
-            return false;
-        }
-        let changed = snapshot.root_session_title.as_deref() != Some("Codex")
-            || snapshot.root_session_status != Some(RootSessionStatus::Idle);
-        snapshot.root_session_title = Some("Codex".to_string());
-        snapshot.root_session_status = Some(RootSessionStatus::Idle);
-        changed
-    });
-}
-
-fn snapshot_matches_key_uri(snapshot: &crate::WorkspaceSnapshot, key_uri: &str) -> bool {
-    snapshot
-        .transient
-        .as_ref()
-        .map(codex_app_server_endpoint_from_transient)
-        .as_deref()
-        == Some(key_uri)
 }
 
 fn effective_status(
@@ -641,7 +644,7 @@ mod tests {
         let workspace = WorkspaceSnapshot::default();
         let workspace = crate::manager::Workspace::new(workspace);
         let key = RootSessionTaskKey {
-            uri: "ws://127.0.0.1:31337/?multicode-container-id=runtime-1".to_string(),
+            uri: "ws://127.0.0.1:31337".to_string(),
             cwd: "/tmp/workspace".to_string(),
         };
         workspace.update(|snapshot| {
@@ -665,69 +668,5 @@ mod tests {
         assert_eq!(snapshot.root_session_id, None);
         assert_eq!(snapshot.root_session_title, None);
         assert_eq!(snapshot.root_session_status, None);
-    }
-
-    #[test]
-    fn update_from_started_thread_matches_apple_container_endpoint_with_query_param() {
-        let workspace = WorkspaceSnapshot::default();
-        let workspace = crate::manager::Workspace::new(workspace);
-        workspace.update(|snapshot| {
-            snapshot.transient = Some(TransientWorkspaceSnapshot {
-                uri: "ws://127.0.0.1:31337".to_string(),
-                runtime: RuntimeHandleSnapshot {
-                    backend: RuntimeBackend::AppleContainer,
-                    id: "runtime-1".to_string(),
-                    metadata: Default::default(),
-                },
-            });
-            true
-        });
-
-        update_from_started_thread(
-            &workspace,
-            &RootSessionTaskKey {
-                uri: "ws://127.0.0.1:31337/?multicode-container-id=runtime-1".to_string(),
-                cwd: "/tmp/workspace".to_string(),
-            },
-            &CodexThread {
-                id: "thread-1".to_string(),
-                title: Some("Root".to_string()),
-                status: CodexThreadStatus::Idle,
-            },
-            None,
-        );
-
-        let snapshot = workspace.subscribe().borrow().clone();
-        assert_eq!(snapshot.root_session_id.as_deref(), Some("thread-1"));
-        assert_eq!(snapshot.root_session_title.as_deref(), Some("Root"));
-        assert_eq!(snapshot.root_session_status, Some(RootSessionStatus::Idle));
-    }
-
-    #[test]
-    fn mark_root_session_reachable_sets_idle_when_no_root_thread_exists() {
-        let workspace = WorkspaceSnapshot::default();
-        let workspace = crate::manager::Workspace::new(workspace);
-        let key = RootSessionTaskKey {
-            uri: "ws://127.0.0.1:31337/?multicode-container-id=runtime-1".to_string(),
-            cwd: "/tmp/workspace".to_string(),
-        };
-        workspace.update(|snapshot| {
-            snapshot.transient = Some(TransientWorkspaceSnapshot {
-                uri: "ws://127.0.0.1:31337".to_string(),
-                runtime: RuntimeHandleSnapshot {
-                    backend: RuntimeBackend::AppleContainer,
-                    id: "runtime-1".to_string(),
-                    metadata: Default::default(),
-                },
-            });
-            true
-        });
-
-        mark_root_session_reachable(&workspace, &key);
-
-        let snapshot = workspace.subscribe().borrow().clone();
-        assert_eq!(snapshot.root_session_id, None);
-        assert_eq!(snapshot.root_session_title.as_deref(), Some("Codex"));
-        assert_eq!(snapshot.root_session_status, Some(RootSessionStatus::Idle));
     }
 }
