@@ -14,7 +14,13 @@ solve, but still take time to understand, debug and fix. AI agents can solve man
 ## Running
 
 ```bash
-cargo run --bin multicode-tui config.toml
+cargo run --bin multicode-tui -- config.toml
+```
+
+To run with the Codex-focused example config in this repository:
+
+```bash
+cargo run --bin multicode-tui -- config.codex.yml
 ```
 
 ## Editor Tool
