@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -121,6 +122,12 @@ case "$cmd" in
       rm -f "$state_dir/$2"
     fi
     ;;
+  system)
+    if [ "${1:-}" = "dns" ] && [ "${2:-}" = "list" ]; then
+      printf 'DOMAIN\n'
+      printf '%s\n' "${MULTICODE_FAKE_CONTAINER_DNS_DOMAIN:-host.multicode.test}"
+    fi
+    ;;
   inspect)
     if [ -n "${1:-}" ] && [ -e "$state_dir/$1" ]; then
       printf '[{\"status\":\"running\"}]\n'
@@ -153,6 +160,18 @@ fn write_fake_codex(path: &Path) {
     make_executable(path);
 }
 
+fn write_fake_docker_cli(path: &Path, context_host: &str) {
+    fs::write(
+        path,
+        format!(
+            "#!/bin/bash\nset -euo pipefail\nif [ \"$1\" = \"context\" ] && [ \"$2\" = \"inspect\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            context_host
+        ),
+    )
+    .expect("fake docker should be written");
+    make_executable(path);
+}
+
 fn read_commands(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .expect("commands log should be readable")
@@ -179,6 +198,8 @@ fn starts_and_stops_workspace_with_apple_container_backend() {
         let runtime_dir = root.path().join("runtime");
         let bin_dir = root.path().join("bin");
         let fake_container_root = root.path().join("fake-container");
+        let docker_socket =
+            std::env::temp_dir().join(format!("mc-it-docker-{}.sock", std::process::id()));
         fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
         fs::create_dir_all(&home).expect("home should exist");
         fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
@@ -187,12 +208,19 @@ fn starts_and_stops_workspace_with_apple_container_backend() {
 
         write_fake_container_cli(&bin_dir.join("container"));
         write_fake_opencode(&bin_dir.join("opencode"));
+        write_fake_docker_cli(
+            &bin_dir.join("docker"),
+            &format!("unix://{}", docker_socket.display()),
+        );
+        let _docker_listener =
+            UnixListener::bind(&docker_socket).expect("docker socket should bind");
 
         let old_path = std::env::var("PATH").unwrap_or_default();
         let test_path = format!("{}:{}", bin_dir.display(), old_path);
         let _path_guard = EnvVarGuard::set("PATH", &test_path);
         let _container_guard =
             EnvVarGuard::set("MULTICODE_CONTAINER_COMMAND", bin_dir.join("container"));
+        let _docker_guard = EnvVarGuard::set("MULTICODE_DOCKER_COMMAND", bin_dir.join("docker"));
         let _port_guard = EnvVarGuard::set("MULTICODE_FIXED_PORT", "43123");
         let _home_guard = EnvVarGuard::set("HOME", &home);
         let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
@@ -249,7 +277,7 @@ cpu = "300%"
             .expect("transient snapshot should be present");
         assert_eq!(transient.runtime.backend, RuntimeBackend::AppleContainer);
         assert!(
-            transient.runtime.id.starts_with("multicode-alpha-"),
+            transient.runtime.id.starts_with("mc-alpha-"),
             "apple runtime id should include the workspace key and a unique suffix"
         );
         assert!(transient.uri.starts_with("http://opencode:"));
@@ -276,6 +304,8 @@ cpu = "300%"
         assert!(env_contents.contains("OPENCODE_SERVER_USERNAME=opencode"));
         assert!(env_contents.contains("OPENCODE_SERVER_PASSWORD="));
         assert!(env_contents.contains(&format!("HOME={}", home.display())));
+        assert!(env_contents.contains("DOCKER_HOST=unix:///var/run/docker.sock"));
+        assert!(env_contents.contains("TESTCONTAINERS_HOST_OVERRIDE=host.multicode.test"));
 
         service
             .stop_workspace("alpha")
@@ -329,6 +359,8 @@ fn starts_workspace_with_apple_container_backend_and_codex_provider() {
         let bin_dir = root.path().join("bin");
         let fake_container_root = root.path().join("fake-container");
         let host_codex_dir = home.join(".codex");
+        let docker_socket =
+            std::env::temp_dir().join(format!("mc-it-codex-docker-{}.sock", std::process::id()));
         fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
         fs::create_dir_all(&home).expect("home should exist");
         fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
@@ -338,6 +370,12 @@ fn starts_workspace_with_apple_container_backend_and_codex_provider() {
 
         write_fake_container_cli(&bin_dir.join("container"));
         write_fake_codex(&bin_dir.join("codex"));
+        write_fake_docker_cli(
+            &bin_dir.join("docker"),
+            &format!("unix://{}", docker_socket.display()),
+        );
+        let _docker_listener =
+            UnixListener::bind(&docker_socket).expect("docker socket should bind");
         fs::write(
             host_codex_dir.join("config.toml"),
             "model = \"gpt-5-codex\"\n",
@@ -358,6 +396,7 @@ fn starts_workspace_with_apple_container_backend_and_codex_provider() {
         let _path_guard = EnvVarGuard::set("PATH", &test_path);
         let _container_guard =
             EnvVarGuard::set("MULTICODE_CONTAINER_COMMAND", bin_dir.join("container"));
+        let _docker_guard = EnvVarGuard::set("MULTICODE_DOCKER_COMMAND", bin_dir.join("docker"));
         let _port_guard = EnvVarGuard::set("MULTICODE_FIXED_PORT", "43124");
         let _home_guard = EnvVarGuard::set("HOME", &home);
         let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
@@ -441,6 +480,8 @@ cpu = "300%"
             fs::read_to_string(&server_env).expect("server env file should be written");
         assert!(env_contents.contains("CODEX_HOME=/multicode-agent/codex-home"));
         assert!(env_contents.contains(&format!("HOME={}", home.display())));
+        assert!(env_contents.contains("DOCKER_HOST=unix:///var/run/docker.sock"));
+        assert!(env_contents.contains("TESTCONTAINERS_HOST_OVERRIDE=host.multicode.test"));
         let server_env_mode = fs::metadata(&server_env)
             .expect("server env metadata should exist")
             .permissions()
