@@ -19,7 +19,7 @@ For Micronaut projects, also assign the PR to the next Micronaut project release
 - The next available project is typically suffixed with a milestone number, for example `5.0.0-M2`.
 - Otherwise, use the semantically versioned project suffixed with `Release`, for example `5.0.0 Release`.
 
-After assigning the PR to yourself, request a review from Copilot as soon as the PR exists.
+After assigning the PR to yourself, request a review from `copilot-pull-request-reviewer` as a reviewer as soon as the PR exists when that reviewer is available, and verify the request actually succeeded instead of assuming it did. Do not add Copilot, `Copilot`, `github-copilot`, or `copilot-pull-request-reviewer` as an assignee. If Copilot is already assigned to the PR, remove that Copilot assignee while preserving human assignees. If Copilot review is unavailable because of limits or permissions, report that and continue; Copilot review is informative and preferred, not mandatory. Verify final PR metadata so Copilot is absent from assignees and appears only in reviewers/review requests when GitHub accepted the request.
 
 After creating the PR, assigning yourself, and requesting the Copilot review, immediately emit the link to the PR like this:
 

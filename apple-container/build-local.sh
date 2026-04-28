@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
-CODEX_VERSION=${CODEX_VERSION:-0.120}
+CODEX_VERSION=${CODEX_VERSION:-0.125}
 
 container build \
   -t multicode-java25:latest \

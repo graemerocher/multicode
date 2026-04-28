@@ -6,6 +6,22 @@ description: Workflow for independently fixing an issue report. Load only on dem
 It is critical that you use the `machine-readable-clone`, `machine-readable-issue` and `machine-readable-pr` skills 
 where appropriate.
 
+When the Codex session has Multicode subagents available, use them for bounded sidecar work before
+and after risky implementation:
+
+- Use `multicode_code_mapper` to trace unfamiliar state, ownership, or cross-module behavior before editing.
+- Use `multicode_planner_architect` before larger changes that cross state machines, runtime behavior, GitHub status, database schema, or TUI rendering.
+- Use `multicode_github_researcher` to inspect issue, pull request, CI, review, Copilot, or Sonar state without mutating GitHub.
+- Use `multicode_docs_researcher` to verify current external API, framework, or Codex behavior from primary docs.
+- Use `multicode_security_cve` when the issue or CI mentions vulnerabilities, CVEs, authentication, shell commands, dependency upgrades, or isolation.
+- Use `multicode_test_risk` before finalizing to identify focused verification and missing coverage.
+- Use `multicode_qa_scenarios` for user-facing TUI workflows, live checks, and keyboard-action state transitions.
+- Use `multicode_reviewer` for a final read-only review of non-trivial changes before asking for publish approval.
+
+Keep subagent tasks concrete and independent. Do not use subagents as a substitute for doing the
+implementation work in the current checkout, and do not ask read-only subagents to edit, push,
+comment, assign, request review, or merge.
+
 You are given a user-provided issue report. If the issue report is a GitHub issue, also consider comments that people
 have already made to the issue. Your task is to resolve this issue, possibly but not necessarily with a code patch.
 

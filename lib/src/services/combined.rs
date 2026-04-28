@@ -2215,6 +2215,15 @@ pub fn summarize_workspace_start_failure(status: Option<i32>, stderr: &str) -> S
             exit_status_suffix(status),
         );
     }
+    if stderr.contains("XPC connection error: Connection invalid")
+        || stderr.contains("Ensure container system service has been started")
+        || stderr.contains("apiserver is not running")
+    {
+        return format!(
+            "Apple container backend is not running{}; run `container system start` and retry",
+            exit_status_suffix(status),
+        );
+    }
 
     if stderr.is_empty() {
         format!("workspace start failed{}", exit_status_suffix(status))
@@ -2452,6 +2461,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn summarize_workspace_start_failure_reports_apple_container_service_hint() {
+        let summary = summarize_workspace_start_failure(
+            Some(1),
+            r#"Error: internalError: "failed to list containers" (cause: "interrupted: "XPC connection error: Connection invalid"")
+Ensure container system service has been started with `container system start`."#,
+        );
+
+        assert_eq!(
+            summary,
+            "Apple container backend is not running (exit 1); run `container system start` and retry"
+        );
+    }
+
     struct TestDir {
         path: PathBuf,
     }
@@ -2521,7 +2544,7 @@ mod tests {
 
     fn config_with_isolation(workspace_directory: &str) -> String {
         format!(
-            "workspace-directory = \"{workspace_directory}\"\ncreate-ssh-agent = false\n\n[isolation]\n"
+            "workspace-directory = \"{workspace_directory}\"\nopencode = [\"/bin/sh\"]\ncreate-ssh-agent = false\n\n[isolation]\n"
         )
     }
 
@@ -2854,6 +2877,10 @@ token = { keychain-service = "multicode.github", keychain-account = "github-mcp-
             .arg("-C")
             .arg(repo_root)
             .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .status()
             .expect("git command should run");
         assert!(

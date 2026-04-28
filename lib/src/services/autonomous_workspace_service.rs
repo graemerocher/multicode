@@ -20,7 +20,8 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
-    CombinedService, GithubStatus,
+    CombinedService, GithubPrBuildState, GithubPrMergeState, GithubPrReviewState,
+    GithubPrSonarState, GithubPrState, GithubPrStatus, GithubStatus,
     codex_app_server::CodexAppServerClient,
     runtime::{
         automation_state_file_source, automation_task_state_file_source,
@@ -29,9 +30,10 @@ use super::{
     workspace_watch::monitor_workspace_snapshots,
 };
 use crate::{
-    AutomationAgentState, RootSessionStatus, WorkspaceIssueType, WorkspaceManagerError,
-    WorkspaceSnapshot, WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace,
-    opencode, services::config::AgentProvider, workspace_issue_type_glyph,
+    AutomationAgentState, CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS, RootSessionStatus,
+    WorkspaceIssueType, WorkspaceManagerError, WorkspaceSnapshot, WorkspaceTaskGitStatus,
+    WorkspaceTaskPersistentSnapshot, WorkspaceTaskSource, manager::Workspace, opencode,
+    services::config::AgentProvider, workspace_issue_type_glyph,
 };
 
 const ISSUE_PRIORITY_LABELS: [&str; 5] = [
@@ -56,6 +58,7 @@ const IN_PROGRESS_LABEL: &str = "status: in progress";
 const IN_PROGRESS_LABEL_ALIASES: [&str; 2] = [IN_PROGRESS_LABEL, "status: in-progress"];
 const AWAITING_VALIDATION_LABEL: &str = "status: awaiting validation";
 const ISSUE_SCAN_RETRY_DELAY: Duration = Duration::from_secs(60);
+const QUEUED_UNTIL_VM_FREE_STATUS: &str = "Queued until VM is free";
 const DOC_ISSUE_LABELS: [&str; 4] = [
     "type: docs",
     "type:docs",
@@ -221,6 +224,15 @@ async fn watch_workspace(
         )
         .await;
         snapshot = workspace.subscribe().borrow().clone();
+        refresh_task_git_statuses(
+            &service,
+            &workspace,
+            &snapshot,
+            &workspace_key,
+            &assigned_repository,
+        )
+        .await;
+        snapshot = workspace.subscribe().borrow().clone();
         sync_task_issue_status_receivers(&service, &snapshot, &mut task_issue_status_rxs);
         sync_task_pr_status_receivers(&service, &snapshot, &mut task_pr_status_rxs);
         let current_issue_url = active_issue_url_for_snapshot(&snapshot);
@@ -266,42 +278,49 @@ async fn watch_workspace(
             previous_root_status = snapshot.root_session_status;
             continue;
         }
-        let merged_pr_issue_urls =
-            merged_dependency_upgrade_issue_urls(&snapshot, &task_pr_status_rxs);
+        let merged_pr_issue_urls = merged_background_pr_issue_urls(
+            &snapshot,
+            current_issue_url.as_deref(),
+            &task_pr_status_rxs,
+        );
         if !merged_pr_issue_urls.is_empty() {
-            let token = match resolved_gh_token(&service).await {
-                Ok(token) => token,
-                Err(err) => {
-                    set_automation_status(
-                        &workspace,
-                        Some(format!("Merge close failed {repository_label}: {err}")),
-                    );
-                    previous_root_status = snapshot.root_session_status;
-                    if workspace_rx.changed().await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-            };
             for issue_url in &merged_pr_issue_urls {
                 if let Some(task_id) = task_id_for_issue(&snapshot, issue_url) {
                     clear_task_automation_state_file(&service, &workspace_key, &task_id).await;
                 }
-                if let Err(err) = close_dependency_upgrade_issue(
-                    &assigned_repository,
-                    issue_url,
-                    &snapshot,
-                    &token,
-                )
-                .await
+                if task_persistent_snapshot_for_issue(&snapshot, issue_url)
+                    .is_some_and(|task| task.dependency_upgrade_backing_pr)
                 {
-                    tracing::warn!(
-                        workspace_key,
-                        issue_url = %issue_url,
-                        error = %err,
-                        "failed to close dependency-upgrade issue after backing PR merged"
-                    );
-                    continue;
+                    match resolved_gh_token(&service).await {
+                        Ok(token) => {
+                            if let Err(err) = close_dependency_upgrade_issue(
+                                &assigned_repository,
+                                issue_url,
+                                &snapshot,
+                                &token,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    workspace_key,
+                                    issue_url = %issue_url,
+                                    error = %err,
+                                    "failed to close dependency-upgrade issue after backing PR merged"
+                                );
+                                continue;
+                            }
+                        }
+                        Err(err) => {
+                            set_automation_status(
+                                &workspace,
+                                Some(format!("Merge close failed {repository_label}: {err}")),
+                            );
+                            if workspace_rx.changed().await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                 }
                 if let Err(err) = service
                     .remove_workspace_task_checkout(&workspace_key, &assigned_repository, issue_url)
@@ -498,6 +517,36 @@ async fn watch_workspace(
                                 "failed to refresh backing pull requests for existing tasks"
                             );
                         }
+                        match sync_assigned_issue_tasks(
+                            &workspace,
+                            &assigned_repository,
+                            &snapshot
+                                .persistent
+                                .ignored_issue_urls
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            &token,
+                        )
+                        .await
+                        {
+                            Ok(synced) if synced > 0 => {
+                                set_automation_status(
+                                    &workspace,
+                                    Some(format!(
+                                        "Synced {synced} assigned issue(s) for {repository_label}"
+                                    )),
+                                );
+                                previous_root_status = snapshot.root_session_status;
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(
+                                workspace_key,
+                                error = %err,
+                                "failed to sync assigned issue tasks"
+                            ),
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -510,11 +559,10 @@ async fn watch_workspace(
                 let available_slots = if queue_next_requested {
                     1
                 } else {
-                    service
-                        .config
-                        .autonomous
-                        .max_parallel_issues
-                        .saturating_sub(snapshot.persistent.tasks.len())
+                    available_issue_scan_slots(
+                        service.config.autonomous.max_parallel_issues,
+                        active_parallel_task_count(&snapshot, &task_pr_status_rxs),
+                    )
                 };
                 if available_slots > 0 {
                     match enqueue_next_issues(
@@ -812,13 +860,44 @@ async fn watch_workspace(
                 "failed to refresh backing pull requests for existing tasks during scan"
             );
         }
+        match sync_assigned_issue_tasks(
+            &workspace,
+            &assigned_repository,
+            &snapshot
+                .persistent
+                .ignored_issue_urls
+                .iter()
+                .cloned()
+                .collect(),
+            &token,
+        )
+        .await
+        {
+            Ok(synced) if synced > 0 => {
+                next_scan_at = None;
+                set_automation_status(
+                    &workspace,
+                    Some(format!(
+                        "Synced {synced} assigned issue(s) for {repository_label}"
+                    )),
+                );
+                previous_root_status = snapshot.root_session_status;
+                continue;
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                workspace_key,
+                error = %err,
+                "failed to sync assigned issue tasks during scan"
+            ),
+        }
         let available_slots = available_issue_scan_slots(
             if queue_next_requested {
-                snapshot.persistent.tasks.len() + 1
+                active_parallel_task_count(&snapshot, &task_pr_status_rxs) + 1
             } else {
                 service.config.autonomous.max_parallel_issues
             },
-            snapshot.persistent.tasks.len(),
+            active_parallel_task_count(&snapshot, &task_pr_status_rxs),
         );
         match enqueue_next_issues(
             &service,
@@ -1034,6 +1113,43 @@ async fn enqueue_next_issues(
     Ok(queued)
 }
 
+async fn sync_assigned_issue_tasks(
+    workspace: &Workspace,
+    assigned_repository: &str,
+    ignored_issue_urls: &HashSet<String>,
+    token: &str,
+) -> Result<usize, String> {
+    let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
+    let issues = list_assigned_issues(assigned_repository, token).await?;
+    let mut synced = 0_usize;
+
+    for issue in issues {
+        if ignored_issue_urls.contains(&issue.url) {
+            continue;
+        }
+        let before = workspace.subscribe().borrow().persistent.tasks.len();
+        let backing_pr_url = best_effort_issue_backing_pr_url(
+            assigned_repository,
+            &issue,
+            &open_pull_requests,
+            token,
+        )
+        .await;
+        queue_issue_task(
+            workspace,
+            &issue,
+            backing_pr_url.as_deref(),
+            false,
+            WorkspaceTaskSource::Scan,
+        );
+        if workspace.subscribe().borrow().persistent.tasks.len() > before {
+            synced += 1;
+        }
+    }
+
+    Ok(synced)
+}
+
 async fn refresh_existing_task_backing_pr_urls(
     workspace: &Workspace,
     snapshot: &WorkspaceSnapshot,
@@ -1063,8 +1179,13 @@ async fn refresh_existing_task_backing_pr_urls(
             labels: Vec::new(),
             dependency_upgrade_pr_urls: Vec::new(),
         });
-        let discovered =
-            discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
+        let discovered = best_effort_issue_backing_pr_url(
+            assigned_repository,
+            &issue,
+            &open_pull_requests,
+            token,
+        )
+        .await;
         let issue_type = issue.issue_type().or(task.issue_type);
         let issue_type_glyph = issue_type.map(|kind| workspace_issue_type_glyph(kind).to_string());
         if discovered.as_deref() != task.backing_pr_url.as_deref()
@@ -1397,6 +1518,9 @@ fn sync_task_runtime_state(workspace: &Workspace, snapshot: &WorkspaceSnapshot) 
         for task in &snapshot.persistent.tasks {
             let is_active = next.active_task_id.as_deref() == Some(task.id.as_str());
             let task_state = next.task_states.entry(task.id.clone()).or_default();
+            if !is_active && task_has_deferred_resume_queue(task_state) {
+                continue;
+            }
             let normalized_agent_state = normalized_task_agent_state(task_state);
             if task_state.agent_state != normalized_agent_state {
                 task_state.agent_state = normalized_agent_state;
@@ -2552,12 +2676,14 @@ fn recover_codex_thread_candidate_from_session_log(
         .unwrap_or_default()
         .to_string();
     let mut has_user_event = false;
-    let mut autonomous_issue_urls = Vec::new();
-    let mut autonomous_pr_urls = Vec::new();
+    let mut autonomous_issue_urls = std::collections::BTreeSet::new();
+    let mut autonomous_pr_urls = std::collections::BTreeSet::new();
     for line in contents.lines().skip(1) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        extend_multicode_tag_values_from_json_value(&mut autonomous_issue_urls, &value, "issue");
+        extend_multicode_tag_values_from_json_value(&mut autonomous_pr_urls, &value, "pr");
         let Some(text) = codex_session_log_user_text(&value) else {
             continue;
         };
@@ -2574,8 +2700,8 @@ fn recover_codex_thread_candidate_from_session_log(
         cwd,
         sort_key: timestamp,
         has_user_event,
-        autonomous_issue_urls,
-        autonomous_pr_urls,
+        autonomous_issue_urls: autonomous_issue_urls.into_iter().collect(),
+        autonomous_pr_urls: autonomous_pr_urls.into_iter().collect(),
     })
 }
 
@@ -2681,6 +2807,7 @@ fn recovered_candidate_matches_task(
             .autonomous_issue_urls
             .iter()
             .any(|issue_url| issue_url == &task.issue_url)
+            || !candidate.autonomous_pr_urls.is_empty()
             || task.backing_pr_url.as_ref().is_some_and(|backing_pr_url| {
                 candidate
                     .autonomous_pr_urls
@@ -2899,26 +3026,30 @@ fn set_task_runtime_state_from_codex(
             }
         }
         let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
-        if task_state.session_id.as_deref() != Some(session_id) {
-            task_state.session_id = Some(session_id.to_string());
-            changed = true;
-        }
-        if task_state.agent_state != Some(agent_state) {
-            task_state.agent_state = Some(agent_state);
-            changed = true;
-        }
-        if task_state.session_status != Some(session_status) {
-            task_state.session_status = Some(session_status);
-            changed = true;
-        }
-        if task_state.status != next_status_text {
-            task_state.status = next_status_text.clone();
-            changed = true;
-        }
-        let should_wait = task_should_wait_on_vm(is_active, Some(agent_state));
-        if task_state.waiting_on_vm != should_wait {
-            task_state.waiting_on_vm = should_wait;
-            changed = true;
+        let preserve_deferred_resume_queue =
+            !is_active && task_has_deferred_resume_queue(task_state);
+        if !preserve_deferred_resume_queue {
+            if task_state.session_id.as_deref() != Some(session_id) {
+                task_state.session_id = Some(session_id.to_string());
+                changed = true;
+            }
+            if task_state.agent_state != Some(agent_state) {
+                task_state.agent_state = Some(agent_state);
+                changed = true;
+            }
+            if task_state.session_status != Some(session_status) {
+                task_state.session_status = Some(session_status);
+                changed = true;
+            }
+            if task_state.status != next_status_text {
+                task_state.status = next_status_text.clone();
+                changed = true;
+            }
+            let should_wait = task_should_wait_on_vm(is_active, Some(agent_state));
+            if task_state.waiting_on_vm != should_wait {
+                task_state.waiting_on_vm = should_wait;
+                changed = true;
+            }
         }
         if task_state.usage_total_tokens != usage_total_tokens {
             task_state.usage_total_tokens = usage_total_tokens;
@@ -2944,7 +3075,10 @@ fn set_task_runtime_state_from_codex(
                     .tasks
                     .iter_mut()
                     .find(|task| task.id == task_id)
-                && task.backing_pr_url.as_deref() != Some(backing_pr_url.as_str())
+                && should_accept_detected_backing_pr_url(
+                    task.backing_pr_url.as_deref(),
+                    backing_pr_url.as_str(),
+                )
             {
                 task.backing_pr_url = Some(backing_pr_url);
                 changed = true;
@@ -2952,6 +3086,15 @@ fn set_task_runtime_state_from_codex(
         }
         changed
     });
+}
+
+fn task_has_deferred_resume_queue(task_state: &crate::WorkspaceTaskRuntimeSnapshot) -> bool {
+    task_state.waiting_on_vm
+        && task_state.status.as_deref() == Some(QUEUED_UNTIL_VM_FREE_STATUS)
+        && task_state
+            .resume_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
 }
 
 fn should_refresh_task_links_after_codex_review(
@@ -3113,7 +3256,7 @@ fn compact_repository_label(assigned_repository: &str) -> &str {
 
 fn issue_is_closed(issue_status_rx: Option<&watch::Receiver<Option<GithubStatus>>>) -> bool {
     matches!(
-        issue_status_rx.and_then(|receiver| *receiver.borrow()),
+        issue_status_rx.and_then(|receiver| receiver.borrow().clone()),
         Some(GithubStatus::Issue(issue_status))
             if issue_status.state == super::github_status_service::GithubIssueState::Closed
     )
@@ -3210,18 +3353,22 @@ fn closed_background_task_issue_urls(
         .collect()
 }
 
-fn merged_dependency_upgrade_issue_urls(
+fn merged_background_pr_issue_urls(
     snapshot: &WorkspaceSnapshot,
+    active_issue_url: Option<&str>,
     task_pr_status_rxs: &HashMap<String, watch::Receiver<Option<GithubStatus>>>,
 ) -> Vec<String> {
     snapshot
         .persistent
         .tasks
         .iter()
-        .filter(|task| task.backing_pr_url.is_some() && task.dependency_upgrade_backing_pr)
+        .filter(|task| task.backing_pr_url.is_some())
+        .filter(|task| Some(task.issue_url.as_str()) != active_issue_url)
         .filter_map(|task| {
             matches!(
-                task_pr_status_rxs.get(&task.issue_url).and_then(|receiver| *receiver.borrow()),
+                task_pr_status_rxs
+                    .get(&task.issue_url)
+                    .and_then(|receiver| receiver.borrow().clone()),
                 Some(GithubStatus::Pr(pr_status))
                     if pr_status.state == super::github_status_service::GithubPrState::Merged
             )
@@ -3548,20 +3695,50 @@ fn resolved_autonomous_task_prompt(
     cwd: &std::path::Path,
     task_state_path: &std::path::Path,
 ) -> String {
-    snapshot
+    let saved_prompt = snapshot
         .task_states
         .get(task_id)
-        .and_then(|task_state| task_state.resume_prompt.clone())
-        .unwrap_or_else(|| {
-            build_issue_prompt(
-                assigned_repository,
-                issue,
-                backing_pr_url,
-                task_session_id,
-                cwd,
-                task_state_path,
-            )
-        })
+        .and_then(|task_state| task_state.resume_prompt.clone());
+    let prompt = saved_prompt.unwrap_or_else(|| {
+        build_issue_prompt(
+            assigned_repository,
+            issue,
+            backing_pr_url,
+            task_session_id,
+            cwd,
+            task_state_path,
+        )
+    });
+    let previous_task_session_id = snapshot
+        .task_states
+        .get(task_id)
+        .and_then(|task_state| task_state.session_id.as_deref());
+    rewrite_autonomous_task_prompt_session_id(&prompt, previous_task_session_id, task_session_id)
+}
+
+fn rewrite_autonomous_task_prompt_session_id(
+    prompt: &str,
+    previous_task_session_id: Option<&str>,
+    task_session_id: &str,
+) -> String {
+    let mut rewritten = match previous_task_session_id {
+        Some(previous_task_session_id)
+            if !previous_task_session_id.is_empty()
+                && previous_task_session_id != task_session_id =>
+        {
+            prompt.replace(previous_task_session_id, task_session_id)
+        }
+        _ => prompt.to_string(),
+    };
+    const STATE_MARKER_PREFIX: &str = "write autonomous state updates in the format `<state>:";
+    if let Some(prefix_start) = rewritten.find(STATE_MARKER_PREFIX) {
+        let session_start = prefix_start + STATE_MARKER_PREFIX.len();
+        if let Some(session_end_offset) = rewritten[session_start..].find('`') {
+            let session_end = session_start + session_end_offset;
+            rewritten.replace_range(session_start..session_end, task_session_id);
+        }
+    }
+    rewritten
 }
 
 async fn wait_for_codex_task_thread_ready(
@@ -3609,6 +3786,164 @@ fn task_cwd_path(
     issue_url: &str,
 ) -> std::path::PathBuf {
     service.workspace_task_checkout_path(workspace_key, assigned_repository, issue_url)
+}
+
+fn should_accept_detected_backing_pr_url(current: Option<&str>, detected: &str) -> bool {
+    let detected = detected.trim();
+    !detected.is_empty() && current.is_none_or(|current| current.trim().is_empty())
+}
+
+async fn refresh_task_git_statuses(
+    service: &CombinedService,
+    workspace: &Workspace,
+    snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
+    assigned_repository: &str,
+) {
+    let mut updates = Vec::new();
+    for task in &snapshot.persistent.tasks {
+        let checkout = task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url);
+        let status = read_task_git_status(&checkout).await;
+        updates.push((task.id.clone(), status));
+    }
+
+    if updates.is_empty() {
+        return;
+    }
+
+    workspace.update(|snapshot| {
+        let mut changed = false;
+        for (task_id, git_status) in &updates {
+            let task_state = snapshot.task_states.entry(task_id.clone()).or_default();
+            if task_state.git != *git_status {
+                task_state.git = *git_status;
+                changed = true;
+            }
+        }
+        changed
+    });
+}
+
+async fn read_task_git_status(checkout: &Path) -> Option<WorkspaceTaskGitStatus> {
+    let output = Command::new(task_git_program())
+        .arg("-C")
+        .arg(checkout)
+        .args(["status", "--porcelain=v1", "--branch"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let details = parse_task_git_status_details(&String::from_utf8_lossy(&output.stdout))?;
+    let mut status = details.status;
+    if status.has_unpushed_commits
+        && !details.has_upstream
+        && let Some(branch) = details.branch.as_deref()
+        && remote_branch_contains_head(checkout, branch).await
+    {
+        status.has_unpushed_commits = false;
+    }
+    Some(status)
+}
+
+#[cfg(test)]
+fn parse_task_git_status(output: &str) -> Option<WorkspaceTaskGitStatus> {
+    parse_task_git_status_details(output).map(|details| details.status)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedTaskGitStatus {
+    status: WorkspaceTaskGitStatus,
+    branch: Option<String>,
+    has_upstream: bool,
+}
+
+fn parse_task_git_status_details(output: &str) -> Option<ParsedTaskGitStatus> {
+    let mut lines = output.lines();
+    let branch = lines.next()?;
+    if !branch.starts_with("## ") {
+        return None;
+    }
+
+    let branch_status = branch.trim_start_matches("## ").trim();
+    let local_branch = branch_status
+        .split_once("...")
+        .map(|(local, _)| local)
+        .unwrap_or_else(|| {
+            branch_status
+                .split_whitespace()
+                .next()
+                .unwrap_or(branch_status)
+        });
+    let branch_name = (!local_branch.is_empty() && local_branch != "HEAD")
+        .then_some(local_branch)
+        .map(str::to_string);
+    let has_upstream = branch_status.contains("...");
+    let has_unpushed_commits = branch.contains("[ahead ") || !has_upstream;
+    let has_uncommitted_changes = lines.any(|line| !line.trim().is_empty());
+    Some(ParsedTaskGitStatus {
+        status: WorkspaceTaskGitStatus {
+            has_uncommitted_changes,
+            has_unpushed_commits,
+        },
+        branch: branch_name,
+        has_upstream,
+    })
+}
+
+async fn remote_branch_contains_head(checkout: &Path, branch: &str) -> bool {
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let remote_ref_exists = Command::new(task_git_program())
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{remote_ref}^{{commit}}"))
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !remote_ref_exists {
+        return false;
+    }
+
+    Command::new(task_git_program())
+        .arg("-C")
+        .arg(checkout)
+        .args(["merge-base", "--is-ancestor", "HEAD"])
+        .arg(&remote_ref)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+fn task_git_program() -> String {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+        "git",
+    ] {
+        let path = Path::new(candidate);
+        let available = if path.components().count() > 1 {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        } else {
+            std::env::var_os("PATH").is_some_and(|path_var| {
+                std::env::split_paths(&path_var)
+                    .map(|directory| directory.join(candidate))
+                    .any(|resolved| {
+                        std::fs::metadata(&resolved)
+                            .map(|metadata| metadata.is_file())
+                            .unwrap_or(false)
+                    })
+            })
+        };
+        if available {
+            return candidate.to_string();
+        }
+    }
+    "git".to_string()
 }
 
 async fn clear_automation_state_file(service: &CombinedService, workspace_key: &str) {
@@ -3722,6 +4057,7 @@ Start work on GitHub issue {issue_url}.\n\
 Issue title: {issue_title}\n\
 Primary checkout for this task: {cwd}\n\
 Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+{subagent_instructions}\n\
 For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
 For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\
 Your job is to:\n\
@@ -3739,6 +4075,7 @@ Prefer an upstream pull request if you have write access. Keep going until the w
         task_session_id = task_session_id,
         cwd = cwd.display(),
         task_state_path = task_state_path.display(),
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
         publish_instruction = publish_instruction
     )
 }
@@ -3756,6 +4093,7 @@ Start validation work on GitHub issue {issue_url}.\n\
 Issue title: {issue_title}\n\
 Primary checkout for this task: {cwd}\n\
 Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+{subagent_instructions}\n\
 For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
 For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\
 You are acting as a QA engineer validating whether this issue is actionable.\n\
@@ -3776,6 +4114,7 @@ Run repository commands, builds, and focused verification without asking for per
         task_session_id = task_session_id,
         cwd = cwd.display(),
         task_state_path = task_state_path.display(),
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
     )
 }
 
@@ -3784,6 +4123,12 @@ async fn find_next_issue(
     excluded_issue_urls: &HashSet<String>,
     token: &str,
 ) -> Result<Option<QueuedIssueCandidate>, String> {
+    if let Some(candidate) =
+        find_next_assigned_issue(assigned_repository, excluded_issue_urls, token).await?
+    {
+        return Ok(Some(candidate));
+    }
+
     if let Some(candidate) =
         find_next_dependency_upgrade_issue(assigned_repository, excluded_issue_urls, token).await?
     {
@@ -3829,6 +4174,36 @@ async fn find_next_issue(
     }
 
     Ok(None)
+}
+
+async fn find_next_assigned_issue(
+    assigned_repository: &str,
+    excluded_issue_urls: &HashSet<String>,
+    token: &str,
+) -> Result<Option<QueuedIssueCandidate>, String> {
+    let open_pull_requests = list_open_pull_requests(assigned_repository, token).await?;
+    let issues = list_assigned_issues(assigned_repository, token).await?;
+    let Some(candidate) = issues
+        .into_iter()
+        .filter(|issue| !excluded_issue_urls.contains(&issue.url))
+        .filter_map(|issue| {
+            let backing_pr_url =
+                discover_issue_backing_pr_url(assigned_repository, &issue, &open_pull_requests);
+            if issue.is_in_progress() && backing_pr_url.is_some() {
+                return None;
+            }
+            Some(QueuedIssueCandidate {
+                backing_pr_url,
+                dependency_upgrade_backing_pr: false,
+                issue,
+            })
+        })
+        .min_by(|left, right| issue_priority_cmp(&left.issue, &right.issue))
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(candidate))
 }
 
 async fn find_next_validation_issue(
@@ -3879,6 +4254,39 @@ async fn list_issues_for_label(
     if !output.status.success() {
         return Err(format!(
             "gh search issues failed for {assigned_repository}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    serde_json::from_slice::<Vec<SelectedIssue>>(&output.stdout)
+        .map(|issues| {
+            issues
+                .into_iter()
+                .filter(SelectedIssue::is_open_issue_candidate)
+                .collect()
+        })
+        .map_err(|err| format!("failed to parse gh search issues output: {err}"))
+}
+
+async fn list_assigned_issues(
+    assigned_repository: &str,
+    token: &str,
+) -> Result<Vec<SelectedIssue>, String> {
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args(assigned_issue_search_args(assigned_repository))
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to run gh search issues for assigned issues in {assigned_repository}: {err}"
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh search issues failed for assigned issues in {assigned_repository}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -3961,6 +4369,48 @@ fn available_issue_scan_slots(max_parallel_issues: usize, task_count: usize) -> 
     max_parallel_issues.saturating_sub(task_count)
 }
 
+fn pr_is_ready_for_approval_queue(pr_status: GithubPrStatus) -> bool {
+    pr_status.state == GithubPrState::Open
+        && !pr_status.is_draft
+        && matches!(
+            pr_status.merge_state,
+            Some(GithubPrMergeState::Clean | GithubPrMergeState::HasHooks)
+        )
+        && pr_status.build == GithubPrBuildState::Succeeded
+        && !matches!(
+            pr_status.sonar,
+            Some(GithubPrSonarState::Building) | Some(GithubPrSonarState::Failed)
+        )
+        && pr_status.unresolved_review_threads == 0
+        && matches!(
+            pr_status.review,
+            GithubPrReviewState::None
+                | GithubPrReviewState::Requested
+                | GithubPrReviewState::Accepted
+        )
+}
+
+fn active_parallel_task_count(
+    snapshot: &WorkspaceSnapshot,
+    task_pr_status_rxs: &HashMap<String, watch::Receiver<Option<GithubStatus>>>,
+) -> usize {
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| {
+            !task_pr_status_rxs
+                .get(&task.issue_url)
+                .and_then(|receiver| receiver.borrow().clone())
+                .and_then(|status| match status {
+                    GithubStatus::Pr(pr_status) => Some(pr_status),
+                    GithubStatus::Issue(_) => None,
+                })
+                .is_some_and(pr_is_ready_for_approval_queue)
+        })
+        .count()
+}
+
 fn should_defer_startup_issue_scan(
     startup_scan_pending: bool,
     snapshot: &WorkspaceSnapshot,
@@ -3995,6 +4445,27 @@ fn issue_search_args(assigned_repository: &str, label: &str) -> Vec<String> {
         "number,title,createdAt,labels,url,state,isPullRequest".to_string(),
         "--".to_string(),
         "-linked:pr".to_string(),
+    ]
+}
+
+fn assigned_issue_search_args(assigned_repository: &str) -> Vec<String> {
+    vec![
+        "search".to_string(),
+        "issues".to_string(),
+        "--repo".to_string(),
+        assigned_repository.to_string(),
+        "--state".to_string(),
+        "open".to_string(),
+        "--sort".to_string(),
+        "created".to_string(),
+        "--order".to_string(),
+        "desc".to_string(),
+        "--limit".to_string(),
+        "100".to_string(),
+        "--json".to_string(),
+        "number,title,createdAt,labels,url,state,isPullRequest".to_string(),
+        "--".to_string(),
+        "assignee:@me".to_string(),
     ]
 }
 
@@ -4142,6 +4613,97 @@ fn discover_issue_backing_pr_url(
     matches.first().map(|(_, _, _, url)| (*url).to_string())
 }
 
+async fn best_effort_issue_backing_pr_url(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    open_pull_requests: &[SelectedPullRequest],
+    token: &str,
+) -> Option<String> {
+    match fetch_linked_issue_backing_pr_url(assigned_repository, issue, token).await {
+        Ok(linked) => linked.or_else(|| {
+            discover_issue_backing_pr_url(assigned_repository, issue, open_pull_requests)
+        }),
+        Err(err) => {
+            tracing::warn!(
+                issue_url = %issue.url,
+                error = %err,
+                "failed to fetch linked pull requests; falling back to pull request discovery"
+            );
+            discover_issue_backing_pr_url(assigned_repository, issue, open_pull_requests)
+        }
+    }
+}
+
+async fn fetch_linked_issue_backing_pr_url(
+    assigned_repository: &str,
+    issue: &SelectedIssue,
+    token: &str,
+) -> Result<Option<String>, String> {
+    let Some((owner, repo)) = assigned_repository.split_once('/') else {
+        return Ok(None);
+    };
+
+    let mut command = Command::new(gh_program());
+    apply_gh_env(&mut command, token);
+    let output = command
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={repo}"),
+            "-F",
+            &format!("number={}", issue.number),
+            "-f",
+            LINKED_ISSUE_PULL_REQUESTS_GRAPHQL_ARG,
+        ])
+        .output()
+        .await
+        .map_err(|err| {
+            format!(
+                "failed to run gh api graphql for linked pull requests on {}: {err}",
+                issue.url
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gh api graphql failed for linked pull requests on {}: {}",
+            issue.url,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let response: LinkedIssuePullRequestsGraphqlResponse =
+        serde_json::from_slice(&output.stdout)
+            .map_err(|err| format!("failed to parse linked pull request graphql output: {err}"))?;
+    Ok(select_linked_issue_backing_pr_url(response))
+}
+
+fn select_linked_issue_backing_pr_url(
+    response: LinkedIssuePullRequestsGraphqlResponse,
+) -> Option<String> {
+    let mut pull_requests = response
+        .data?
+        .repository?
+        .issue?
+        .timeline_items
+        .nodes
+        .into_iter()
+        .filter_map(|node| match node {
+            LinkedIssueTimelineItem::Connected { subject } => subject,
+            LinkedIssueTimelineItem::CrossReferenced { source, .. } => source,
+            LinkedIssueTimelineItem::Other => None,
+        })
+        .filter(|pr| matches!(pr.state.as_deref(), Some("OPEN") | Some("open")))
+        .filter(|pr| pr.is_draft != Some(true))
+        .collect::<Vec<_>>();
+
+    pull_requests.sort_by(|left, right| right.number.cmp(&left.number));
+    pull_requests.into_iter().next().map(|pr| pr.url)
+}
+
 fn score_pull_request_issue_match(
     assigned_repository: &str,
     issue: &SelectedIssue,
@@ -4274,6 +4836,90 @@ fn is_issue_branch_keyword(segment: &str) -> bool {
         segment,
         "issue" | "issues" | "fix" | "fixes" | "fixed" | "bug" | "bugs" | "feature"
     )
+}
+
+const LINKED_ISSUE_PULL_REQUESTS_GRAPHQL_ARG: &str = r#"query=query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    issue(number:$number) {
+      timelineItems(first:50, itemTypes:[CONNECTED_EVENT, CROSS_REFERENCED_EVENT]) {
+        nodes {
+          __typename
+          ... on ConnectedEvent {
+            subject {
+              __typename
+              ... on PullRequest {
+                number
+                url
+                state
+                isDraft
+              }
+            }
+          }
+          ... on CrossReferencedEvent {
+            source {
+              __typename
+              ... on PullRequest {
+                number
+                url
+                state
+                isDraft
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssuePullRequestsGraphqlResponse {
+    data: Option<LinkedIssuePullRequestsGraphqlData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssuePullRequestsGraphqlData {
+    repository: Option<LinkedIssuePullRequestsGraphqlRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssuePullRequestsGraphqlRepository {
+    issue: Option<LinkedIssuePullRequestsGraphqlIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssuePullRequestsGraphqlIssue {
+    #[serde(rename = "timelineItems")]
+    timeline_items: LinkedIssueTimelineConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssueTimelineConnection {
+    nodes: Vec<LinkedIssueTimelineItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum LinkedIssueTimelineItem {
+    #[serde(rename = "ConnectedEvent")]
+    Connected {
+        subject: Option<LinkedIssueTimelinePullRequest>,
+    },
+    #[serde(rename = "CrossReferencedEvent")]
+    CrossReferenced {
+        source: Option<LinkedIssueTimelinePullRequest>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkedIssueTimelinePullRequest {
+    number: u64,
+    url: String,
+    state: Option<String>,
+    #[serde(rename = "isDraft")]
+    is_draft: Option<bool>,
 }
 
 async fn find_or_create_dependency_upgrade_issue(
@@ -5218,7 +5864,8 @@ mod tests {
     use crate::WorkspaceSnapshot;
     use crate::services::codex_app_server::{CodexThreadActiveFlag, CodexThreadStatus};
     use crate::services::github_status_service::{
-        GithubPrBuildState, GithubPrReviewState, GithubPrState, GithubPrStatus,
+        GithubPrBuildState, GithubPrCopilotReviewState, GithubPrMergeState, GithubPrReviewState,
+        GithubPrSonarState, GithubPrState, GithubPrStatus,
     };
     use crate::test_support::ENV_VAR_LOCK;
     use std::{
@@ -5473,6 +6120,64 @@ mod tests {
         assert_eq!(
             recovered.as_ref().map(|candidate| candidate.id.as_str()),
             Some("019d979d")
+        );
+
+        let _ = fs::remove_dir_all(&codex_home);
+    }
+
+    #[test]
+    fn recover_latest_codex_task_thread_candidate_uses_pr_tag_from_publish_session() {
+        let codex_home = unique_test_dir("codex-task-publish-session-recovery");
+        let old_dir = latest_codex_sessions_dir(&codex_home).join("2026/04/24");
+        let new_dir = latest_codex_sessions_dir(&codex_home).join("2026/04/27");
+        fs::create_dir_all(&old_dir).expect("old session dir should be created");
+        fs::create_dir_all(&new_dir).expect("new session dir should be created");
+
+        let cwd = "/Users/nmikic/dev/multicode-workspaces/micrometer/work/micronaut-micrometer-114";
+        let issue_url = "https://github.com/micronaut-projects/micronaut-micrometer/issues/114";
+        let pr_url = "https://github.com/micronaut-projects/micronaut-micrometer/pull/1155";
+        let old_worker = old_dir.join("rollout-2026-04-24T19-32-18-019dc0fa.jsonl");
+        let publish = new_dir.join("rollout-2026-04-27T08-50-40-019dce22.jsonl");
+
+        fs::write(
+            &old_worker,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019dc0fa\",\"cwd\":\"{}\",\"timestamp\":\"2026-04-24T19:32:18.000Z\"}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"You are operating in an autonomous multicode workspace for repository micronaut-projects/micronaut-micrometer.\\nStart work on GitHub issue {}.\"}}]}}}}\n"
+                ),
+                cwd,
+                issue_url,
+            ),
+        )
+        .expect("old worker session log should be written");
+        fs::write(
+            &publish,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"019dce22\",\"cwd\":\"{}\",\"timestamp\":\"2026-04-27T08:50:40.000Z\"}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"The local changes for this task are approved for publishing.\"}}]}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"<multicode:pr>{}</multicode:pr>\"}}]}}}}\n"
+                ),
+                cwd,
+                pr_url,
+            ),
+        )
+        .expect("publish session log should be written");
+
+        let recovered = recover_latest_codex_task_thread_candidate(
+            &codex_home,
+            &CodexTaskRecoveryDescriptor {
+                task_id: "task-114".to_string(),
+                cwd: cwd.to_string(),
+                issue_url: issue_url.to_string(),
+                backing_pr_url: None,
+            },
+        );
+
+        assert_eq!(
+            recovered.as_ref().map(|candidate| candidate.id.as_str()),
+            Some("019dce22")
         );
 
         let _ = fs::remove_dir_all(&codex_home);
@@ -6099,6 +6804,14 @@ mod tests {
     }
 
     #[test]
+    fn assigned_issue_search_args_filters_to_current_user() {
+        let args = assigned_issue_search_args("example/repo");
+        assert!(args.iter().any(|arg| arg == "assignee:@me"));
+        assert!(!args.iter().any(|arg| arg == "-linked:pr"));
+        assert!(args.windows(2).any(|pair| pair == ["--state", "open"]));
+    }
+
+    #[test]
     fn issue_priority_labels_include_spaced_docs_label() {
         assert!(ISSUE_PRIORITY_LABELS.contains(&"type: docs"));
     }
@@ -6109,6 +6822,66 @@ mod tests {
         assert_eq!(available_issue_scan_slots(5, 4), 1);
         assert_eq!(available_issue_scan_slots(5, 5), 0);
         assert_eq!(available_issue_scan_slots(5, 6), 0);
+    }
+
+    #[test]
+    fn active_parallel_task_count_excludes_green_prs_waiting_for_approval() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-1".to_string(),
+                "https://github.com/example/repo/issues/1".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+        snapshot
+            .persistent
+            .tasks
+            .push(WorkspaceTaskPersistentSnapshot::new(
+                "task-2".to_string(),
+                "https://github.com/example/repo/issues/2".to_string(),
+                WorkspaceTaskSource::Scan,
+            ));
+
+        let (ready_tx, ready_rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: Some(GithubPrSonarState::Succeeded),
+            review: GithubPrReviewState::Requested,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: UNIX_EPOCH,
+        })));
+        let (active_tx, active_rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Failed,
+            sonar: Some(GithubPrSonarState::Failed),
+            review: GithubPrReviewState::Outstanding,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 2,
+            fetched_at: UNIX_EPOCH,
+        })));
+        let _ = (ready_tx, active_tx);
+
+        let receivers = HashMap::from([
+            (snapshot.persistent.tasks[0].issue_url.clone(), ready_rx),
+            (snapshot.persistent.tasks[1].issue_url.clone(), active_rx),
+        ]);
+
+        assert_eq!(active_parallel_task_count(&snapshot, &receivers), 1);
     }
 
     #[test]
@@ -6133,6 +6906,208 @@ mod tests {
             ..open_issue
         };
         assert!(!pull_request.is_open_issue_candidate());
+    }
+
+    #[test]
+    fn find_next_issue_prefers_current_user_assigned_issue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\n\
+set -eu\n\
+if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+  printf '%s\\n' '[]'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"search\" ] && [ \"$2\" = \"issues\" ]; then\n\
+  shift 2\n\
+  query=\"\"\n\
+  saw_sep=0\n\
+  while [ \"$#\" -gt 0 ]; do\n\
+    if [ \"$saw_sep\" -eq 1 ]; then\n\
+      query=\"$query $1\"\n\
+    elif [ \"$1\" = \"--\" ]; then\n\
+      saw_sep=1\n\
+    fi\n\
+    shift\n\
+  done\n\
+  case \"$query\" in\n\
+    *\"assignee:@me\"*)\n\
+      printf '%s\\n' '[{\"number\":42,\"title\":\"Assigned to me\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T12:00:00Z\",\"labels\":[],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+    *\" type: regression \"*)\n\
+      printf '%s\\n' '[{\"number\":7,\"title\":\"Regression issue\",\"url\":\"https://github.com/example/repo/issues/7\",\"createdAt\":\"2026-04-09T13:00:00Z\",\"labels\":[{\"name\":\"type: regression\"}],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+    *)\n\
+      printf '%s\\n' '[]'\n\
+      ;;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' \"unexpected gh invocation: $*\" >&2\n\
+exit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let candidate = find_next_issue("example/repo", &HashSet::new(), "test-token")
+                .await
+                .expect("find_next_issue should succeed")
+                .expect("assigned issue should be selected");
+
+            assert_eq!(candidate.issue.number, 42);
+            assert_eq!(
+                candidate.issue.url,
+                "https://github.com/example/repo/issues/42"
+            );
+        });
+    }
+
+    #[test]
+    fn find_next_issue_reloads_in_progress_assigned_issue_without_pr() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\n\
+set -eu\n\
+if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+  printf '%s\\n' '[]'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"search\" ] && [ \"$2\" = \"issues\" ]; then\n\
+  shift 2\n\
+  query=\"\"\n\
+  saw_sep=0\n\
+  while [ \"$#\" -gt 0 ]; do\n\
+    if [ \"$saw_sep\" -eq 1 ]; then\n\
+      query=\"$query $1\"\n\
+    elif [ \"$1\" = \"--\" ]; then\n\
+      saw_sep=1\n\
+    fi\n\
+    shift\n\
+  done\n\
+  case \"$query\" in\n\
+    *\"assignee:@me\"*)\n\
+      printf '%s\\n' '[{\"number\":42,\"title\":\"Assigned and in progress\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T12:00:00Z\",\"labels\":[{\"name\":\"type: bug\"},{\"name\":\"status: in progress\"}],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+    *\" type: regression \"*)\n\
+      printf '%s\\n' '[{\"number\":7,\"title\":\"Regression issue\",\"url\":\"https://github.com/example/repo/issues/7\",\"createdAt\":\"2026-04-09T13:00:00Z\",\"labels\":[{\"name\":\"type: regression\"}],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+    *)\n\
+      printf '%s\\n' '[]'\n\
+      ;;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' \"unexpected gh invocation: $*\" >&2\n\
+exit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let candidate = find_next_issue("example/repo", &HashSet::new(), "test-token")
+                .await
+                .expect("find_next_issue should succeed")
+                .expect("assigned issue should be selected");
+
+            assert_eq!(candidate.issue.number, 42);
+            assert_eq!(candidate.backing_pr_url, None);
+        });
+    }
+
+    #[test]
+    fn find_next_issue_skips_in_progress_assigned_issue_with_pr() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\n\
+set -eu\n\
+if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+  printf '%s\\n' '[{\"number\":99,\"title\":\"Fix assigned issue\",\"url\":\"https://github.com/example/repo/pull/99\",\"createdAt\":\"2026-04-10T10:00:00Z\",\"headRefName\":\"fix-42\",\"state\":\"OPEN\",\"isDraft\":false,\"body\":\"Fixes #42\",\"labels\":[],\"author\":{\"login\":\"alice\"}}]'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"search\" ] && [ \"$2\" = \"prs\" ]; then\n\
+  printf '%s\\n' '[]'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"search\" ] && [ \"$2\" = \"issues\" ]; then\n\
+  shift 2\n\
+  query=\"\"\n\
+  saw_sep=0\n\
+  while [ \"$#\" -gt 0 ]; do\n\
+    if [ \"$saw_sep\" -eq 1 ]; then\n\
+      query=\"$query $1\"\n\
+    elif [ \"$1\" = \"--\" ]; then\n\
+      saw_sep=1\n\
+    fi\n\
+    shift\n\
+  done\n\
+  case \"$query\" in\n\
+    *\"assignee:@me\"*)\n\
+      printf '%s\\n' '[{\"number\":42,\"title\":\"Assigned and in progress\",\"url\":\"https://github.com/example/repo/issues/42\",\"createdAt\":\"2026-04-09T12:00:00Z\",\"labels\":[{\"name\":\"type: bug\"},{\"name\":\"status: in progress\"}],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+    *)\n\
+      printf '%s\\n' '[{\"number\":7,\"title\":\"Fallback bug issue\",\"url\":\"https://github.com/example/repo/issues/7\",\"createdAt\":\"2026-04-09T13:00:00Z\",\"labels\":[{\"name\":\"type: bug\"}],\"state\":\"OPEN\",\"isPullRequest\":false}]'\n\
+      ;;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' \"unexpected gh invocation: $*\" >&2\n\
+exit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let candidate = find_next_issue("example/repo", &HashSet::new(), "test-token")
+                .await
+                .expect("find_next_issue should succeed")
+                .expect("fallback issue should be selected");
+
+            assert_eq!(candidate.issue.number, 7);
+            assert_eq!(candidate.issue.url, "https://github.com/example/repo/issues/7");
+        });
     }
 
     #[test]
@@ -6234,6 +7209,183 @@ mod tests {
                 Some(workspace_issue_type_glyph(WorkspaceIssueType::Bug))
             );
         });
+    }
+
+    #[test]
+    fn refresh_existing_task_backing_pr_urls_replaces_stale_closed_pr_with_open_issue_pr() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+
+            let fake_gh = bin_dir.join("gh");
+            fs::write(
+                &fake_gh,
+                "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n  printf '%s\n' '[{\"number\":1163,\"title\":\"Fix Prometheus shaded protobuf dependency on 5.9.x\",\"url\":\"https://github.com/example/repo/pull/1163\",\"body\":\"Resolves #898\",\"headRefName\":\"nmikic/issue-898-prometheus-client-5.9.x\",\"createdAt\":\"2026-04-27T12:53:43Z\",\"isDraft\":false,\"state\":\"OPEN\",\"labels\":[{\"name\":\"type: bug\"}],\"author\":{\"login\":\"n0tl3ss\"}}]'\n  exit 0\nfi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf '%s\n' '{\"data\":{\"repository\":{\"issue\":{\"timelineItems\":{\"nodes\":[{\"__typename\":\"CrossReferencedEvent\",\"source\":{\"number\":1152,\"url\":\"https://github.com/example/repo/pull/1152\",\"state\":\"CLOSED\",\"isDraft\":false}},{\"__typename\":\"CrossReferencedEvent\",\"source\":{\"number\":1163,\"url\":\"https://github.com/example/repo/pull/1163\",\"state\":\"OPEN\",\"isDraft\":false}}]}}}}}'\n  exit 0\nfi\nprintf '%s\n' \"unexpected gh invocation: $*\" >&2\nexit 1\n",
+            )
+            .expect("fake gh should be written");
+            make_executable(&fake_gh);
+            let _gh_guard = EnvVarGuard::set("MULTICODE_GH_COMMAND", &fake_gh);
+
+            let workspace = Workspace::new(WorkspaceSnapshot::default());
+            workspace.update(|snapshot| {
+                let mut task = WorkspaceTaskPersistentSnapshot::new(
+                    "task-898".to_string(),
+                    "https://github.com/example/repo/issues/898".to_string(),
+                    WorkspaceTaskSource::Scan,
+                );
+                task.backing_pr_url = Some("https://github.com/example/repo/pull/1152".to_string());
+                task.issue_type = Some(WorkspaceIssueType::Bug);
+                task.issue_type_glyph = Some(workspace_issue_type_glyph(WorkspaceIssueType::Bug).to_string());
+                snapshot.persistent.tasks.push(task);
+                true
+            });
+
+            let snapshot = workspace.subscribe().borrow().clone();
+            let updated = refresh_existing_task_backing_pr_urls(
+                &workspace,
+                &snapshot,
+                "example/repo",
+                "test-token",
+            )
+            .await
+            .expect("refresh should succeed");
+
+            assert_eq!(updated, 1);
+            let next = workspace.subscribe().borrow().clone();
+            assert_eq!(
+                next.persistent.tasks[0].backing_pr_url.as_deref(),
+                Some("https://github.com/example/repo/pull/1163")
+            );
+        });
+    }
+
+    #[test]
+    fn select_linked_issue_backing_pr_url_prefers_open_newest_linked_pr() {
+        let response: LinkedIssuePullRequestsGraphqlResponse =
+            serde_json::from_value(serde_json::json!({
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "timelineItems": {
+                                "nodes": [
+                                    {
+                                        "__typename": "CrossReferencedEvent",
+                                        "source": {
+                                            "number": 1152,
+                                            "url": "https://github.com/example/repo/pull/1152",
+                                            "state": "CLOSED",
+                                            "isDraft": false
+                                        }
+                                    },
+                                    {
+                                        "__typename": "CrossReferencedEvent",
+                                        "source": {
+                                            "number": 1163,
+                                            "url": "https://github.com/example/repo/pull/1163",
+                                            "state": "OPEN",
+                                            "isDraft": false
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("linked PR response should deserialize");
+
+        assert_eq!(
+            select_linked_issue_backing_pr_url(response).as_deref(),
+            Some("https://github.com/example/repo/pull/1163")
+        );
+    }
+
+    #[test]
+    fn detected_backing_pr_metadata_only_fills_missing_persisted_pr() {
+        assert!(should_accept_detected_backing_pr_url(
+            None,
+            "https://github.com/example/repo/pull/2",
+        ));
+        assert!(should_accept_detected_backing_pr_url(
+            Some(""),
+            "https://github.com/example/repo/pull/2",
+        ));
+        assert!(!should_accept_detected_backing_pr_url(
+            Some("https://github.com/example/repo/pull/3"),
+            "https://github.com/example/repo/pull/2",
+        ));
+        assert!(!should_accept_detected_backing_pr_url(None, ""));
+    }
+
+    #[test]
+    fn parse_task_git_status_detects_uncommitted_and_unpushed_changes() {
+        assert_eq!(
+            parse_task_git_status("## branch...origin/branch\n"),
+            Some(WorkspaceTaskGitStatus::default())
+        );
+        assert_eq!(
+            parse_task_git_status("## branch...origin/branch [ahead 1]\n"),
+            Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: false,
+                has_unpushed_commits: true,
+            })
+        );
+        assert_eq!(
+            parse_task_git_status("## branch-without-upstream\n"),
+            Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: false,
+                has_unpushed_commits: true,
+            })
+        );
+        assert_eq!(
+            parse_task_git_status("## branch...origin/branch\n M build.gradle\n?? src/New.java\n"),
+            Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: false,
+            })
+        );
+        assert_eq!(
+            parse_task_git_status("## branch...origin/branch [ahead 2]\n M build.gradle\n"),
+            Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_task_git_status_details_remembers_branch_and_upstream_presence() {
+        assert_eq!(
+            parse_task_git_status_details("## issue-1122\n"),
+            Some(ParsedTaskGitStatus {
+                status: WorkspaceTaskGitStatus {
+                    has_uncommitted_changes: false,
+                    has_unpushed_commits: true,
+                },
+                branch: Some("issue-1122".to_string()),
+                has_upstream: false,
+            })
+        );
+        assert_eq!(
+            parse_task_git_status_details("## issue-1122...origin/issue-1122 [ahead 1]\n"),
+            Some(ParsedTaskGitStatus {
+                status: WorkspaceTaskGitStatus {
+                    has_uncommitted_changes: false,
+                    has_unpushed_commits: true,
+                },
+                branch: Some("issue-1122".to_string()),
+                has_upstream: true,
+            })
+        );
     }
 
     #[test]
@@ -6819,6 +7971,75 @@ mod tests {
             .expect("blocked task should exist");
         assert!(task_state.waiting_on_vm);
         assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+    }
+
+    #[test]
+    fn sync_task_runtime_state_preserves_deferred_resume_queue() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/1".to_string());
+            snapshot.task_states.insert(
+                "task-1".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-1".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    ..Default::default()
+                },
+            );
+            snapshot.task_states.insert(
+                "task-2".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-2".to_string()),
+                    agent_state: Some(AutomationAgentState::Review),
+                    session_status: Some(RootSessionStatus::Idle),
+                    status: Some(QUEUED_UNTIL_VM_FREE_STATUS.to_string()),
+                    waiting_on_vm: true,
+                    resume_prompt: Some("address review comments".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        sync_task_runtime_state(&workspace, &snapshot);
+
+        let next = workspace.subscribe().borrow().clone();
+        let task_state = next
+            .task_states
+            .get("task-2")
+            .expect("queued task should exist");
+        assert_eq!(task_state.session_id.as_deref(), Some("thread-2"));
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Review));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Idle));
+        assert_eq!(
+            task_state.status.as_deref(),
+            Some(QUEUED_UNTIL_VM_FREE_STATUS)
+        );
+        assert!(task_state.waiting_on_vm);
+        assert_eq!(
+            task_state.resume_prompt.as_deref(),
+            Some("address review comments")
+        );
     }
 
     #[test]
@@ -7427,6 +8648,75 @@ mod tests {
         assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
         assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
         assert!(task_state.waiting_on_vm);
+    }
+
+    #[test]
+    fn set_task_runtime_state_from_codex_preserves_deferred_resume_queue() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-2".to_string(),
+                    "https://github.com/example/repo/issues/2".to_string(),
+                    WorkspaceTaskSource::Scan,
+                ));
+            snapshot.active_task_id = Some("task-1".to_string());
+            snapshot.task_states.insert(
+                "task-2".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("task-session-2".to_string()),
+                    agent_state: Some(AutomationAgentState::Working),
+                    session_status: Some(RootSessionStatus::Busy),
+                    status: Some(QUEUED_UNTIL_VM_FREE_STATUS.to_string()),
+                    resume_prompt: Some("publish approved changes".to_string()),
+                    waiting_on_vm: true,
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        set_task_runtime_state_from_codex(
+            &workspace,
+            "task-2",
+            "task-session-2",
+            RootSessionStatus::Idle,
+            AutomationAgentState::Review,
+            Some(CodexTaskMetadata {
+                repositories: vec!["example/repo".to_string()],
+                issues: vec!["https://github.com/example/repo/issues/2".to_string()],
+                prs: vec!["https://github.com/example/repo/pull/56".to_string()],
+            }),
+            Some(20),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_state = snapshot
+            .task_states
+            .get("task-2")
+            .expect("queued task should exist");
+        assert_eq!(task_state.agent_state, Some(AutomationAgentState::Working));
+        assert_eq!(task_state.session_status, Some(RootSessionStatus::Busy));
+        assert_eq!(
+            task_state.status.as_deref(),
+            Some(QUEUED_UNTIL_VM_FREE_STATUS)
+        );
+        assert!(task_state.waiting_on_vm);
+        assert_eq!(
+            task_state.pr,
+            vec!["https://github.com/example/repo/pull/56".to_string()]
+        );
+        assert_eq!(task_state.usage_total_tokens, Some(20));
     }
 
     #[test]
@@ -8087,6 +9377,10 @@ mod tests {
         assert!(prompt.contains("`independent-fix`"));
         assert!(prompt.contains("`machine-readable-pr`"));
         assert!(prompt.contains("`autonomous-state`"));
+        assert!(prompt.contains("When Multicode subagents are available"));
+        assert!(prompt.contains("`multicode_code_mapper`"));
+        assert!(prompt.contains("`multicode_security_cve`"));
+        assert!(prompt.contains("`multicode_reviewer`"));
         assert!(prompt.contains("Primary checkout for this task: /tmp/work/example-repo-980"));
         assert!(prompt.contains("write autonomous state updates to `/tmp/state/task-980.state`"));
         assert!(prompt.contains("Use the existing checkout at `/tmp/work/example-repo-980`"));
@@ -8204,6 +9498,43 @@ mod tests {
             prompt,
             "Apply the extra Redis fix from the attached session."
         );
+    }
+
+    #[test]
+    fn resolved_autonomous_task_prompt_rewrites_stale_saved_session_marker() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.task_states.insert(
+            "task-361".to_string(),
+            crate::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-old".to_string()),
+                resume_prompt: Some(
+                    "Continue the task.\nFor this task session/thread, write autonomous state updates in the format `<state>:thread-old` so multicode can attribute the state to this specific session."
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+        let issue = test_issue(
+            361,
+            "Redis issue",
+            "https://github.com/example/repo/issues/361",
+            "2026-04-09T10:00:00Z",
+            vec![],
+        );
+
+        let prompt = resolved_autonomous_task_prompt(
+            &snapshot,
+            "task-361",
+            "example/repo",
+            &issue,
+            None,
+            "thread-new",
+            std::path::Path::new("/tmp/work/example-repo-361"),
+            std::path::Path::new("/tmp/state/task-361.state"),
+        );
+
+        assert!(prompt.contains("`<state>:thread-new`"));
+        assert!(!prompt.contains("thread-old"));
     }
 
     #[test]
@@ -8345,7 +9676,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_dependency_upgrade_issue_urls_ignores_non_dependency_tasks() {
+    fn merged_background_pr_issue_urls_includes_non_active_merged_pr_tasks() {
         let mut snapshot = WorkspaceSnapshot::default();
         snapshot.persistent.tasks.push(
             WorkspaceTaskPersistentSnapshot::new(
@@ -8357,19 +9688,38 @@ mod tests {
         );
         let (tx, rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
             state: GithubPrState::Merged,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 1,
+            human_approval_total: 1,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: std::time::SystemTime::UNIX_EPOCH,
         })));
         let _ = tx;
         let receivers = HashMap::from([(snapshot.persistent.tasks[0].issue_url.clone(), rx)]);
 
-        assert!(merged_dependency_upgrade_issue_urls(&snapshot, &receivers).is_empty());
+        assert_eq!(
+            merged_background_pr_issue_urls(&snapshot, None, &receivers),
+            vec!["https://github.com/example/repo/issues/485".to_string()]
+        );
+        assert!(
+            merged_background_pr_issue_urls(
+                &snapshot,
+                Some("https://github.com/example/repo/issues/485"),
+                &receivers
+            )
+            .is_empty()
+        );
     }
 
     #[test]
-    fn merged_dependency_upgrade_issue_urls_includes_dependency_upgrade_tasks() {
+    fn merged_background_pr_issue_urls_includes_dependency_upgrade_tasks() {
         let mut snapshot = WorkspaceSnapshot::default();
         snapshot.persistent.tasks.push(
             WorkspaceTaskPersistentSnapshot::new(
@@ -8382,16 +9732,24 @@ mod tests {
         );
         let (tx, rx) = watch::channel(Some(GithubStatus::Pr(GithubPrStatus {
             state: GithubPrState::Merged,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 1,
+            human_approval_total: 1,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: std::time::SystemTime::UNIX_EPOCH,
         })));
         let _ = tx;
         let receivers = HashMap::from([(snapshot.persistent.tasks[0].issue_url.clone(), rx)]);
 
         assert_eq!(
-            merged_dependency_upgrade_issue_urls(&snapshot, &receivers),
+            merged_background_pr_issue_urls(&snapshot, None, &receivers),
             vec!["https://github.com/example/repo/issues/981".to_string()]
         );
     }
