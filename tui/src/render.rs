@@ -1,6 +1,7 @@
 use crate::icons::{
-    icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
-    pr_review_icon_color,
+    git_status_icon_color, icon_glyph, issue_icon_kind_and_color, pr_build_icon_color,
+    pr_copilot_review_icon_color, pr_copilot_review_icon_label, pr_icon_kind_and_color,
+    pr_review_status_color, pr_sonar_icon_color,
 };
 use crate::system::centered_rect_fixed;
 use crate::*;
@@ -29,11 +30,16 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         is_width,
         t_width,
         pr_width,
+        target_branch_width,
+        git_width,
+        copilot_width,
         build_width,
+        sonar_width,
         review_width,
     ) = table_column_widths(
         &app.ordered_keys,
         &app.snapshots,
+        &app.github_link_statuses,
         create_row_server,
         &create_row_cpu_raw,
         &create_row_ram_raw,
@@ -42,6 +48,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         let label = match entry {
             TableEntry::Create => CREATE_ROW_LABEL.to_string(),
             TableEntry::Workspace { workspace_key } => workspace_key.clone(),
+            TableEntry::ApprovalSeparator { .. } => String::new(),
             TableEntry::Task {
                 workspace_key,
                 task_id,
@@ -70,6 +77,10 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Cell::from(create_row_server),
             Cell::from(create_row_cpu),
             Cell::from(create_row_ram),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -162,61 +173,84 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         .and_then(|task| task.issue_type_glyph.as_deref()),
                     archived,
                 );
-                let (pr_cell, build_cell, review_status_cell) =
-                    if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
-                        let (kind, color) = pr_icon_kind_and_color(*pr_status);
-                        (
-                            status_icon_cell(
-                                kind,
-                                if archived { Color::DarkGray } else { color },
-                                selected_link_kind == Some(WorkspaceLinkKind::Pr),
-                            ),
-                            pr_build_icon_color(*pr_status).map_or_else(
-                                Cell::default,
-                                |build_color| {
-                                    status_icon_cell(
-                                        StatusIconKind::Server,
-                                        if archived {
-                                            Color::DarkGray
-                                        } else {
-                                            build_color
-                                        },
-                                        false,
-                                    )
-                                },
-                            ),
-                            pr_review_icon_color(*pr_status).map_or_else(
-                                Cell::default,
-                                |review_color| {
-                                    status_icon_cell(
-                                        StatusIconKind::Eye,
-                                        if archived {
-                                            Color::DarkGray
-                                        } else {
-                                            review_color
-                                        },
-                                        false,
-                                    )
-                                },
-                            ),
-                        )
-                    } else if pr_link.is_some() {
-                        (
-                            status_icon_cell(
-                                StatusIconKind::GitPullRequest,
-                                if archived {
-                                    Color::DarkGray
-                                } else {
-                                    Color::Green
-                                },
-                                selected_link_kind == Some(WorkspaceLinkKind::Pr),
-                            ),
-                            Cell::default(),
-                            Cell::default(),
-                        )
-                    } else {
-                        (Cell::default(), Cell::default(), Cell::default())
-                    };
+                let (
+                    pr_cell,
+                    target_branch_cell,
+                    git_cell,
+                    copilot_cell,
+                    build_cell,
+                    sonar_cell,
+                    review_status_cell,
+                ) = if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
+                    let (kind, color) = pr_icon_kind_and_color(pr_status.clone());
+                    (
+                        status_icon_cell(
+                            kind,
+                            if archived { Color::DarkGray } else { color },
+                            selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                        ),
+                        Cell::from(target_branch_cell_label(Some(pr_status.clone()))),
+                        Cell::default(),
+                        pr_copilot_review_cell(pr_status.clone(), archived),
+                        pr_build_icon_color(pr_status.clone()).map_or_else(
+                            Cell::default,
+                            |build_color| {
+                                status_icon_cell(
+                                    StatusIconKind::Server,
+                                    if archived {
+                                        Color::DarkGray
+                                    } else {
+                                        build_color
+                                    },
+                                    false,
+                                )
+                            },
+                        ),
+                        pr_sonar_icon_color(pr_status.clone()).map_or_else(
+                            Cell::default,
+                            |sonar_color| {
+                                status_icon_cell(
+                                    StatusIconKind::Eye,
+                                    if archived {
+                                        Color::DarkGray
+                                    } else {
+                                        sonar_color
+                                    },
+                                    false,
+                                )
+                            },
+                        ),
+                        pr_review_status_cell(pr_status.clone(), archived),
+                    )
+                } else if pr_link.is_some() {
+                    (
+                        status_icon_cell(
+                            StatusIconKind::GitPullRequest,
+                            if archived {
+                                Color::DarkGray
+                            } else {
+                                Color::Green
+                            },
+                            selected_link_kind == Some(WorkspaceLinkKind::Pr),
+                        ),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                    )
+                } else {
+                    (
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                        Cell::default(),
+                    )
+                };
 
                 rows.push(
                     Row::new(vec![
@@ -234,11 +268,41 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         issue_cell,
                         task_type_cell,
                         pr_cell,
+                        target_branch_cell,
+                        git_cell,
+                        copilot_cell,
                         build_cell,
+                        sonar_cell,
                         review_status_cell,
                         description,
                     ])
                     .style(workspace_row_style(snapshot)),
+                );
+            }
+            TableEntry::ApprovalSeparator { .. } => {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(format!(
+                            "──── Approval Queue (separate from active {})",
+                            app.service.config.autonomous.max_parallel_issues
+                        )),
+                    ])
+                    .style(Style::default().fg(Color::LightCyan)),
                 );
             }
             TableEntry::Task {
@@ -292,7 +356,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         )
                     };
                 let pr_cell = if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
-                    let (kind, color) = pr_icon_kind_and_color(*pr_status);
+                    let (kind, color) = pr_icon_kind_and_color(pr_status.clone());
                     status_icon_cell(
                         kind,
                         if archived { Color::DarkGray } else { color },
@@ -322,12 +386,23 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         },
                     )
                 };
+                let git_cell = task_state
+                    .and_then(|state| state.git)
+                    .and_then(git_status_icon_color)
+                    .map_or_else(Cell::default, |git_color| {
+                        status_icon_cell(
+                            StatusIconKind::GitCommit,
+                            if archived { Color::DarkGray } else { git_color },
+                            false,
+                        )
+                    });
                 let cost = task_cost_cell_label(task_state);
                 let cost = right_align_cell_text(&cost, cost_width);
-                let (build_cell, review_status_cell) =
+                let (copilot_cell, build_cell, sonar_cell, review_status_cell) =
                     if let Some(GithubLinkStatusView::Pr(pr_status)) = pr_status {
                         (
-                            pr_build_icon_color(*pr_status).map_or_else(
+                            pr_copilot_review_cell(pr_status.clone(), archived),
+                            pr_build_icon_color(pr_status.clone()).map_or_else(
                                 Cell::default,
                                 |build_color| {
                                     status_icon_cell(
@@ -341,31 +416,54 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                                     )
                                 },
                             ),
-                            pr_review_icon_color(*pr_status).map_or_else(
+                            pr_sonar_icon_color(pr_status.clone()).map_or_else(
                                 Cell::default,
-                                |review_color| {
+                                |sonar_color| {
                                     status_icon_cell(
                                         StatusIconKind::Eye,
                                         if archived {
                                             Color::DarkGray
                                         } else {
-                                            review_color
+                                            sonar_color
                                         },
                                         false,
                                     )
                                 },
                             ),
+                            pr_review_status_cell(pr_status.clone(), archived),
                         )
                     } else {
-                        (Cell::default(), Cell::default())
+                        (
+                            Cell::default(),
+                            Cell::default(),
+                            Cell::default(),
+                            Cell::default(),
+                        )
                     };
                 let task_type_cell =
                     issue_type_cell(task.issue_type, task.issue_type_glyph.as_deref(), archived);
                 rows.push(
                     Row::new(vec![
                         Cell::from(task_row_label(task)),
-                        Cell::from(task_server_label(task_state))
-                            .style(task_server_style(task_state, archived)),
+                        Cell::from(task_server_label_for_display(
+                            snapshot,
+                            &task.id,
+                            task_state,
+                            pr_status.and_then(|status| match status {
+                                GithubLinkStatusView::Pr(pr_status) => Some(pr_status.clone()),
+                                _ => None,
+                            }),
+                        ))
+                        .style(task_server_style_for_display(
+                            snapshot,
+                            &task.id,
+                            task_state,
+                            pr_status.and_then(|status| match status {
+                                GithubLinkStatusView::Pr(pr_status) => Some(pr_status.clone()),
+                                _ => None,
+                            }),
+                            archived,
+                        )),
                         Cell::from(""),
                         Cell::from(""),
                         Cell::from(cost),
@@ -373,9 +471,26 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                         issue_cell,
                         task_type_cell,
                         pr_cell,
+                        Cell::from(target_branch_cell_label(pr_status.and_then(
+                            |status| match status {
+                                GithubLinkStatusView::Pr(pr_status) => Some(pr_status.clone()),
+                                _ => None,
+                            },
+                        ))),
+                        git_cell,
+                        copilot_cell,
                         build_cell,
+                        sonar_cell,
                         review_status_cell,
-                        Cell::from(task_description(task, task_state)),
+                        Cell::from(task_description_for_display(
+                            snapshot,
+                            task,
+                            task_state,
+                            pr_status.and_then(|status| match status {
+                                GithubLinkStatusView::Pr(pr_status) => Some(pr_status.clone()),
+                                _ => None,
+                            }),
+                        )),
                     ])
                     .style(workspace_row_style(snapshot)),
                 );
@@ -396,7 +511,11 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Constraint::Length(is_width),
             Constraint::Length(t_width),
             Constraint::Length(pr_width),
+            Constraint::Length(target_branch_width),
+            Constraint::Length(git_width),
+            Constraint::Length(copilot_width),
             Constraint::Length(build_width),
+            Constraint::Length(sonar_width),
             Constraint::Length(review_width),
             Constraint::Fill(1),
         ],
@@ -413,7 +532,11 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
             Cell::from("IS"),
             Cell::from("T"),
             Cell::from("PR"),
+            Cell::from("Base"),
+            Cell::from("G"),
+            Cell::from("C"),
             Cell::from("B"),
+            Cell::from("S"),
             Cell::from("R"),
             Cell::from("Description"),
         ])
@@ -434,9 +557,16 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
     let help = help_line(
         app.mode,
         app.selected_row,
-        entries.len().saturating_sub(1),
+        entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| !matches!(entry, TableEntry::ApprovalSeparator { .. }))
+            .map(|(index, _)| index)
+            .unwrap_or(0),
         app.selected_workspace_snapshot(),
         app.selected_task_id().is_some(),
+        app.selected_task_pr_link().is_some(),
         app.selected_workspace_link_count(),
         app.selected_link_index,
         app.selected_workspace_link()
@@ -453,7 +583,13 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
         }) && app.selected_link_index.is_none(),
         app.selected_workspace_can_diff(),
         app.selected_workspace_can_edit(),
+        app.selected_task_can_request_pr_creation(),
+        app.selected_task_can_request_pr_rebase(),
+        app.selected_task_can_request_pr_review_fix(),
         app.selected_task_can_request_ci_fix(),
+        app.selected_task_can_request_sonar_fix(),
+        app.selected_task_can_request_pr_merge(),
+        app.selected_task_can_request_copilot_review(),
         app.running_operation_is_cancellable(),
         &app.contextual_tool_hotkeys(),
         &app.status,
@@ -559,7 +695,11 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                 is_width,
                 t_width,
                 pr_width,
+                target_branch_width,
+                git_width,
+                copilot_width,
                 build_width,
+                sonar_width,
                 review_width,
             ],
         )
@@ -627,7 +767,7 @@ pub(crate) fn selected_link_tooltip_area(
     selected_row: usize,
     selected_link_kind: WorkspaceLinkKind,
     targets: &[(String, bool)],
-    column_widths: [u16; 11],
+    column_widths: [u16; 15],
 ) -> Option<Rect> {
     if selected_row == 0 || targets.is_empty() {
         return None;
@@ -751,6 +891,40 @@ fn status_icon_cell(kind: StatusIconKind, color: Color, reversed: bool) -> Cell<
         style
     };
     Cell::from(format!("{} ", icon_glyph(kind))).style(style)
+}
+
+fn pr_copilot_review_cell(pr: GithubPrStatus, archived: bool) -> Cell<'static> {
+    let Some(label) = pr_copilot_review_icon_label(pr.clone()) else {
+        return Cell::default();
+    };
+    let Some(color) = pr_copilot_review_icon_color(pr) else {
+        return Cell::default();
+    };
+    Cell::from(format!("{label} ")).style(
+        Style::default()
+            .fg(if archived { Color::DarkGray } else { color })
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+pub(crate) fn pr_review_status_cell_text(pr: GithubPrStatus) -> String {
+    let suffix = if pr.unresolved_review_threads > 99 {
+        "99+".to_string()
+    } else {
+        pr.unresolved_review_threads.to_string()
+    };
+
+    format!("{}{suffix}", icon_glyph(StatusIconKind::Eye))
+}
+
+fn pr_review_status_cell(pr: GithubPrStatus, archived: bool) -> Cell<'static> {
+    pr_review_status_color(pr.clone()).map_or_else(Cell::default, |review_color| {
+        Cell::from(pr_review_status_cell_text(pr)).style(Style::default().fg(if archived {
+            Color::DarkGray
+        } else {
+            review_color
+        }))
+    })
 }
 
 pub(crate) fn draw_create_modal(

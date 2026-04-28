@@ -20,6 +20,7 @@ use crate::{
 };
 
 const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const QUEUED_UNTIL_VM_FREE_STATUS: &str = "Queued until VM is free";
 
 #[derive(Debug)]
 pub enum AutomationStateFileServiceError {
@@ -203,22 +204,26 @@ fn apply_state_file_snapshot(
             }
         }
         let task_state = snapshot.task_states.entry(target_task_id).or_default();
-        if task_state.session_id != next_session_id {
-            task_state.session_id = next_session_id.clone();
-            changed = true;
-        }
-        if task_state.agent_state != next_agent_state {
-            task_state.agent_state = next_agent_state;
-            changed = true;
-        }
-        if task_state.session_status != next_session_status {
-            task_state.session_status = next_session_status;
-            changed = true;
-        }
-        let should_wait = task_should_wait_on_vm(is_active_target, next_agent_state);
-        if task_state.waiting_on_vm != should_wait {
-            task_state.waiting_on_vm = should_wait;
-            changed = true;
+        let preserve_deferred_resume_queue =
+            !is_active_target && task_has_deferred_resume_queue(task_state);
+        if !preserve_deferred_resume_queue {
+            if task_state.session_id != next_session_id {
+                task_state.session_id = next_session_id.clone();
+                changed = true;
+            }
+            if task_state.agent_state != next_agent_state {
+                task_state.agent_state = next_agent_state;
+                changed = true;
+            }
+            if task_state.session_status != next_session_status {
+                task_state.session_status = next_session_status;
+                changed = true;
+            }
+            let should_wait = task_should_wait_on_vm(is_active_target, next_agent_state);
+            if task_state.waiting_on_vm != should_wait {
+                task_state.waiting_on_vm = should_wait;
+                changed = true;
+            }
         }
         changed
     });
@@ -282,6 +287,15 @@ fn task_should_wait_on_vm(is_active: bool, agent_state: Option<AutomationAgentSt
                     | AutomationAgentState::Stale
             )
         )
+}
+
+fn task_has_deferred_resume_queue(task_state: &crate::WorkspaceTaskRuntimeSnapshot) -> bool {
+    task_state.waiting_on_vm
+        && task_state.status.as_deref() == Some(QUEUED_UNTIL_VM_FREE_STATUS)
+        && task_state
+            .resume_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
 }
 
 fn state_update_target_task_id(
@@ -913,6 +927,69 @@ mod tests {
         assert_eq!(task_42.agent_state, Some(AutomationAgentState::Review));
         assert_eq!(task_42.session_status, Some(RootSessionStatus::Idle));
         assert!(!task_42.waiting_on_vm);
+    }
+
+    #[test]
+    fn apply_state_file_snapshot_preserves_deferred_resume_queue() {
+        let workspace = Workspace::new(WorkspaceSnapshot::default());
+        workspace.update(|snapshot| {
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-42".to_string(),
+                    "https://github.com/example/repo/issues/42".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot
+                .persistent
+                .tasks
+                .push(WorkspaceTaskPersistentSnapshot::new(
+                    "task-30".to_string(),
+                    "https://github.com/example/repo/issues/30".to_string(),
+                    WorkspaceTaskSource::Manual,
+                ));
+            snapshot.active_task_id = Some("task-30".to_string());
+            snapshot.persistent.automation_issue =
+                Some("https://github.com/example/repo/issues/30".to_string());
+            snapshot.task_states.insert(
+                "task-42".to_string(),
+                crate::WorkspaceTaskRuntimeSnapshot {
+                    session_id: Some("thread-42".to_string()),
+                    agent_state: Some(AutomationAgentState::WaitingOnVm),
+                    session_status: Some(RootSessionStatus::Busy),
+                    status: Some(QUEUED_UNTIL_VM_FREE_STATUS.to_string()),
+                    waiting_on_vm: true,
+                    resume_prompt: Some("address review comments".to_string()),
+                    ..Default::default()
+                },
+            );
+            true
+        });
+
+        apply_state_file_snapshot(
+            &workspace,
+            Some("task-42"),
+            Some(ParsedAutomationState {
+                state: AutomationAgentState::Review,
+                thread_id: Some("thread-42".to_string()),
+            }),
+        );
+
+        let snapshot = workspace.subscribe().borrow().clone();
+        let task_42 = snapshot
+            .task_states
+            .get("task-42")
+            .expect("task 42 should remain queued");
+        assert_eq!(task_42.session_id.as_deref(), Some("thread-42"));
+        assert_eq!(task_42.agent_state, Some(AutomationAgentState::WaitingOnVm));
+        assert_eq!(task_42.session_status, Some(RootSessionStatus::Busy));
+        assert_eq!(task_42.status.as_deref(), Some(QUEUED_UNTIL_VM_FREE_STATUS));
+        assert!(task_42.waiting_on_vm);
+        assert_eq!(
+            task_42.resume_prompt.as_deref(),
+            Some("address review comments")
+        );
     }
 
     #[test]

@@ -21,6 +21,19 @@ Rules for creating new tests:
 - Where available, prefer writing a TCK test over a test for a specific module, even if the TCK fails for another module
 - When Docker / Testcontainers is used for testing and the Docker environment is not available write a unit test that doesn't require docker as well as the docker-based test then rely on dowstream CI checks for Docker-based testing results
 
+## Java style
+
+When adding or updating source file copyright headers, keep the ending year as the current calendar year. For example, in 2026 use `Copyright 2017-2026 original authors`; do not leave an older ending year on newly touched headers.
+
+When creating new Java classes, avoid adding `@author` Javadoc unless the surrounding module consistently uses it. If you do add an `@author` tag to match existing style, use the current human user from git or GitHub identity, not the agent name and not a fabricated author.
+
+When adding or updating public APIs that need Javadoc `@since`, derive the value from the pull request target branch, not from the local dependency versions or the agent's guess:
+
+- For a next-minor or milestone target version with a suffix, such as `5.0.0-M22`, strip the suffix and use the base major/minor release with patch zero: `@since 5.0.0`.
+- For a maintenance patch branch such as `5.1.x`, find the latest already released `5.1.*` tag or version and increment the patch by one. For example, if the latest released `5.1.*` is `5.1.3`, use `@since 5.1.4`.
+- If the target branch itself is `major.minor.x`, treat it as a patch branch and use the next patch after the latest released version in that line.
+- If you cannot determine the latest released patch version from tags, release notes, or repository metadata, stop and ask instead of inventing an `@since` value.
+
 ## Multi-project development
 
 When a fix needs validation across multiple Gradle projects:
