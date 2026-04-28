@@ -11,9 +11,8 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        CODEX_CREATE_PR_APPROVAL_PROMPT,
-        build_codex_fix_ci_prompt, compact_github_tooltip_target, count_codex_session_turn_metrics,
-        github_repository_spec, github_repository_url,
+        CODEX_CREATE_PR_APPROVAL_PROMPT, build_codex_fix_ci_prompt, compact_github_tooltip_target,
+        count_codex_session_turn_metrics, github_repository_spec, github_repository_url,
         last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
         restored_selected_row, shell_command_in_repo,
         should_auto_resume_autonomous_codex_after_attach,

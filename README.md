@@ -330,6 +330,60 @@ Apple workspaces also expose the host `~/.gitconfig` automatically. The runtime 
 an internal read-only path and sets `GIT_CONFIG_GLOBAL` so git can use your host global identity
 and defaults without requiring a direct file bind.
 
+### Docker setup for Apple containers
+
+If your Apple-container workspaces need Docker, for example to run `docker ps` or use
+Testcontainers, the host needs a working Docker-compatible engine first. multicode does not start
+or provision that engine for you.
+
+Practical requirements:
+
+- Install a Docker-compatible host runtime such as Docker Desktop or Rancher Desktop.
+- Make sure the host `docker` CLI is installed and on `PATH`.
+- Make sure the active Docker context points at a local Unix socket.
+
+You can verify the host setup with:
+
+```bash
+docker context inspect --format '{{.Endpoints.docker.Host}}'
+docker ps
+```
+
+The context host should resolve to a local Unix socket such as:
+
+- `unix:///var/run/docker.sock`
+- `unix://~/.rd/docker.sock`
+
+When that is true, Apple-container workspaces auto-detect the active host Docker context, mount
+the host socket into the container as `unix:///var/run/docker.sock`, and export `DOCKER_HOST` so
+`docker ps` works inside the workspace by default.
+
+If you use Testcontainers inside Apple-container workspaces, you also need a host DNS alias so the
+guest can reach host-published ports. multicode uses `TESTCONTAINERS_HOST_OVERRIDE=host.multicode.test`
+for that path.
+
+You can check whether the alias already exists:
+
+```bash
+container system dns list
+```
+
+If `host.multicode.test` is missing, create it once on the host as an administrator:
+
+```bash
+sudo container system dns create --localhost 192.0.2.123 host.multicode.test
+```
+
+Notes:
+
+- The `--localhost` value must be a non-loopback IP. Do not use `127.0.0.1`.
+- `192.0.2.123` is a fixed example alias IP, not your machine's real LAN address.
+- `container system dns list` only reports the domain name, not the configured redirect target.
+- Once the alias exists, Apple-container workspaces can reach host services and Docker-published
+  ports through `host.multicode.test:<port>`.
+- If the alias is missing, Docker can still work inside the workspace via the mounted socket, but
+  Testcontainers host-port access will fail.
+
 ## Git / GitHub integration
 
 With the GitHub integration you can see progress at a glance in the overview screen, and navigate to the issue or PR

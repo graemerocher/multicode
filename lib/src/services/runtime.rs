@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::OnceLock,
@@ -22,7 +22,13 @@ use crate::{RuntimeBackend, RuntimeHandleSnapshot, TransientWorkspaceSnapshot};
 pub(super) const RUNTIME_SPEC_METADATA_KEY: &str = "runtime-spec";
 const APPLE_GITCONFIG_DIR: &str = "/multicode-host/git";
 const APPLE_GITCONFIG_FILE_NAME: &str = ".gitconfig";
+const APPLE_DOCKER_SOCKET_METADATA_KEY: &str = "docker-socket-mounted";
+const APPLE_DOCKER_SOCKET_TARGET: &str = "/run/docker.sock";
+const APPLE_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+const APPLE_TESTCONTAINERS_HOST_OVERRIDE: &str = "host.multicode.test";
 const SYNTHETIC_CODEX_HOME: &str = "/multicode-agent/codex-home";
+const APPLE_RUNTIME_ID_KEY_LIMIT: usize = 12;
+const APPLE_RUNTIME_ID_SUFFIX_LEN: usize = 12;
 pub(crate) const AUTOMATION_STATE_DIR: &str = "/multicode-agent/automation";
 pub(crate) const AUTOMATION_STATE_ENV: &str = "MULTICODE_AUTONOMOUS_STATE_PATH";
 pub(crate) const AUTOMATION_STATE_FILE_NAME: &str = "state";
@@ -985,9 +991,14 @@ impl AppleContainerRuntime {
             });
         }
 
+        let host_docker_socket = resolve_host_docker_socket_path().await;
         let mut metadata = BTreeMap::new();
         metadata.insert("workspace-key".to_string(), key.to_string());
         metadata.insert("port".to_string(), port.to_string());
+        metadata.insert(
+            APPLE_DOCKER_SOCKET_METADATA_KEY.to_string(),
+            host_docker_socket.is_some().to_string(),
+        );
         metadata.insert(
             RUNTIME_SPEC_METADATA_KEY.to_string(),
             WorkspaceRuntime::AppleContainer(self.clone()).runtime_spec(),
@@ -1116,8 +1127,13 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let host_docker_socket = resolve_host_docker_socket_path().await;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            host_docker_socket.is_some(),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let mut args = vec![
@@ -1131,8 +1147,13 @@ impl AppleContainerRuntime {
             workspace_path.to_string_lossy().into_owned(),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(args.as_mut(), key, host_gitconfig.as_deref())
-            .await?;
+        self.append_container_mounts(
+            args.as_mut(),
+            key,
+            host_gitconfig.as_deref(),
+            host_docker_socket.as_deref(),
+        )
+        .await?;
         args.push(image.to_string());
         args.extend(command);
 
@@ -1153,8 +1174,15 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         ensure_pty_terminal_env(&mut env);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            runtime_handle
+                .metadata
+                .get(APPLE_DOCKER_SOCKET_METADATA_KEY)
+                .is_some_and(|value| value == "true"),
+        )
+        .await?;
         let env_file = self.write_env_file(key, "exec.env", &env).await?;
         let workspace_path = self.context.workspace_directory_path.join(key);
         let args = vec![
@@ -1277,8 +1305,13 @@ impl AppleContainerRuntime {
         let mut env = inherited_env.to_vec();
         append_agent_env(&self.context, &mut env, password);
         let host_gitconfig = self.host_gitconfig_path_for_env(&env);
-        self.append_implicit_env(&mut env, host_gitconfig.as_deref())
-            .await?;
+        let host_docker_socket = resolve_host_docker_socket_path().await;
+        self.append_implicit_env(
+            &mut env,
+            host_gitconfig.as_deref(),
+            host_docker_socket.is_some(),
+        )
+        .await?;
 
         let workspace_path = self.context.workspace_directory_path.join(key);
         tokio::fs::create_dir_all(&workspace_path).await?;
@@ -1298,8 +1331,13 @@ impl AppleContainerRuntime {
             format!("127.0.0.1:{port}:{port}/tcp"),
         ];
         self.append_container_limits(&mut args);
-        self.append_container_mounts(&mut args, key, host_gitconfig.as_deref())
-            .await?;
+        self.append_container_mounts(
+            &mut args,
+            key,
+            host_gitconfig.as_deref(),
+            host_docker_socket.as_deref(),
+        )
+        .await?;
         args.push(image.to_string());
         args.extend(start_command_args(
             &self.context,
@@ -1343,6 +1381,7 @@ impl AppleContainerRuntime {
         args: &mut Vec<String>,
         key: &str,
         host_gitconfig: Option<&Path>,
+        host_docker_socket: Option<&Path>,
     ) -> Result<(), CombinedServiceError> {
         let workspace_path = self.context.workspace_directory_path.join(key);
         let implicit_gitconfig_mount = self
@@ -1412,6 +1451,13 @@ impl AppleContainerRuntime {
         if let Some(implicit_gitconfig_mount) = implicit_gitconfig_mount {
             mount_specs.push(implicit_gitconfig_mount);
         }
+        if let Some(host_docker_socket) = host_docker_socket {
+            mount_specs.push(MountSpec::new(
+                PathBuf::from(APPLE_DOCKER_SOCKET_TARGET),
+                Some(host_docker_socket.to_path_buf()),
+                MountKind::Writable,
+            ));
+        }
         mount_specs.push(MountSpec::new(
             PathBuf::from(AUTOMATION_STATE_DIR),
             Some(automation_state_dir_source(
@@ -1473,6 +1519,7 @@ impl AppleContainerRuntime {
         &self,
         env: &mut Vec<(String, String)>,
         host_gitconfig: Option<&Path>,
+        docker_socket_mounted: bool,
     ) -> Result<(), CombinedServiceError> {
         env.push((
             AUTOMATION_STATE_ENV.to_string(),
@@ -1486,6 +1533,17 @@ impl AppleContainerRuntime {
                 "GIT_CONFIG_GLOBAL".to_string(),
                 format!("{APPLE_GITCONFIG_DIR}/{APPLE_GITCONFIG_FILE_NAME}"),
             ));
+        }
+        if docker_socket_mounted {
+            env.push(("DOCKER_HOST".to_string(), APPLE_DOCKER_HOST.to_string()));
+            if let Some(host_override) = resolve_apple_container_host_override().await {
+                env.push(("TESTCONTAINERS_HOST_OVERRIDE".to_string(), host_override));
+            } else {
+                tracing::warn!(
+                    domain = APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+                    "apple container local DNS rule is missing; docker is available in-container but Testcontainers host-port access will not work until the host DNS rule is created"
+                );
+            }
         }
         Ok(())
     }
@@ -1648,7 +1706,9 @@ impl AppleContainerRuntime {
     }
 
     fn generate_runtime_id(&self, key: &str) -> String {
-        format!("multicode-{key}-{}", Uuid::new_v4().as_simple())
+        let key_segment: String = key.chars().take(APPLE_RUNTIME_ID_KEY_LIMIT).collect();
+        let random = Uuid::new_v4().simple().to_string();
+        format!("mc-{}-{}", key_segment, &random[..APPLE_RUNTIME_ID_SUFFIX_LEN])
     }
 }
 
@@ -1708,6 +1768,35 @@ fn parse_apple_container_usage(output: &str) -> RuntimeUsageSample {
             .map(|value| value.saturating_mul(1_000)),
         state: Some(RuntimeUsageState::Active),
     }
+}
+
+fn apple_container_dns_list_contains_domain(output: &str, domain: &str) -> bool {
+    output.lines().any(|line| line.trim() == domain)
+}
+
+async fn resolve_apple_container_host_override() -> Option<String> {
+    if let Some(override_value) = std::env::var("MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(override_value);
+    }
+
+    let output = run_blocking_process(
+        container_program(),
+        vec!["system".to_string(), "dns".to_string(), "list".to_string()],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    apple_container_dns_list_contains_domain(
+        &String::from_utf8_lossy(&output.stdout),
+        APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+    )
+    .then(|| APPLE_TESTCONTAINERS_HOST_OVERRIDE.to_string())
 }
 
 fn format_skill_mounts(skills: &[super::config::AddedSkillMount]) -> String {
@@ -1816,6 +1905,10 @@ fn container_program() -> String {
     std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
 }
 
+fn docker_program() -> String {
+    std::env::var("MULTICODE_DOCKER_COMMAND").unwrap_or_else(|_| "docker".to_string())
+}
+
 fn apple_container_start_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -1833,6 +1926,46 @@ fn container_start_reports_allocator_exhaustion(stderr: &str) -> bool {
     stderr
         .to_ascii_lowercase()
         .contains("no free indices are available for allocation")
+}
+
+fn docker_context_host_to_socket_path(host: &str) -> Option<PathBuf> {
+    let path = host.trim().strip_prefix("unix://")?;
+    let expanded = if let Some(relative) = path.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+    } else {
+        PathBuf::from(path)
+    };
+    let expanded = expanded.is_absolute().then_some(expanded)?;
+    if let Ok(canonical_path) = std::fs::canonicalize(&expanded) {
+        return Some(canonical_path);
+    }
+
+    let file_name = expanded.file_name()?.to_owned();
+    let parent = expanded.parent()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    Some(canonical_parent.join(file_name))
+}
+
+async fn resolve_host_docker_socket_path() -> Option<PathBuf> {
+    let output = run_blocking_process(
+        docker_program(),
+        vec![
+            "context".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Endpoints.docker.Host}}".to_string(),
+        ],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let socket_path =
+        docker_context_host_to_socket_path(String::from_utf8_lossy(&output.stdout).trim())?;
+    let metadata = std::fs::metadata(&socket_path).ok()?;
+    metadata.file_type().is_socket().then_some(socket_path)
 }
 
 async fn run_blocking_process(
@@ -1905,16 +2038,16 @@ impl MountSpec {
     pub(crate) fn new(target: PathBuf, source: Option<PathBuf>, kind: MountKind) -> Self {
         let is_file = match source.as_ref() {
             Some(source) => std::fs::metadata(source)
-                .map(|metadata| metadata.is_file())
+                .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                 .unwrap_or_else(|_| {
                     std::fs::metadata(&target)
-                        .map(|metadata| metadata.is_file())
+                        .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                         .unwrap_or_else(|_| {
                             path_looks_like_file(source) || path_looks_like_file(&target)
                         })
                 }),
             None => std::fs::metadata(&target)
-                .map(|metadata| metadata.is_file())
+                .map(|metadata| metadata.is_file() || metadata.file_type().is_socket())
                 .unwrap_or_else(|_| path_looks_like_file(&target)),
         };
         Self {
@@ -2084,6 +2217,20 @@ impl ResolvedMountSpec {
             return;
         }
 
+        if self.mount.is_file {
+            args.push("--volume".to_string());
+            let mut volume = format!(
+                "{}:{}",
+                self.effective_source.to_string_lossy(),
+                self.mount.target.to_string_lossy()
+            );
+            if matches!(self.mount.kind, MountKind::Readable) {
+                volume.push_str(":ro");
+            }
+            args.push(volume);
+            return;
+        }
+
         match self.mount.kind {
             MountKind::Tmpfs => {
                 args.push("--tmpfs".to_string());
@@ -2119,7 +2266,10 @@ mod tests {
         AddedSkillMount, AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess,
         CodexSandboxMode, IsolationConfig,
     };
-    use std::fs;
+    use std::{
+        fs,
+        os::unix::{fs::symlink, net::UnixListener},
+    };
 
     struct TestDir {
         path: PathBuf,
@@ -2200,6 +2350,48 @@ mod tests {
                 .map(String::as_str)
                 .eq(sequence.iter().copied())
         })
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let old_value = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn write_fake_docker_cli(path: &Path, context_host: &str) {
+        let script = format!(
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = \"context\" ] && [ \"$2\" = \"inspect\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            context_host
+        );
+        fs::write(path, script).expect("fake docker script should be written");
+        let mut perms = fs::metadata(path)
+            .expect("fake docker metadata should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("fake docker script should be executable");
     }
 
     #[test]
@@ -2673,6 +2865,153 @@ mod tests {
     }
 
     #[test]
+    fn docker_context_host_to_socket_path_expands_home_relative_socket() {
+        let previous_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir().join(format!(
+            "multicode-docker-home-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().as_simple()
+        ));
+        let docker_socket = fake_home.join(".rd/docker.sock");
+        fs::create_dir_all(&fake_home).expect("fake home should exist");
+        fs::create_dir_all(
+            docker_socket
+                .parent()
+                .expect("docker socket should have a parent directory"),
+        )
+        .expect("fake rancher desktop directory should exist");
+        let _listener = UnixListener::bind(&docker_socket).expect("fake docker socket should bind");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let resolved = docker_context_host_to_socket_path("unix://~/.rd/docker.sock")
+            .expect("home-relative socket should resolve");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var("HOME", previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        let expected =
+            std::fs::canonicalize(&docker_socket).expect("docker socket path should canonicalize");
+        let _ = fs::remove_dir_all(&fake_home);
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn docker_context_host_to_socket_path_resolves_symlinked_socket_to_real_target() {
+        let root = std::env::temp_dir().join(format!("mc-sock-{}", Uuid::new_v4().as_simple()));
+        let real_socket = root.join("real.sock");
+        let symlinked_socket = root.join("docker.sock");
+        fs::create_dir_all(
+            real_socket
+                .parent()
+                .expect("real socket should have a parent directory"),
+        )
+        .expect("real socket directory should exist");
+        let _listener = UnixListener::bind(&real_socket).expect("real socket should bind");
+        symlink(&real_socket, &symlinked_socket).expect("symlinked socket should exist");
+
+        let resolved =
+            docker_context_host_to_socket_path(&format!("unix://{}", symlinked_socket.display()))
+                .expect("symlinked socket should resolve");
+        let expected =
+            std::fs::canonicalize(&real_socket).expect("real socket should canonicalize");
+
+        let _ = fs::remove_file(&symlinked_socket);
+        let _ = fs::remove_file(&real_socket);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn apple_container_run_command_mounts_host_docker_socket_and_exports_docker_host() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let root = TestDir::new();
+            let workspace_root = root.path().join("workspaces");
+            let bin_dir = root.path().join("bin");
+            let _host_override_guard = EnvVarGuard::set(
+                "MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE",
+                APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+            );
+            let socket_path =
+                std::env::temp_dir().join(format!("mc-docker-{}.sock", Uuid::new_v4().as_simple()));
+            fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            let _listener = UnixListener::bind(&socket_path).expect("socket should bind");
+            write_fake_docker_cli(
+                &bin_dir.join("docker"),
+                &format!("unix://{}", socket_path.display()),
+            );
+
+            let _path_guard = EnvVarGuard::set("PATH", bin_dir.to_string_lossy().as_ref());
+            let _docker_guard =
+                EnvVarGuard::set("MULTICODE_DOCKER_COMMAND", bin_dir.join("docker"));
+
+            let runtime = apple_runtime(&root, IsolationConfig::default());
+            let command = runtime
+                .build_run_command(
+                    "alpha",
+                    "multicode-alpha",
+                    "secret",
+                    31337,
+                    &[(
+                        "HOME".to_string(),
+                        root.path().to_string_lossy().into_owned(),
+                    )],
+                )
+                .await
+                .expect("command should build");
+            let server_env = workspace_root
+                .join(".multicode")
+                .join("apple-container")
+                .join("alpha")
+                .join("server.env");
+
+            let resolved_socket = docker_context_host_to_socket_path(&format!(
+                "unix://{}",
+                socket_path.display()
+            ))
+            .expect("docker socket path should canonicalize");
+            let docker_mount = format!(
+                "{}:{}",
+                resolved_socket.display(),
+                APPLE_DOCKER_SOCKET_TARGET
+            );
+            assert!(
+                command.args.iter().any(|arg| arg == &docker_mount),
+                "apple backend should mount the active host docker socket into the container"
+            );
+            let env_contents =
+                fs::read_to_string(&server_env).expect("server env file should be written");
+            assert!(
+                env_contents.contains(&format!("DOCKER_HOST={APPLE_DOCKER_HOST}\n")),
+                "apple backend should point docker at the mounted in-container socket path"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={}\n",
+                    APPLE_TESTCONTAINERS_HOST_OVERRIDE
+                )),
+                "apple backend should point Testcontainers at the host DNS alias"
+            );
+            let _ = fs::remove_file(&socket_path);
+        });
+    }
+
+    #[test]
     fn apple_container_pty_command_uses_one_shot_container_run() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2682,7 +3021,23 @@ mod tests {
         runtime.block_on(async {
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
+            let bin_dir = root.path().join("bin");
+            let _host_override_guard = EnvVarGuard::set(
+                "MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE",
+                APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+            );
+            let socket_path =
+                std::env::temp_dir().join(format!("mc-docker-{}.sock", Uuid::new_v4().as_simple()));
             fs::create_dir_all(workspace_root.join("alpha")).expect("workspace should exist");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            let _listener = UnixListener::bind(&socket_path).expect("socket should bind");
+            write_fake_docker_cli(
+                &bin_dir.join("docker"),
+                &format!("unix://{}", socket_path.display()),
+            );
+            let _path_guard = EnvVarGuard::set("PATH", bin_dir.to_string_lossy().as_ref());
+            let _docker_guard =
+                EnvVarGuard::set("MULTICODE_DOCKER_COMMAND", bin_dir.join("docker"));
             let runtime = apple_runtime(&root, IsolationConfig::default());
 
             let command = runtime
@@ -2726,7 +3081,19 @@ mod tests {
                 env_contents.contains("COLORTERM=truecolor\n"),
                 "apple PTY runs should set a portable COLORTERM for container shells"
             );
+            assert!(
+                env_contents.contains(&format!("DOCKER_HOST={APPLE_DOCKER_HOST}\n")),
+                "apple PTY runs should inherit the mounted docker socket configuration"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={}\n",
+                    APPLE_TESTCONTAINERS_HOST_OVERRIDE
+                )),
+                "apple PTY runs should point Testcontainers at the host DNS alias"
+            );
             assert!(command.inherited_env.is_empty());
+            let _ = fs::remove_file(&socket_path);
         });
     }
 
@@ -2740,12 +3107,19 @@ mod tests {
         runtime.block_on(async {
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
+            let _host_override_guard = EnvVarGuard::set(
+                "MULTICODE_APPLE_CONTAINER_HOST_OVERRIDE",
+                APPLE_TESTCONTAINERS_HOST_OVERRIDE,
+            );
             fs::create_dir_all(workspace_root.join("alpha")).expect("workspace should exist");
             let runtime = apple_runtime(&root, IsolationConfig::default());
             let runtime_handle = RuntimeHandleSnapshot {
                 backend: RuntimeBackend::AppleContainer,
                 id: "multicode-alpha-running".to_string(),
-                metadata: BTreeMap::new(),
+                metadata: BTreeMap::from([(
+                    APPLE_DOCKER_SOCKET_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                )]),
             };
 
             let command = runtime
@@ -2794,6 +3168,17 @@ mod tests {
             assert!(
                 env_contents.contains("COLORTERM=truecolor\n"),
                 "apple PTY exec should set a portable COLORTERM for container shells"
+            );
+            assert!(
+                env_contents.contains(&format!("DOCKER_HOST={APPLE_DOCKER_HOST}\n")),
+                "apple PTY exec should inherit the mounted docker socket configuration"
+            );
+            assert!(
+                env_contents.contains(&format!(
+                    "TESTCONTAINERS_HOST_OVERRIDE={}\n",
+                    APPLE_TESTCONTAINERS_HOST_OVERRIDE
+                )),
+                "apple PTY exec should point Testcontainers at the host DNS alias"
             );
             assert!(command.inherited_env.is_empty());
         });
@@ -3202,5 +3587,17 @@ mod tests {
                 state: Some(RuntimeUsageState::Unknown),
             }
         );
+    }
+
+    #[test]
+    fn apple_container_dns_list_contains_domain_matches_domain_entries() {
+        assert!(apple_container_dns_list_contains_domain(
+            "DOMAIN\nhost.multicode.test\nexample.test\n",
+            "host.multicode.test"
+        ));
+        assert!(!apple_container_dns_list_contains_domain(
+            "DOMAIN\nexample.test\n",
+            "host.multicode.test"
+        ));
     }
 }
