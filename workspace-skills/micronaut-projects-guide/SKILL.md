@@ -14,6 +14,24 @@ This is the recommended build command:
 Note that for projects using the Micronaut build systems, gradle modules have a prefix: For example the folder 
 `context-propagation` corresponds to the gradle module `:micronaut-context-propagation`.
 
+When a Micronaut Gradle build fails on `findBaseline` with an error like `Could not find a previous version for X.Y.Z`, do not disable the task with:
+
+```groovy
+tasks.named("findBaseline") {
+    enabled = false
+}
+```
+
+Use Micronaut build's binary compatibility gate instead:
+
+```groovy
+micronautBuild {
+    binaryCompatibility.enabledAfter("X.Y.Z")
+}
+```
+
+Set `X.Y.Z` to the next unreleased major, minor, or patch version as appropriate for the branch you are changing.
+
 Rules for creating new tests:
 
 - Prefer junit over spock, unless there is already a spock test that can easily be altered to test this issue
