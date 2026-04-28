@@ -4434,6 +4434,15 @@ mod tests {
             multicode_lib::WorkspaceTaskSource::Scan,
         )
         .with_backing_pr_url(Some("https://github.com/example/repo/pull/858".to_string()));
+        assert_eq!(
+            crate::task_server_label(None, Some(rebase_pr.clone())),
+            "Needs Rebase"
+        );
+        assert_eq!(
+            crate::task_description(&rebase_task, None, Some(rebase_pr.clone())),
+            "Needs rebase before continuing #858"
+        );
+
         let waiting_task_state = WorkspaceTaskRuntimeSnapshot {
             waiting_on_vm: true,
             status: Some("Queued until VM is free".to_string()),
@@ -4441,11 +4450,64 @@ mod tests {
         };
         assert_eq!(
             crate::task_server_label(Some(&waiting_task_state), Some(rebase_pr.clone())),
-            "Needs Rebase"
+            "Waiting on VM"
         );
         assert_eq!(
-            crate::task_description(&rebase_task, Some(&waiting_task_state), Some(rebase_pr)),
-            "Needs rebase before continuing #858"
+            crate::task_description(
+                &rebase_task,
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Queued until VM is free"
+        );
+
+        let mut snapshot = WorkspaceSnapshot {
+            active_task_id: Some("task-999".to_string()),
+            automation_agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        snapshot
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-999".to_string(),
+                "https://github.com/example/repo/issues/999".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            ));
+        snapshot.persistent.tasks.push(rebase_task.clone());
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-287",
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Waiting on VM"
+        );
+        assert_eq!(
+            crate::task_description_for_display(
+                &snapshot,
+                &rebase_task,
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Queued until VM is free"
+        );
+
+        let resuming_task_state = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Working),
+            session_status: Some(RootSessionStatus::Busy),
+            status: Some("Resuming in background".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-287",
+                Some(&resuming_task_state),
+                Some(rebase_pr)
+            ),
+            "Resuming"
         );
     }
 

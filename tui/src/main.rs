@@ -542,9 +542,6 @@ fn task_server_label(
     task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
     pr_status: Option<GithubPrStatus>,
 ) -> &'static str {
-    if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
-        return "Needs Rebase";
-    }
     if task_state.is_some_and(|state| state.waiting_on_vm) {
         if task_state.is_some_and(task_session_is_busy) {
             return "Session Busy";
@@ -553,6 +550,9 @@ fn task_server_label(
     }
     if task_state.is_some_and(task_is_resuming_in_background) {
         return "Resuming";
+    }
+    if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
+        return "Needs Rebase";
     }
     if pr_status
         .as_ref()
@@ -686,9 +686,6 @@ fn task_server_label_for_display(
     if task_state.is_some_and(task_is_resuming_in_background) {
         return "Resuming";
     }
-    if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
-        return "Needs Rebase";
-    }
     let display_agent_state = active_task_display_agent_state(snapshot, task_id, task_state);
     if display_agent_state == Some(AutomationAgentState::WaitingOnVm)
         && task_state.is_some_and(task_session_is_busy)
@@ -755,16 +752,6 @@ fn task_description(
     let pr_created_status = task_pr_created_status(task, task_state);
     let pr_reference = task_pr_reference(task, task_state);
     if task_state.is_some_and(|state| state.waiting_on_vm) {
-        if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
-            return pr_reference
-                .map(|reference| format!("Needs rebase before continuing {reference}"))
-                .unwrap_or_else(|| {
-                    format!(
-                        "Needs rebase before continuing {}",
-                        task_issue_reference(task)
-                    )
-                });
-        }
         return task_state
             .and_then(|state| state.status.as_deref())
             .filter(|status| !status.trim().is_empty())
@@ -873,34 +860,22 @@ fn task_description_for_display(
             .filter(|status| !status.trim().is_empty())
             .map(|status| status.trim().to_string())
             .unwrap_or_else(|| format!("Question {}", task_issue_reference(task))),
-        Some(AutomationAgentState::WaitingOnVm) => {
-            if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
-                return task_pr_reference(task, task_state)
-                    .map(|reference| format!("Needs rebase before continuing {reference}"))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "Needs rebase before continuing {}",
-                            task_issue_reference(task)
-                        )
-                    });
-            }
-            task_state
-                .and_then(|state| state.status.as_deref())
-                .filter(|status| {
-                    let status = status.trim();
-                    !status.is_empty()
-                        && (task_state.is_some_and(task_session_is_busy)
-                            || !status.starts_with("Working "))
-                })
-                .map(|status| status.trim().to_string())
-                .unwrap_or_else(|| {
-                    if task_state.is_some_and(task_session_is_busy) {
-                        "Session busy; queued until VM is free".to_string()
-                    } else {
-                        "Queued until VM is free".to_string()
-                    }
-                })
-        }
+        Some(AutomationAgentState::WaitingOnVm) => task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| {
+                let status = status.trim();
+                !status.is_empty()
+                    && (task_state.is_some_and(task_session_is_busy)
+                        || !status.starts_with("Working "))
+            })
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| {
+                if task_state.is_some_and(task_session_is_busy) {
+                    "Session busy; queued until VM is free".to_string()
+                } else {
+                    "Queued until VM is free".to_string()
+                }
+            }),
         Some(AutomationAgentState::Stale) => task_state
             .and_then(|state| state.status.as_deref())
             .filter(|status| !status.trim().is_empty())
