@@ -1507,6 +1507,8 @@ mod tests {
         config.github.token = Some(multicode_lib::services::GithubTokenConfig {
             env: Some("MULTICODE_TEST_GITHUB_TOKEN".to_string()),
             command: None,
+            keychain_service: None,
+            keychain_account: None,
         });
         config
     }
