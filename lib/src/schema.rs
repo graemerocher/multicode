@@ -12,6 +12,8 @@ diesel::table! {
         sonar_state -> Nullable<Text>,
         review_state -> Nullable<Text>,
         requested_reviewers -> Nullable<Text>,
+        human_approval_count -> Nullable<BigInt>,
+        human_approval_total -> Nullable<BigInt>,
         copilot_review_state -> Nullable<Text>,
         target_branch -> Nullable<Text>,
         merge_state -> Nullable<Text>,

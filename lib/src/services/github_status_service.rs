@@ -268,6 +268,8 @@ pub struct GithubPrStatus {
     pub sonar: Option<GithubPrSonarState>,
     pub review: GithubPrReviewState,
     pub requested_reviewers: Option<String>,
+    pub human_approval_count: u32,
+    pub human_approval_total: u32,
     pub copilot_review: GithubPrCopilotReviewState,
     pub is_draft: bool,
     pub unresolved_review_threads: u32,
@@ -329,6 +331,8 @@ struct CachedLinkStatus {
     sonar_state: Option<GithubPrSonarState>,
     review_state: Option<GithubPrReviewState>,
     requested_reviewers: Option<String>,
+    human_approval_count: Option<i64>,
+    human_approval_total: Option<i64>,
     copilot_review_state: Option<GithubPrCopilotReviewState>,
     target_branch: Option<String>,
     merge_state: Option<GithubPrMergeState>,
@@ -349,6 +353,8 @@ impl CachedLinkStatus {
             sonar_state: None,
             review_state: None,
             requested_reviewers: None,
+            human_approval_count: None,
+            human_approval_total: None,
             copilot_review_state: None,
             target_branch: None,
             merge_state: None,
@@ -369,6 +375,8 @@ impl CachedLinkStatus {
             sonar_state: None,
             review_state: Some(GithubPrReviewState::None),
             requested_reviewers: None,
+            human_approval_count: Some(0),
+            human_approval_total: Some(0),
             copilot_review_state: Some(GithubPrCopilotReviewState::None),
             target_branch: None,
             merge_state: Some(GithubPrMergeState::Unknown),
@@ -396,6 +404,8 @@ impl CachedLinkStatus {
             sonar: self.sonar_state,
             review: self.review_state?,
             requested_reviewers: self.requested_reviewers.clone(),
+            human_approval_count: self.human_approval_count.unwrap_or(0).max(0) as u32,
+            human_approval_total: self.human_approval_total.unwrap_or(0).max(0) as u32,
             copilot_review: self.copilot_review_state?,
             is_draft: self.pr_is_draft?,
             unresolved_review_threads: self.unresolved_review_thread_count.unwrap_or(0).max(0)
@@ -428,6 +438,8 @@ impl CachedLinkStatus {
                 sonar_state: None,
                 review_state: None,
                 requested_reviewers: None,
+                human_approval_count: None,
+                human_approval_total: None,
                 copilot_review_state: None,
                 target_branch: None,
                 merge_state: None,
@@ -450,6 +462,8 @@ impl CachedLinkStatus {
                 sonar_state: self.sonar_state.map(|state| state.as_db().to_string()),
                 review_state: self.review_state.map(|state| state.as_db().to_string()),
                 requested_reviewers: self.requested_reviewers.clone(),
+                human_approval_count: self.human_approval_count,
+                human_approval_total: self.human_approval_total,
                 copilot_review_state: self
                     .copilot_review_state
                     .map(|state| state.as_db().to_string()),
@@ -493,6 +507,8 @@ impl CachedLinkStatus {
         let pr_is_draft = row.pr_is_draft;
         let unresolved_review_thread_count = row.unresolved_review_thread_count;
         let requested_reviewers = row.requested_reviewers;
+        let human_approval_count = row.human_approval_count;
+        let human_approval_total = row.human_approval_total;
         let mut copilot_review_state = row
             .copilot_review_state
             .and_then(|state| GithubPrCopilotReviewState::from_db(&state));
@@ -528,6 +544,8 @@ impl CachedLinkStatus {
                 sonar_state,
                 review_state,
                 requested_reviewers,
+                human_approval_count,
+                human_approval_total,
                 copilot_review_state,
                 target_branch,
                 merge_state,
@@ -881,6 +899,8 @@ impl GithubStatusService {
             sonar_state: None,
             review_state: None,
             requested_reviewers: None,
+            human_approval_count: None,
+            human_approval_total: None,
             copilot_review_state: None,
             target_branch: None,
             merge_state: None,
@@ -970,6 +990,8 @@ impl GithubStatusService {
         let requested_reviewer_count = requested_reviewer_logins.len() + requested_human_team_count;
         let requested_reviewers =
             requested_reviewers_label(&requested_reviewer_logins, requested_teams);
+        let human_approval_count = count_human_approvals(&reviews);
+        let human_approval_total = human_approval_count + requested_reviewer_count;
         let pr_is_draft = pull.draft.unwrap_or(false);
         let target_branch =
             Some(pull.base.ref_field.trim().to_string()).filter(|branch| !branch.is_empty());
@@ -1026,6 +1048,8 @@ impl GithubStatusService {
             sonar_state,
             review_state: Some(review_state),
             requested_reviewers,
+            human_approval_count: Some(human_approval_count as i64),
+            human_approval_total: Some(human_approval_total as i64),
             copilot_review_state: Some(copilot_review_state),
             target_branch,
             merge_state,
@@ -2157,32 +2181,7 @@ fn derive_pr_review_state(
     requested_reviewer_count: usize,
     unresolved_review_thread_count: i64,
 ) -> GithubPrReviewState {
-    let mut latest_review_state_by_user = HashMap::<String, String>::new();
-    for review in reviews {
-        let Some(user) = review.user.as_ref() else {
-            continue;
-        };
-        let login = user.login.trim();
-        if login.is_empty() {
-            continue;
-        }
-        if is_automation_review_login(login) {
-            continue;
-        }
-        let Some(state) = review.state else {
-            continue;
-        };
-        let state = match state {
-            ReviewState::Approved => "APPROVED",
-            ReviewState::ChangesRequested => "CHANGES_REQUESTED",
-            ReviewState::Commented => "COMMENTED",
-            ReviewState::Dismissed => "DISMISSED",
-            ReviewState::Open => "OPEN",
-            ReviewState::Pending => "PENDING",
-            _ => continue,
-        };
-        latest_review_state_by_user.insert(login.to_string(), state.to_string());
-    }
+    let latest_review_state_by_user = latest_human_review_state_by_user(reviews);
 
     if latest_review_state_by_user.is_empty() {
         return if requested_reviewer_count > 0 {
@@ -2214,13 +2213,52 @@ fn derive_pr_review_state(
         .values()
         .any(|state| state == "APPROVED");
 
-    if has_approval && requested_reviewer_count == 0 {
+    if has_approval {
         GithubPrReviewState::Accepted
     } else if requested_reviewer_count > 0 {
         GithubPrReviewState::Requested
     } else {
         GithubPrReviewState::None
     }
+}
+
+fn latest_human_review_state_by_user(
+    reviews: &[octocrab::models::pulls::Review],
+) -> HashMap<String, String> {
+    let mut latest_review_state_by_user = HashMap::new();
+    for review in reviews {
+        let Some(user) = review.user.as_ref() else {
+            continue;
+        };
+        let login = user.login.trim();
+        if login.is_empty() {
+            continue;
+        }
+        if is_automation_review_login(login) {
+            continue;
+        }
+        let Some(state) = review.state else {
+            continue;
+        };
+        let state = match state {
+            ReviewState::Approved => "APPROVED",
+            ReviewState::ChangesRequested => "CHANGES_REQUESTED",
+            ReviewState::Commented => "COMMENTED",
+            ReviewState::Dismissed => "DISMISSED",
+            ReviewState::Open => "OPEN",
+            ReviewState::Pending => "PENDING",
+            _ => continue,
+        };
+        latest_review_state_by_user.insert(login.to_string(), state.to_string());
+    }
+    latest_review_state_by_user
+}
+
+fn count_human_approvals(reviews: &[octocrab::models::pulls::Review]) -> usize {
+    latest_human_review_state_by_user(reviews)
+        .values()
+        .filter(|state| state.as_str() == "APPROVED")
+        .count()
 }
 
 fn derive_copilot_review_state(
@@ -2437,6 +2475,8 @@ struct GithubLinkStatusRow {
     sonar_state: Option<String>,
     review_state: Option<String>,
     requested_reviewers: Option<String>,
+    human_approval_count: Option<i64>,
+    human_approval_total: Option<i64>,
     copilot_review_state: Option<String>,
     target_branch: Option<String>,
     merge_state: Option<String>,
@@ -2502,6 +2542,8 @@ async fn upsert_cache_row(
                     link_status_dsl::sonar_state.eq(&row.sonar_state),
                     link_status_dsl::review_state.eq(&row.review_state),
                     link_status_dsl::requested_reviewers.eq(&row.requested_reviewers),
+                    link_status_dsl::human_approval_count.eq(&row.human_approval_count),
+                    link_status_dsl::human_approval_total.eq(&row.human_approval_total),
                     link_status_dsl::copilot_review_state.eq(&row.copilot_review_state),
                     link_status_dsl::target_branch.eq(&row.target_branch),
                     link_status_dsl::merge_state.eq(&row.merge_state),
@@ -3000,6 +3042,16 @@ mod tests {
         );
 
         assert_eq!(
+            derive_pr_review_state(
+                &[review("alice", "APPROVED")],
+                &requested_reviewers(&["bob"]),
+                1,
+                0,
+            ),
+            GithubPrReviewState::Accepted
+        );
+
+        assert_eq!(
             derive_pr_review_state(&[], &requested_reviewers(&["alice"]), 1, 0),
             GithubPrReviewState::Requested
         );
@@ -3050,6 +3102,16 @@ mod tests {
                 0,
             ),
             GithubPrReviewState::Rejected
+        );
+
+        assert_eq!(
+            count_human_approvals(&[
+                review("alice", "APPROVED"),
+                review("alice", "COMMENTED"),
+                review("bob", "APPROVED"),
+                review("copilot-pull-request-reviewer[bot]", "APPROVED"),
+            ]),
+            1
         );
     }
 
@@ -3203,6 +3265,8 @@ mod tests {
             sonar_state: None,
             review_state: None,
             requested_reviewers: None,
+            human_approval_count: None,
+            human_approval_total: None,
             copilot_review_state: None,
             target_branch: None,
             merge_state: None,
@@ -3248,6 +3312,8 @@ mod tests {
                 sonar: None,
                 review: GithubPrReviewState::None,
                 requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
                 copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
                 unresolved_review_threads: 0,
@@ -3267,6 +3333,8 @@ mod tests {
                 sonar: None,
                 review: GithubPrReviewState::None,
                 requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
                 copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
                 unresolved_review_threads: 0,
@@ -3293,6 +3361,8 @@ mod tests {
             sonar_state: None,
             review_state: Some(GithubPrReviewState::Accepted),
             requested_reviewers: None,
+            human_approval_count: Some(1),
+            human_approval_total: Some(1),
             copilot_review_state: Some(GithubPrCopilotReviewState::None),
             target_branch: Some("6.0.x".to_string()),
             merge_state: Some(GithubPrMergeState::Dirty),
@@ -3328,6 +3398,8 @@ mod tests {
             sonar_state: None,
             review_state: Some(GithubPrReviewState::Accepted.as_db().to_string()),
             requested_reviewers: None,
+            human_approval_count: None,
+            human_approval_total: None,
             copilot_review_state: None,
             target_branch: None,
             merge_state: None,
@@ -3349,6 +3421,8 @@ mod tests {
                 sonar: None,
                 review: GithubPrReviewState::Accepted,
                 requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
                 copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
                 unresolved_review_threads: 0,
@@ -3574,6 +3648,8 @@ mod tests {
                 sonar_state: None,
                 review_state: None,
                 requested_reviewers: None,
+                human_approval_count: None,
+                human_approval_total: None,
                 copilot_review_state: None,
                 target_branch: None,
                 merge_state: None,

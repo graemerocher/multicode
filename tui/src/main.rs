@@ -435,6 +435,17 @@ fn task_issue_reference(task: &WorkspaceTaskPersistentSnapshot) -> String {
     task.issue_url.clone()
 }
 
+fn pr_approval_progress_description(pr_status: &GithubPrStatus) -> Option<String> {
+    (pr_status.human_approval_count > 0
+        && pr_status.human_approval_total > pr_status.human_approval_count)
+        .then(|| {
+            format!(
+                "{}/{} approvals",
+                pr_status.human_approval_count, pr_status.human_approval_total
+            )
+        })
+}
+
 fn task_row_label(task: &WorkspaceTaskPersistentSnapshot) -> String {
     format!("➡️ {}", task_issue_reference(task))
 }
@@ -774,9 +785,23 @@ fn task_description(
         .as_ref()
         .is_some_and(crate::app::pr_is_ready_to_merge)
     {
+        let approval_progress = pr_status
+            .as_ref()
+            .and_then(pr_approval_progress_description);
         return pr_created_status
-            .map(|status| format!("Can be Merged {status}"))
-            .unwrap_or_else(|| format!("Can be Merged {}", task_issue_reference(task)));
+            .map(|status| {
+                approval_progress
+                    .as_ref()
+                    .map(|progress| format!("Can be Merged {status}; {progress}"))
+                    .unwrap_or_else(|| format!("Can be Merged {status}"))
+            })
+            .unwrap_or_else(|| {
+                let status = format!("Can be Merged {}", task_issue_reference(task));
+                approval_progress
+                    .as_ref()
+                    .map(|progress| format!("{status}; {progress}"))
+                    .unwrap_or(status)
+            });
     }
     if pr_status
         .as_ref()
