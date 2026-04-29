@@ -30,8 +30,9 @@ pub use config::{
     parse_optional_size_bytes,
 };
 pub use github_status_service::{
-    GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrReviewState, GithubPrState,
-    GithubPrStatus, GithubStatus, GithubStatusService, GithubStatusServiceError,
+    GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrCopilotReviewState,
+    GithubPrMergeState, GithubPrReviewState, GithubPrSonarState, GithubPrState, GithubPrStatus,
+    GithubStatus, GithubStatusService, GithubStatusServiceError,
 };
 pub use multicode_metadata_service::{MulticodeMetadataServiceError, multicode_metadata_service};
 pub use opencode_client_service::{OpencodeClientServiceError, opencode_client_service};

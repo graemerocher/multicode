@@ -1,6 +1,8 @@
 use crate::ops::*;
 use crate::system::*;
 use crate::*;
+use multicode_lib::CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS;
+use multicode_lib::services::{GithubPrMergeState, GithubPrReviewState};
 use multicode_lib::services::{
     GithubTokenConfig,
     codex_app_server::{CodexAppServerClient, CodexThreadStatus},
@@ -9,8 +11,20 @@ use std::os::unix::fs::FileTypeExt;
 
 const NERD_FONT_GITHUB_GLYPH: &str = "\u{f408}";
 const CODEX_AUTO_RESUME_PROMPT: &str = "Continue autonomously from where you left off. Do not wait for approval for repository commands, builds, Gradle tasks, or focused tests. Only stop to ask before committing, pushing, commenting on GitHub, or opening or updating a pull request.";
-pub(crate) const CODEX_CREATE_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing. Create or update the pull request now from this task checkout. Push the branch if needed, use the correct upstream base branch, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements, write the pull request body with actual newlines instead of literal `\\n` escape sequences and prefer `gh pr create --body-file` or `gh pr edit --body-file` for multiline descriptions, assign the pull request to yourself, assign it automatically to the next Micronaut project release at the organization level under https://github.com/orgs/micronaut-projects/projects, prefer the next semantically versioned release project that is typically suffixed with a milestone such as `5.0.0-M2` and otherwise suffixed with `Release` such as `5.0.0 Release`, request Copilot review, emit the <multicode:pr> link, and stop once the PR is ready for human review. If a PR already exists, update it instead of creating a duplicate. Do not merge the PR.";
+const QUEUED_UNTIL_VM_FREE_STATUS: &str = "Queued until VM is free";
+pub(crate) const CODEX_CREATE_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing. Create or update the pull request now from this task checkout. Push the branch if needed, use the correct upstream base branch, include an appropriate type label such as `type: docs` for documentation-only changes, `type: bug` for bug fixes, `type: improvement` for minor improvements, or `type: enhancement` for broader enhancements, write the pull request body with actual newlines instead of literal `\\n` escape sequences and prefer `gh pr create --body-file` or `gh pr edit --body-file` for multiline descriptions, assign the pull request to yourself, assign it automatically to the next Micronaut project release at the organization level under https://github.com/orgs/micronaut-projects/projects, prefer the next semantically versioned release project that is typically suffixed with a milestone such as `5.0.0-M2` and otherwise suffixed with `Release` such as `5.0.0 Release`, request a review from `copilot-pull-request-reviewer` as a reviewer, not as an assignee, as soon as the pull request exists when that reviewer is available, verify the request succeeded instead of assuming it did, but do not block PR readiness if Copilot review is unavailable due to limits or permissions, emit the <multicode:pr> link, and stop once the PR is ready for human review. If a PR already exists, update it instead of creating a duplicate. Do not merge the PR.";
+pub(crate) const CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT: &str = "The local changes for this task are approved for publishing to the existing pull request. Commit local changes if needed, push the current branch to the same pull request, refresh the pull request metadata if that is needed to reflect the latest work, request `copilot-pull-request-reviewer` as a reviewer, not as an assignee, when that reviewer is available and has not already reviewed the latest PR, verify the request succeeded instead of assuming it did, but do not block PR readiness if Copilot review is unavailable due to limits or permissions, emit the <multicode:pr> link, and stop once the existing PR is updated for human review. Do not create a duplicate pull request. Do not merge the PR.";
+pub(crate) const CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT: &str = "The local changes that address pull request review feedback are approved for publishing. Continue from the review-fix context already in this session: use the specific review threads you identified as addressed, not every unresolved thread on the PR. Commit local changes if needed, push the branch updates to the existing pull request, then re-fetch the latest review threads. For each addressed thread only, leave a follow-up reply saying whether the feedback was fixed, already fixed by the current pushed branch, outdated by newer code, or intentionally not fixed; if it was not fixed, explain concretely why the requested change would be incorrect, unnecessary, not applicable, or unsafe. Resolve only those addressed, already-fixed, or outdated threads after the reply is posted when a reply is useful, and when GitHub allows it. Do not reply to or resolve unrelated unresolved threads, new reviewer comments, or feedback you did not address. After pushing, request `copilot-pull-request-reviewer` as a reviewer, not as an assignee, for another review when that reviewer is available; if unavailable due to limits or permissions, report that and do not block PR readiness. Emit the <multicode:pr> link and stop once the pull request is ready for another human pass. Do not create a new pull request. Do not merge the PR.";
+pub(crate) const CODEX_PUBLISH_SONAR_FIX_APPROVAL_PROMPT: &str = "The local Sonar or vulnerability-fix changes for this task are approved for publishing. Commit local changes if needed, push the branch updates to the existing pull request, monitor the relevant Sonar or vulnerability scan checks after each push, and keep addressing remaining failures until those checks are green or you need human input. After the final push, request `copilot-pull-request-reviewer` as a reviewer, not as an assignee, for another review when that reviewer is available; if unavailable due to limits or permissions, report that and do not block PR readiness. Emit the <multicode:pr> link while you work. Do not create a new pull request. Do not merge the PR.";
 const CODEX_FIX_CI_INSTRUCTIONS: &str = "Fix any failing CI checks for this task's existing pull request, including Sonar failures. Existing tests must never be changed just to satisfy failing checks or to mask regressions; preserve the intended existing behavior. Push fixes as needed, monitor CI after each push, and continue until the pull request is green. Do not create a new pull request. Do not merge the pull request. Stop only when all CI is passing or you need human input.";
+const CODEX_FIX_SONAR_INSTRUCTIONS: &str = "Fix the SonarCloud or SonarQube failures for this task's existing pull request. First inspect the exact Sonar report instead of guessing: use `gh pr view --json statusCheckRollup` to find the Sonar details URL, then fetch and review the failing quality gate conditions and actionable findings such as bugs, vulnerabilities, security hotspots, code smells, coverage, duplication, and dependency CVEs. If Sonar or the build logs indicate a vulnerable dependency, inspect the Gradle dependency tree to trace where that dependency comes from, determine whether the affected version is declared in `gradle/libs.versions.toml`, introduced directly in the current module, inherited from a Micronaut dependency, or pulled from another third-party dependency, and then update the narrowest correct source of truth. When the vulnerable artifact comes from a Micronaut-managed dependency or Micronaut module, first try upgrading that Micronaut dependency to the newest relevant version that can solve the problem, instead of introducing a new direct override for the transitive library; for example, prefer moving `micronaut-kafka` from `6.0.0-M1` to `6.0.0-M2` before adding or overriding `kafka-clients` directly. Only add or change a version in `gradle/libs.versions.toml` for the transitive library itself as a last resort when the correct higher-level Micronaut or existing direct dependency upgrade cannot solve the CVE cleanly. When evaluating upgrade candidates, handle both standard semantic versions and Micronaut milestone versions such as `5.0.0-M10` and `5.0.0-M11`, treating the higher milestone number as newer. For any dependency you do decide to update, prefer the highest safe patch release within the chosen release line, and for milestone versions prefer the highest available `-M` suffix in that line. Use that report and dependency analysis to drive the fixes in the existing checkout, run focused verification locally, and leave the branch ready for approval. Existing tests must never be weakened just to satisfy Sonar; preserve the intended existing behavior. Do not commit, do not push, and do not publish pull request updates until explicit approval. Do not create a new pull request. Do not merge the pull request. Stop only when the local Sonar-related fixes are ready for approval or you need human input.";
+const CODEX_FIX_PR_REVIEW_INSTRUCTIONS: &str = "Fetch the latest pull request review feedback, requested changes, review comments, regular PR comments, and unresolved review threads for this task's existing pull request. For each unresolved thread, determine whether it still needs code or test changes, is already fixed by the current pushed PR branch, is outdated by newer code, or is not valid/not applicable. Address actionable feedback in the existing checkout, run focused verification locally, and leave the branch ready for approval. Do not commit, do not push, and do not post or resolve review-thread replies for feedback that required local code changes until explicit approval. If a thread requires no local code change because it is already fixed and pushed, outdated, invalid, unsafe, or not applicable, immediately leave a concise follow-up reply explaining that reason when a reply is useful, then resolve only that thread when GitHub allows it. If there is no actionable code feedback, perform any needed GitHub-only replies/resolutions, summarize what was resolved or intentionally left open, and stop. Once local fixes are prepared, summarize exactly what should be published and which review threads were addressed. Do not create a new pull request. Do not merge the pull request.";
+const CODEX_REVIEW_FIX_MODE_MARKER: &str =
+    "unresolved review threads for this task's existing pull request";
+const CODEX_SONAR_FIX_MODE_MARKER: &str =
+    "SonarCloud or SonarQube failures for this task's existing pull request";
+const CODEX_REBASE_PR_INSTRUCTIONS: &str = "Determine the pull request's current target/base branch before making any git history changes. Fetch the latest refs for the target branch and rebase the existing task branch onto that target branch. Resolve rebase conflicts carefully without dropping intended behavior, run focused verification locally after the rebase, and update the same pull request branch. Force-push only if needed to publish the rebased branch history to the existing pull request. Do not create a new pull request. Do not merge the pull request. Stop only when the rebase and verification are complete or you need human input.";
+const CODEX_MERGE_PR_INSTRUCTIONS: &str = "Merge this task's existing pull request once it is truly ready. Before merging, confirm the pull request is still open, all required build checks are green, Sonar or vulnerability scanning is green when configured, unresolved review threads are zero, and the pull request has the necessary human approval. If the branch is out of date, update it in the narrowest safe way first and re-check status. Use the repository's normal GitHub merge flow, prefer the default merge strategy unless the repository clearly requires another, and do not create a new pull request. After the merge succeeds, emit the machine-readable PR tag and stop.";
 
 pub(crate) fn build_codex_fix_ci_prompt(
     assigned_repository: &str,
@@ -37,7 +51,9 @@ pub(crate) fn build_codex_fix_ci_prompt(
 Continue autonomously from where you left off.\n\
 Start from the existing checkout for GitHub issue {issue_url}.\n\
 Primary checkout for this task: {cwd}\n\
-Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+Before you proceed, load and follow these workspace skills as appropriate: `machine-readable-clone`, `machine-readable-issue`, `git-commit-coauthorship`, and `autonomous-state`.\n\
+This TUI merge command is an explicit human approval to merge this pull request, overriding general workspace guidance that agents should not merge PRs. Do not apply `machine-readable-pr` or Micronaut guide no-merge rules to this specific command.\n\
+{subagent_instructions}\n\
 For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
 {session_instruction}\
 {pr_instruction}\n\
@@ -55,23 +71,223 @@ Keep going until CI is green or you need human feedback.",
         cwd = cwd.display(),
         task_state_path = task_state_path.display(),
         session_instruction = session_instruction,
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
         instructions = CODEX_FIX_CI_INSTRUCTIONS
+    )
+}
+
+pub(crate) fn build_codex_fix_pr_review_prompt(
+    assigned_repository: &str,
+    issue_url: &str,
+    backing_pr_url: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+    task_session_id: Option<&str>,
+) -> String {
+    let session_instruction = task_session_id.map_or_else(String::new, |task_session_id| {
+        format!(
+            "For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\\\n"
+        )
+    });
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Continue autonomously from where you left off.\n\
+Start from the existing checkout for GitHub issue {issue_url}.\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+{subagent_instructions}\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+{session_instruction}\
+Use the existing pull request {backing_pr_url}.\n\
+Your job is to:\n\
+1. Fetch the latest PR review state and comments from GitHub, including requested changes, review comments, regular PR comments, and unresolved review threads.\n\
+2. Identify the actionable feedback that still needs code or test changes.\n\
+3. Fix the underlying issues in the existing checkout.\n\
+4. Run focused verification locally.\n\
+5. Summarize exactly what is ready to publish once approval is given.\n\
+6. Emit the machine-readable repository / issue / PR tags while you work.\n\
+7. Run repository commands, builds, Gradle tasks, focused tests, and local code edits as needed without asking for permission.\n\
+{instructions}\n\
+\n\
+Keep going until the local PR feedback fixes are ready for approval or you need human feedback.",
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        session_instruction = session_instruction,
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
+        instructions = CODEX_FIX_PR_REVIEW_INSTRUCTIONS
+    )
+}
+
+pub(crate) fn build_codex_rebase_task_prompt(
+    assigned_repository: &str,
+    issue_url: &str,
+    backing_pr_url: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+    task_session_id: Option<&str>,
+) -> String {
+    let session_instruction = task_session_id.map_or_else(String::new, |task_session_id| {
+        format!(
+            "For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\\\n"
+        )
+    });
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Continue autonomously from where you left off.\n\
+Start from the existing checkout for GitHub issue {issue_url}.\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+{subagent_instructions}\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+{session_instruction}\
+Use the existing pull request {backing_pr_url}.\n\
+Your job is to:\n\
+1. Inspect the existing pull request metadata and determine its current target/base branch.\n\
+2. Fetch the latest target branch refs and rebase the current task branch onto that target branch.\n\
+3. Resolve any conflicts carefully in the existing checkout.\n\
+4. Run focused verification locally after the rebase.\n\
+5. Push branch updates as needed to keep the same pull request current.\n\
+6. Emit the machine-readable repository / issue / PR tags while you work.\n\
+7. Run repository commands, builds, Gradle tasks, focused tests, git commits, rebases, branch pushes, and pull request updates as needed without asking for permission.\n\
+{instructions}\n\
+\n\
+Keep going until the rebase is complete or you need human feedback.",
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        session_instruction = session_instruction,
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
+        instructions = CODEX_REBASE_PR_INSTRUCTIONS
+    )
+}
+
+pub(crate) fn build_codex_fix_sonar_prompt(
+    assigned_repository: &str,
+    issue_url: &str,
+    backing_pr_url: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+    task_session_id: Option<&str>,
+) -> String {
+    let session_instruction = task_session_id.map_or_else(String::new, |task_session_id| {
+        format!(
+            "For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\\\n"
+        )
+    });
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Continue autonomously from where you left off.\n\
+Start from the existing checkout for GitHub issue {issue_url}.\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, `autonomous-state`, and `sonar-pr-report`.\n\
+{subagent_instructions}\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+{session_instruction}\
+Use the existing pull request {backing_pr_url}.\n\
+Your job is to:\n\
+1. Inspect the current Sonar status for this task and identify the exact failing quality gate conditions and findings.\n\
+2. If Sonar points to vulnerable dependencies, use Gradle dependency insight or dependency tree output to trace the real source of the vulnerable version before editing anything.\n\
+3. Determine whether the vulnerable dependency is owned by the current module, `gradle/libs.versions.toml`, a Micronaut-managed dependency, or another third-party dependency, and update the narrowest correct version source.\n\
+4. If the vulnerable artifact comes through a Micronaut-managed dependency or Micronaut module, first try upgrading that Micronaut dependency to the newest relevant version that can solve the issue instead of introducing a new direct override for the transitive library.\n\
+5. When comparing candidate upgrades, handle both normal semantic versions and milestone versions such as `5.0.0-M10` < `5.0.0-M11`, and for any dependency you choose to update prefer the highest safe patch or milestone suffix within the selected version line.\n\
+6. Only add or change a version in `gradle/libs.versions.toml` for the transitive library itself as a last resort when the correct higher-level Micronaut or existing direct dependency upgrade cannot solve the problem cleanly.\n\
+7. Fix the underlying Sonar issues in the existing checkout.\n\
+8. Run focused verification locally.\n\
+9. Summarize exactly what is ready to publish once approval is given.\n\
+10. Emit the machine-readable repository / issue / PR tags while you work.\n\
+11. Run repository commands, builds, Gradle tasks, focused tests, and local code edits as needed without asking for permission.\n\
+{instructions}\n\
+\n\
+Keep going until the local Sonar-related fixes are ready for approval or you need human feedback.",
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        session_instruction = session_instruction,
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
+        instructions = CODEX_FIX_SONAR_INSTRUCTIONS
+    )
+}
+
+pub(crate) fn build_codex_merge_task_prompt(
+    assigned_repository: &str,
+    issue_url: &str,
+    backing_pr_url: &str,
+    cwd: &std::path::Path,
+    task_state_path: &std::path::Path,
+    task_session_id: Option<&str>,
+) -> String {
+    let session_instruction = task_session_id.map_or_else(String::new, |task_session_id| {
+        format!(
+            "For this task session/thread, write autonomous state updates in the format `<state>:{task_session_id}` so multicode can attribute the state to this specific session.\n\\\n"
+        )
+    });
+    format!(
+        "You are operating in an autonomous multicode workspace for repository {assigned_repository}.\n\
+Continue autonomously from where you left off.\n\
+Start from the existing checkout for GitHub issue {issue_url}.\n\
+Primary checkout for this task: {cwd}\n\
+Before you proceed, load and follow these workspace skills as appropriate: `independent-fix`, `machine-readable-clone`, `machine-readable-issue`, `machine-readable-pr`, `git-commit-coauthorship`, `micronaut-projects-guide`, and `autonomous-state`.\n\
+{subagent_instructions}\n\
+For this task, write autonomous state updates to `{task_state_path}`. Do not write task state to any shared workspace file.\n\
+{session_instruction}\
+Use the existing pull request {backing_pr_url}.\n\
+Your job is to:\n\
+1. Re-check the current pull request status on GitHub before merging anything.\n\
+2. Confirm the pull request is still green, has no unresolved review threads, and has the required approval.\n\
+3. If the pull request needs a final safe branch update before merge, do that first and verify again.\n\
+4. Merge the existing pull request using the correct repository flow.\n\
+5. Emit the machine-readable repository / issue / PR tags while you work.\n\
+6. Run repository commands, builds, Gradle tasks, focused tests, git commits, branch pushes, and pull request updates as needed without asking for permission.\n\
+{instructions}\n\
+\n\
+Keep going until the pull request is merged or you need human feedback.",
+        cwd = cwd.display(),
+        task_state_path = task_state_path.display(),
+        session_instruction = session_instruction,
+        subagent_instructions = CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS,
+        instructions = CODEX_MERGE_PR_INSTRUCTIONS
     )
 }
 
 pub(crate) fn repository_diff_shell_command() -> &'static str {
     r#"tmp="$(mktemp -t multicode-diff.XXXXXX)" || exit 1
+base_ref=""
+upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+current_branch="$(git branch --show-current 2>/dev/null || true)"
+default_ref="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+same_name_ref=""
+if [ -n "$current_branch" ] && git rev-parse --verify --quiet "refs/remotes/origin/$current_branch^{commit}" >/dev/null; then
+  same_name_ref="origin/$current_branch"
+fi
+if [ -n "$default_ref" ]; then
+  base_ref="$default_ref"
+elif [ -n "$upstream" ]; then
+  base_ref="$upstream"
+elif [ -n "$same_name_ref" ]; then
+  base_ref="$same_name_ref"
+fi
+section() {
+  printf '\033[1;36m%s\033[0m\n' "$1"
+  printf '\033[36m%*s\033[0m\n' "${#1}" '' | tr ' ' '='
+}
 {
-  echo "Git status"
-  echo "=========="
+  section "Git status"
   git status --short
   echo
-  echo "Git diff"
-  echo "========"
+  section "Uncommitted diff"
   git --no-pager diff --color=always --stat --patch HEAD --
+  echo
+  if [ -n "$base_ref" ]; then
+    merge_base="$(git merge-base HEAD "$base_ref")"
+    section "Committed branch diff ($base_ref..HEAD)"
+    git --no-pager log --oneline --decorate "$merge_base"..HEAD --
+    echo
+    git --no-pager diff --color=always --stat --patch "$merge_base"..HEAD --
+  else
+    section "Committed branch diff"
+    echo "No default remote base found; showing uncommitted diff only."
+  fi
 } >"$tmp"
 if [ ! -s "$tmp" ]; then
-  printf 'No local changes\n' >"$tmp"
+  printf 'No local or committed branch changes found\n' >"$tmp"
 fi
 if command -v less >/dev/null 2>&1; then
   less -R -X "$tmp"
@@ -269,6 +485,28 @@ pub(crate) fn should_restart_codex_task_for_pr_request(
     matches!(task_state.status.as_deref(), Some("NotLoaded"))
 }
 
+pub(crate) fn should_restart_codex_task_for_pr_approval(
+    has_pr_link: bool,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    approval_prompt: &str,
+) -> bool {
+    if should_restart_codex_task_for_pr_request(task_state) {
+        return true;
+    }
+    if approval_prompt == CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT
+        || approval_prompt == CODEX_PUBLISH_SONAR_FIX_APPROVAL_PROMPT
+    {
+        return false;
+    }
+    has_pr_link
+        && task_state.is_none_or(|task_state| {
+            task_state.git.is_none()
+                || task_state
+                    .git
+                    .is_some_and(|git| git.has_uncommitted_changes || git.has_unpushed_commits)
+        })
+}
+
 pub(crate) fn should_restart_codex_task_for_ci_fix(
     task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
 ) -> bool {
@@ -292,6 +530,18 @@ pub(crate) fn should_restart_codex_task_for_ci_fix(
     }
 }
 
+pub(crate) fn should_restart_codex_task_for_resume_prompt(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    resume_prompt: &str,
+) -> bool {
+    if resume_prompt.contains(CODEX_REBASE_PR_INSTRUCTIONS)
+        || resume_prompt.contains(CODEX_MERGE_PR_INSTRUCTIONS)
+    {
+        return should_restart_codex_task_for_pr_request(task_state);
+    }
+    should_restart_codex_task_for_ci_fix(task_state)
+}
+
 pub(crate) fn should_offer_codex_ci_fix(
     has_pr_link: bool,
     pr_status: Option<GithubPrStatus>,
@@ -306,6 +556,204 @@ pub(crate) fn should_offer_codex_ci_fix(
             Some(_) => false,
             None => true,
         }
+}
+
+pub(crate) fn should_offer_codex_sonar_fix(
+    has_pr_link: bool,
+    pr_status: Option<GithubPrStatus>,
+) -> bool {
+    has_pr_link
+        && matches!(
+            pr_status,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                sonar: Some(multicode_lib::services::GithubPrSonarState::Failed),
+                ..
+            })
+        )
+}
+
+pub(crate) fn should_offer_codex_pr_review_fix(
+    has_pr_link: bool,
+    pr_status: Option<GithubPrStatus>,
+) -> bool {
+    has_pr_link
+        && match pr_status {
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                unresolved_review_threads,
+                ..
+            }) => unresolved_review_threads > 0,
+            Some(_) => false,
+            None => false,
+        }
+}
+
+pub(crate) fn should_offer_codex_pr_rebase(
+    has_pr_link: bool,
+    pr_status: Option<GithubPrStatus>,
+) -> bool {
+    has_pr_link
+        && match pr_status {
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                ..
+            }) => true,
+            Some(_) => false,
+            None => true,
+        }
+}
+
+pub(crate) fn should_allow_codex_task_pr_rebase(
+    has_pr_link: bool,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+) -> bool {
+    should_allow_codex_task_pr_operation(has_pr_link, task_state, pr_status.clone())
+        || pr_status.as_ref().is_some_and(pr_needs_rebase)
+}
+
+pub(crate) fn should_allow_codex_task_pr_operation(
+    has_pr_link: bool,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+) -> bool {
+    should_allow_codex_task_pr_publish_approval(has_pr_link, task_state)
+        || pr_status
+            .as_ref()
+            .is_some_and(pr_is_ready_for_approval_queue)
+}
+
+pub(crate) fn should_allow_codex_task_pr_publish_approval(
+    _has_pr_link: bool,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> bool {
+    should_offer_codex_pr_creation(task_state) || task_has_local_publish_work(task_state)
+}
+
+pub(crate) fn task_has_local_publish_work(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> bool {
+    task_state
+        .and_then(|state| state.git)
+        .is_some_and(|git| git.has_uncommitted_changes || git.has_unpushed_commits)
+}
+
+pub(crate) fn pr_is_ready_for_approval_queue(pr_status: &GithubPrStatus) -> bool {
+    pr_status.state == GithubPrState::Open
+        && !pr_status.is_draft
+        && pr_mergeability_allows_ready_state(pr_status)
+        && pr_status.build == GithubPrBuildState::Succeeded
+        && !matches!(
+            pr_status.sonar,
+            Some(multicode_lib::services::GithubPrSonarState::Building)
+                | Some(multicode_lib::services::GithubPrSonarState::Failed)
+        )
+        && pr_status.unresolved_review_threads == 0
+        && matches!(
+            pr_status.review,
+            GithubPrReviewState::None
+                | GithubPrReviewState::Requested
+                | GithubPrReviewState::Accepted
+        )
+}
+
+pub(crate) fn pr_is_ready_to_merge(pr_status: &GithubPrStatus) -> bool {
+    pr_is_ready_for_approval_queue(pr_status) && pr_status.review == GithubPrReviewState::Accepted
+}
+
+pub(crate) fn pr_needs_rebase(pr_status: &GithubPrStatus) -> bool {
+    pr_status.state == GithubPrState::Open
+        && matches!(
+            pr_status.merge_state,
+            Some(GithubPrMergeState::Behind | GithubPrMergeState::Dirty)
+        )
+}
+
+fn pr_mergeability_allows_ready_state(pr_status: &GithubPrStatus) -> bool {
+    matches!(
+        pr_status.merge_state,
+        Some(GithubPrMergeState::Clean | GithubPrMergeState::HasHooks)
+    )
+}
+
+fn saved_prompt_matches_publish_mode(
+    saved_resume_prompt: Option<&str>,
+    current_prompt: Option<&str>,
+    mode_marker: &str,
+) -> bool {
+    saved_resume_prompt.is_some_and(|saved| {
+        let saved = saved.trim();
+        current_prompt.is_some_and(|current| saved == current.trim()) || saved.contains(mode_marker)
+    })
+}
+
+pub(crate) fn approval_prompt_for_task(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    review_fix_prompt: Option<&str>,
+    sonar_fix_prompt: Option<&str>,
+) -> String {
+    let task = task_persistent_snapshot(snapshot, task_id);
+    let issue_url = task.map(|task| task.issue_url.as_str());
+    let issue_reference = issue_url.and_then(compact_github_tooltip_target);
+    let issue_link_instruction = issue_url.map(|issue_url| {
+        let issue_label = issue_reference.as_deref().unwrap_or(issue_url);
+        format!(
+            " Link the pull request to the task issue {issue_label} by ending the PR body with a GitHub closing keyword such as `Resolves {issue_url}` or the equivalent issue number for the same repository."
+        )
+    });
+    let has_existing_pr = task
+        .and_then(|task| {
+            task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+                .or(task.backing_pr_url.as_deref())
+        })
+        .is_some();
+    if !has_existing_pr {
+        return format!(
+            "{CODEX_CREATE_PR_APPROVAL_PROMPT}{}",
+            issue_link_instruction.as_deref().unwrap_or_default()
+        );
+    }
+
+    let resume_prompt = task_runtime_snapshot(snapshot, task_id)
+        .and_then(|task_state| task_state.resume_prompt.as_deref())
+        .map(str::trim);
+    let review_fix_prompt = review_fix_prompt.map(str::trim);
+    let sonar_fix_prompt = sonar_fix_prompt.map(str::trim);
+
+    if saved_prompt_matches_publish_mode(
+        resume_prompt,
+        review_fix_prompt,
+        CODEX_REVIEW_FIX_MODE_MARKER,
+    ) {
+        CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT.to_string()
+    } else if saved_prompt_matches_publish_mode(
+        resume_prompt,
+        sonar_fix_prompt,
+        CODEX_SONAR_FIX_MODE_MARKER,
+    ) {
+        CODEX_PUBLISH_SONAR_FIX_APPROVAL_PROMPT.to_string()
+    } else {
+        format!(
+            "{CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT}{}",
+            issue_link_instruction.as_deref().unwrap_or_default()
+        )
+    }
+}
+
+pub(crate) fn should_offer_codex_pr_creation(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> bool {
+    let Some(task_state) = task_state else {
+        return false;
+    };
+
+    !task_state.waiting_on_vm
+        && matches!(
+            task_effective_agent_state(Some(task_state)),
+            Some(AutomationAgentState::Review | AutomationAgentState::Stale)
+        )
 }
 
 pub(crate) fn compact_github_tooltip_target(target: &str) -> Option<String> {
@@ -371,20 +819,151 @@ pub(crate) fn task_repository_spec(snapshot: &WorkspaceSnapshot, task_id: &str) 
     })
 }
 
+pub(crate) fn task_pr_status_for(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
+) -> Option<GithubPrStatus> {
+    let task = task_persistent_snapshot(snapshot, task_id)?;
+    let pr_link = task_pr_link(task, task_runtime_snapshot(snapshot, task_id))?;
+    let link = WorkspaceLink {
+        kind: WorkspaceLinkKind::Pr,
+        value: pr_link.to_string(),
+        source: WorkspaceLinkSource::Task,
+    };
+    match github_link_statuses.get(&link) {
+        Some(GithubLinkStatusView::Pr(pr_status)) => Some(pr_status.clone()),
+        _ => None,
+    }
+}
+
+fn ordered_task_ids_for_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
+) -> Vec<String> {
+    let mut active = Vec::new();
+    let mut waiting_for_approval = Vec::new();
+
+    for task in &snapshot.persistent.tasks {
+        let pr_status = task_pr_status_for(snapshot, &task.id, github_link_statuses);
+        if pr_status
+            .as_ref()
+            .is_some_and(|status| status.state == GithubPrState::Merged)
+        {
+            continue;
+        }
+        if pr_status
+            .as_ref()
+            .is_some_and(pr_is_ready_for_approval_queue)
+        {
+            waiting_for_approval.push(task.id.clone());
+        } else {
+            active.push(task.id.clone());
+        }
+    }
+
+    active.extend(waiting_for_approval);
+    active
+}
+
+pub(crate) fn task_entries_for_workspace_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    workspace_key: &str,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
+) -> Vec<TableEntry> {
+    let ordered_task_ids = ordered_task_ids_for_snapshot(snapshot, github_link_statuses);
+    let mut entries = Vec::with_capacity(ordered_task_ids.len() + 1);
+    let mut inserted_approval_separator = false;
+
+    for task_id in ordered_task_ids {
+        if !inserted_approval_separator
+            && task_pr_status_for(snapshot, &task_id, github_link_statuses)
+                .as_ref()
+                .is_some_and(pr_is_ready_for_approval_queue)
+        {
+            entries.push(TableEntry::ApprovalSeparator {
+                workspace_key: workspace_key.to_string(),
+            });
+            inserted_approval_separator = true;
+        }
+        entries.push(TableEntry::Task {
+            workspace_key: workspace_key.to_string(),
+            task_id,
+        });
+    }
+
+    entries
+}
+
+fn table_entry_is_selectable(entry: &TableEntry) -> bool {
+    !matches!(entry, TableEntry::ApprovalSeparator { .. })
+}
+
+fn next_selectable_table_row(entries: &[TableEntry], start_row: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .skip(start_row)
+        .find(|(_, entry)| table_entry_is_selectable(entry))
+        .map(|(index, _)| index)
+}
+
+fn previous_selectable_table_row(entries: &[TableEntry], start_row: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .take(start_row + 1)
+        .rev()
+        .find(|(_, entry)| table_entry_is_selectable(entry))
+        .map(|(index, _)| index)
+}
+
+fn normalize_selected_row(entries: &[TableEntry], selected_row: usize) -> usize {
+    if entries
+        .get(selected_row)
+        .is_some_and(table_entry_is_selectable)
+    {
+        return selected_row;
+    }
+
+    next_selectable_table_row(entries, selected_row)
+        .or_else(|| {
+            selected_row
+                .checked_sub(1)
+                .and_then(|row| previous_selectable_table_row(entries, row))
+        })
+        .unwrap_or(0)
+}
+
 pub(crate) fn has_available_task_slot(
     snapshot: &WorkspaceSnapshot,
     max_parallel_issues: usize,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
 ) -> bool {
-    snapshot.persistent.tasks.len() < max_parallel_issues
+    snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| {
+            !task_pr_status_for(snapshot, &task.id, github_link_statuses)
+                .as_ref()
+                .is_some_and(pr_is_ready_for_approval_queue)
+        })
+        .count()
+        < max_parallel_issues
 }
 
 pub(crate) fn should_request_autonomous_issue_scan(
     snapshot: &WorkspaceSnapshot,
     max_parallel_issues: usize,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
 ) -> bool {
-    snapshot.persistent.assigned_repository.is_some()
-        && !snapshot.persistent.archived
-        && has_available_task_slot(snapshot, max_parallel_issues)
+    should_request_autonomous_workspace_recheck(snapshot)
+        && has_available_task_slot(snapshot, max_parallel_issues, github_link_statuses)
+}
+
+pub(crate) fn should_request_autonomous_workspace_recheck(snapshot: &WorkspaceSnapshot) -> bool {
+    snapshot.persistent.assigned_repository.is_some() && !snapshot.persistent.archived
 }
 
 pub(crate) fn workspace_can_queue_next_issue(snapshot: &WorkspaceSnapshot) -> bool {
@@ -583,19 +1162,81 @@ pub(crate) fn should_queue_task_codex_resume_until_vm_available(
             Some(RootSessionStatus::Busy | RootSessionStatus::Question)
         );
     };
-    if active_task_id == task_id {
-        return false;
-    }
     let Some(active_task_state) = snapshot.task_states.get(&active_task_id) else {
         return matches!(
             snapshot.root_session_status,
             Some(RootSessionStatus::Busy | RootSessionStatus::Question)
         );
     };
+    if active_task_id == task_id {
+        return matches!(
+            snapshot.root_session_status,
+            Some(RootSessionStatus::Busy | RootSessionStatus::Question)
+        ) && task_can_yield_vm_for_attach(active_task_state);
+    }
     if active_task_state.waiting_on_vm {
         return false;
     }
+    if matches!(
+        snapshot.root_session_status,
+        Some(RootSessionStatus::Busy | RootSessionStatus::Question)
+    ) {
+        return true;
+    }
     !task_can_yield_vm_for_attach(active_task_state)
+}
+
+pub(crate) fn mark_task_deferred_codex_resume_waiting_on_vm(
+    snapshot: &mut WorkspaceSnapshot,
+    task_id: &str,
+    previous_active_task_id: Option<&str>,
+    resume_prompt: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    let task_issue_url = snapshot
+        .task_issue_url_for_id(task_id)
+        .map(ToOwned::to_owned);
+    let task_state = snapshot.task_states.entry(task_id.to_string()).or_default();
+    if task_state.agent_state != Some(AutomationAgentState::Working) {
+        task_state.agent_state = Some(AutomationAgentState::Working);
+        changed = true;
+    }
+    if task_state.session_status != Some(RootSessionStatus::Busy) {
+        task_state.session_status = Some(RootSessionStatus::Busy);
+        changed = true;
+    }
+    let task_status = Some(QUEUED_UNTIL_VM_FREE_STATUS.to_string());
+    if task_state.status != task_status {
+        task_state.status = task_status;
+        changed = true;
+    }
+    if !task_state.waiting_on_vm {
+        task_state.waiting_on_vm = true;
+        changed = true;
+    }
+    if let Some(resume_prompt) = resume_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        if task_state.resume_prompt.as_deref() != Some(resume_prompt) {
+            task_state.resume_prompt = Some(resume_prompt.to_string());
+            changed = true;
+        }
+    }
+    let previous_active_task_id = previous_active_task_id
+        .filter(|previous_active_task_id| *previous_active_task_id != task_id)
+        .map(str::to_string);
+    if snapshot.active_task_id != previous_active_task_id {
+        snapshot.active_task_id = previous_active_task_id;
+        changed = true;
+    }
+    if task_issue_url.as_deref() == snapshot.persistent.automation_issue.as_deref()
+        && snapshot.active_task_id.as_deref() != Some(task_id)
+    {
+        snapshot.persistent.automation_issue = None;
+        changed = true;
+    }
+    changed
 }
 
 pub(crate) fn restored_selected_row(
@@ -644,12 +1285,11 @@ impl TuiState {
                 workspace_key: key.clone(),
             });
             if let Some(snapshot) = self.snapshots.get(key) {
-                for task in &snapshot.persistent.tasks {
-                    entries.push(TableEntry::Task {
-                        workspace_key: key.clone(),
-                        task_id: task.id.clone(),
-                    });
-                }
+                entries.extend(task_entries_for_workspace_snapshot(
+                    snapshot,
+                    key,
+                    &self.github_link_statuses,
+                ));
             }
         }
         entries
@@ -670,9 +1310,18 @@ impl TuiState {
             }
             row += 1;
             if let Some(snapshot) = self.snapshots.get(key) {
-                for task in &snapshot.persistent.tasks {
+                for entry in
+                    task_entries_for_workspace_snapshot(snapshot, key, &self.github_link_statuses)
+                {
                     if row == self.selected_row {
-                        return Some(task.id.as_str());
+                        return match entry {
+                            TableEntry::Task { task_id, .. } => {
+                                task_persistent_snapshot(snapshot, &task_id)
+                                    .map(|task| task.id.as_str())
+                            }
+                            TableEntry::ApprovalSeparator { .. } => None,
+                            _ => None,
+                        };
                     }
                     row += 1;
                 }
@@ -818,10 +1467,13 @@ impl TuiState {
         self.refresh_github_link_statuses();
 
         let table_entries = self.table_entries();
-        self.selected_row = restored_selected_row(
+        self.selected_row = normalize_selected_row(
             &table_entries,
-            previous_selected_entry.as_ref(),
-            self.selected_row,
+            restored_selected_row(
+                &table_entries,
+                previous_selected_entry.as_ref(),
+                self.selected_row,
+            ),
         );
 
         if let Some(key) = self.selected_workspace_key()
@@ -947,9 +1599,16 @@ impl TuiState {
             }
             row += 1;
             if let Some(snapshot) = self.snapshots.get(key) {
-                for _task in &snapshot.persistent.tasks {
+                for entry in
+                    task_entries_for_workspace_snapshot(snapshot, key, &self.github_link_statuses)
+                {
                     if row == self.selected_row {
-                        return Some(key.as_str());
+                        return match entry {
+                            TableEntry::Task { .. } | TableEntry::ApprovalSeparator { .. } => {
+                                Some(key.as_str())
+                            }
+                            _ => None,
+                        };
                     }
                     row += 1;
                 }
@@ -1304,7 +1963,7 @@ impl TuiState {
             let status = self
                 .github_link_status_rxs
                 .get(&link)
-                .and_then(|receiver| *receiver.borrow())
+                .and_then(|receiver| receiver.borrow().clone())
                 .and_then(|status| match (link.kind, status) {
                     (WorkspaceLinkKind::Issue, GithubStatus::Issue(issue_status)) => {
                         Some(GithubLinkStatusView::Issue(issue_status))
@@ -1332,6 +1991,7 @@ impl TuiState {
             should_request_autonomous_issue_scan(
                 snapshot,
                 self.service.config.autonomous.max_parallel_issues,
+                &self.github_link_statuses,
             ) || self
                 .selected_workspace_selectable_links()
                 .into_iter()
@@ -1353,20 +2013,21 @@ impl TuiState {
         let autonomous_scan_requested = self
             .snapshots
             .get(&workspace_key)
-            .filter(|snapshot| {
-                should_request_autonomous_issue_scan(
-                    snapshot,
-                    self.service.config.autonomous.max_parallel_issues,
-                )
-            })
+            .filter(|snapshot| should_request_autonomous_workspace_recheck(snapshot))
             .map(|_| self.service.request_workspace_issue_scan(&workspace_key))
             .transpose();
 
         let requested_refreshes = self
-            .selected_workspace_selectable_links()
+            .snapshots
+            .get(&workspace_key)
+            .map(workspace_all_issue_pr_links)
+            .unwrap_or_default()
             .into_iter()
             .filter(|link| matches!(link.kind, WorkspaceLinkKind::Issue | WorkspaceLinkKind::Pr))
-            .filter_map(|link| self.selected_workspace_link_argument(&link))
+            .filter_map(|link| {
+                self.selected_workspace_link_argument(&link)
+                    .map(str::to_string)
+            })
             .filter(|url| self.service.github_status_service().request_refresh(url))
             .count();
 
@@ -1692,7 +2353,23 @@ impl TuiState {
         )
     }
 
-    fn selected_task_can_request_pr_creation(&self) -> bool {
+    pub(crate) fn selected_task_can_request_pr_creation(&self) -> bool {
+        if !self.selected_task_can_request_codex_pr_operation() {
+            return false;
+        }
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
+            return false;
+        };
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        should_allow_codex_task_pr_publish_approval(
+            self.selected_task_pr_link().is_some(),
+            task_runtime_snapshot(snapshot, task_id),
+        )
+    }
+
+    fn selected_task_can_request_codex_pr_operation(&self) -> bool {
         if self.selected_link_index.is_some() {
             return false;
         }
@@ -1710,7 +2387,7 @@ impl TuiState {
             && task_persistent_snapshot(snapshot, task_id).is_some()
     }
 
-    fn selected_task_pr_link(&self) -> Option<String> {
+    pub(crate) fn selected_task_pr_link(&self) -> Option<String> {
         let snapshot = self.selected_workspace_snapshot()?;
         let task_id = self.selected_task_id()?;
         let task = task_persistent_snapshot(snapshot, task_id)?;
@@ -1718,25 +2395,104 @@ impl TuiState {
     }
 
     fn selected_task_pr_status(&self) -> Option<GithubPrStatus> {
-        let pr_link = self.selected_task_pr_link()?;
-        let link = WorkspaceLink {
-            kind: WorkspaceLinkKind::Pr,
-            value: pr_link,
-            source: WorkspaceLinkSource::Task,
-        };
-        match self.github_link_statuses.get(&link) {
-            Some(GithubLinkStatusView::Pr(pr_status)) => Some(*pr_status),
-            _ => None,
-        }
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        task_pr_status_for(snapshot, task_id, &self.github_link_statuses)
     }
 
     pub(crate) fn selected_task_can_request_ci_fix(&self) -> bool {
-        self.selected_task_can_request_pr_creation()
+        self.selected_task_can_request_codex_pr_operation()
             && should_offer_codex_ci_fix(
                 self.selected_task_pr_link().is_some(),
                 self.selected_task_pr_status(),
             )
             && self.selected_task_ci_fix_prompt().is_some()
+    }
+
+    pub(crate) fn selected_task_can_request_sonar_fix(&self) -> bool {
+        self.selected_task_can_request_codex_pr_operation()
+            && should_offer_codex_sonar_fix(
+                self.selected_task_pr_link().is_some(),
+                self.selected_task_pr_status(),
+            )
+            && self.selected_task_sonar_fix_prompt().is_some()
+    }
+
+    pub(crate) fn selected_task_can_request_pr_review_fix(&self) -> bool {
+        self.selected_task_can_request_codex_pr_operation()
+            && should_offer_codex_pr_review_fix(
+                self.selected_task_pr_link().is_some(),
+                self.selected_task_pr_status(),
+            )
+            && self.selected_task_pr_review_fix_prompt().is_some()
+    }
+
+    pub(crate) fn selected_task_can_request_pr_rebase(&self) -> bool {
+        if self.selected_link_index.is_some() {
+            return false;
+        }
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return false;
+        }
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
+            return false;
+        };
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        workspace_is_usable(snapshot)
+            && workspace_state(snapshot) == WorkspaceUiState::Started
+            && task_persistent_snapshot(snapshot, task_id).is_some()
+            && should_allow_codex_task_pr_rebase(
+                self.selected_task_pr_link().is_some(),
+                task_runtime_snapshot(snapshot, task_id),
+                self.selected_task_pr_status(),
+            )
+            && should_offer_codex_pr_rebase(
+                self.selected_task_pr_link().is_some(),
+                self.selected_task_pr_status(),
+            )
+            && self.selected_task_pr_rebase_prompt().is_some()
+    }
+
+    pub(crate) fn selected_task_can_request_pr_merge(&self) -> bool {
+        if self.selected_link_index.is_some() {
+            return false;
+        }
+        if self.service.agent_provider() != multicode_lib::services::AgentProvider::Codex {
+            return false;
+        }
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
+            return false;
+        };
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        workspace_is_usable(snapshot)
+            && workspace_state(snapshot) == WorkspaceUiState::Started
+            && task_persistent_snapshot(snapshot, task_id).is_some()
+            && !task_has_local_publish_work(task_runtime_snapshot(snapshot, task_id))
+            && self
+                .selected_task_pr_status()
+                .as_ref()
+                .is_some_and(pr_is_ready_to_merge)
+            && self.selected_task_pr_merge_prompt().is_some()
+    }
+
+    pub(crate) fn selected_task_can_request_copilot_review(&self) -> bool {
+        if self.selected_link_index.is_some() {
+            return false;
+        }
+        let Some(snapshot) = self.selected_workspace_snapshot() else {
+            return false;
+        };
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        let Some(task) = task_persistent_snapshot(snapshot, task_id) else {
+            return false;
+        };
+        task_pr_link(task, task_runtime_snapshot(snapshot, task_id)).is_some()
     }
 
     fn selected_task_ci_fix_prompt(&self) -> Option<String> {
@@ -1770,11 +2526,187 @@ impl TuiState {
         ))
     }
 
+    fn selected_task_pr_review_fix_prompt(&self) -> Option<String> {
+        let workspace_key = self.selected_workspace_key()?;
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        let assigned_repository = task_repository_spec(snapshot, task_id)?;
+        let pr_url = task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+            .or(task.backing_pr_url.as_deref())?;
+        let cwd = self.service.workspace_task_checkout_path(
+            workspace_key,
+            &assigned_repository,
+            &task.issue_url,
+        );
+        let task_state_path = self
+            .service
+            .workspace_directory_path()
+            .join(".multicode")
+            .join("automation")
+            .join(workspace_key)
+            .join("tasks")
+            .join(format!("{task_id}.state"));
+        Some(build_codex_fix_pr_review_prompt(
+            &assigned_repository,
+            &task.issue_url,
+            pr_url,
+            &cwd,
+            &task_state_path,
+            task_runtime_snapshot(snapshot, task_id)
+                .and_then(|task_state| task_state.session_id.as_deref()),
+        ))
+    }
+
+    fn selected_task_pr_rebase_prompt(&self) -> Option<String> {
+        let workspace_key = self.selected_workspace_key()?;
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        let assigned_repository = task_repository_spec(snapshot, task_id)?;
+        let pr_url = task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+            .or(task.backing_pr_url.as_deref())?;
+        let cwd = self.service.workspace_task_checkout_path(
+            workspace_key,
+            &assigned_repository,
+            &task.issue_url,
+        );
+        let task_state_path = self
+            .service
+            .workspace_directory_path()
+            .join(".multicode")
+            .join("automation")
+            .join(workspace_key)
+            .join("tasks")
+            .join(format!("{task_id}.state"));
+        Some(build_codex_rebase_task_prompt(
+            &assigned_repository,
+            &task.issue_url,
+            pr_url,
+            &cwd,
+            &task_state_path,
+            task_runtime_snapshot(snapshot, task_id)
+                .and_then(|task_state| task_state.session_id.as_deref()),
+        ))
+    }
+
+    fn selected_task_sonar_fix_prompt(&self) -> Option<String> {
+        let workspace_key = self.selected_workspace_key()?;
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        let assigned_repository = task_repository_spec(snapshot, task_id)?;
+        let pr_url = task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+            .or(task.backing_pr_url.as_deref())?;
+        let cwd = self.service.workspace_task_checkout_path(
+            workspace_key,
+            &assigned_repository,
+            &task.issue_url,
+        );
+        let task_state_path = self
+            .service
+            .workspace_directory_path()
+            .join(".multicode")
+            .join("automation")
+            .join(workspace_key)
+            .join("tasks")
+            .join(format!("{task_id}.state"));
+        Some(build_codex_fix_sonar_prompt(
+            &assigned_repository,
+            &task.issue_url,
+            pr_url,
+            &cwd,
+            &task_state_path,
+            task_runtime_snapshot(snapshot, task_id)
+                .and_then(|task_state| task_state.session_id.as_deref()),
+        ))
+    }
+
+    fn selected_task_pr_merge_prompt(&self) -> Option<String> {
+        let workspace_key = self.selected_workspace_key()?;
+        let snapshot = self.selected_workspace_snapshot()?;
+        let task_id = self.selected_task_id()?;
+        let task = task_persistent_snapshot(snapshot, task_id)?;
+        let assigned_repository = task_repository_spec(snapshot, task_id)?;
+        let pr_url = task_pr_link(task, task_runtime_snapshot(snapshot, task_id))
+            .or(task.backing_pr_url.as_deref())?;
+        let cwd = self.service.workspace_task_checkout_path(
+            workspace_key,
+            &assigned_repository,
+            &task.issue_url,
+        );
+        let task_state_path = self
+            .service
+            .workspace_directory_path()
+            .join(".multicode")
+            .join("automation")
+            .join(workspace_key)
+            .join("tasks")
+            .join(format!("{task_id}.state"));
+        Some(build_codex_merge_task_prompt(
+            &assigned_repository,
+            &task.issue_url,
+            pr_url,
+            &cwd,
+            &task_state_path,
+            task_runtime_snapshot(snapshot, task_id)
+                .and_then(|task_state| task_state.session_id.as_deref()),
+        ))
+    }
+
     fn selected_task_default_github_url(&self) -> Option<String> {
         let snapshot = self.selected_workspace_snapshot()?;
         let task_id = self.selected_task_id()?;
         let task = task_persistent_snapshot(snapshot, task_id)?;
         Some(task_issue_link(task, task_runtime_snapshot(snapshot, task_id)).to_string())
+    }
+
+    async fn open_github_target(
+        &mut self,
+        workspace_key: &str,
+        target_description: &str,
+        url: String,
+    ) {
+        let (program, args) = match build_handler_command(
+            &self.service.config.handler.web,
+            multicode_lib::HandlerArgumentMode::Argument,
+            &url,
+        ) {
+            Ok(command) => command,
+            Err(err) => {
+                self.status = format!(
+                    "Invalid web handler configuration for workspace '{}': {err}",
+                    workspace_key
+                );
+                return;
+            }
+        };
+
+        let result =
+            dispatch_web_handler_action(self.relay_socket.as_deref(), &program, &args, &url).await;
+
+        match result {
+            Ok(()) => {
+                self.status =
+                    format!("Opened {target_description} for workspace '{workspace_key}'");
+            }
+            Err(err) => {
+                self.status = format!(
+                    "Failed to open {target_description} for workspace '{workspace_key}': {err}"
+                );
+            }
+        }
+    }
+
+    async fn open_selected_task_pr_target(&mut self) {
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            return;
+        };
+        let Some(url) = self.selected_task_pr_link() else {
+            return;
+        };
+        self.open_github_target(&workspace_key, "GitHub PR", url)
+            .await;
     }
 
     async fn approve_selected_task_for_pr_creation(&mut self) {
@@ -1790,9 +2722,20 @@ impl TuiState {
         let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
             return;
         };
+        let review_fix_prompt = self.selected_task_pr_review_fix_prompt();
+        let sonar_fix_prompt = self.selected_task_sonar_fix_prompt();
+        let approval_prompt = approval_prompt_for_task(
+            &snapshot,
+            &task_id,
+            review_fix_prompt.as_deref(),
+            sonar_fix_prompt.as_deref(),
+        );
         let previous_snapshot = snapshot.clone();
-        let should_restart =
-            should_restart_codex_task_for_ci_fix(task_runtime_snapshot(&snapshot, &task_id));
+        let should_restart = should_restart_codex_task_for_pr_approval(
+            self.selected_task_pr_link().is_some(),
+            task_runtime_snapshot(&snapshot, &task_id),
+            &approval_prompt,
+        );
         let (progress_tx, progress_rx) =
             watch::channel("Preparing PR approval request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
@@ -1800,12 +2743,36 @@ impl TuiState {
         let workspace_key_for_task = workspace_key.clone();
         let task_id_for_task = task_id.clone();
 
+        if should_queue_task_codex_resume_until_vm_available(&snapshot, &task_id) {
+            self.persist_task_resume_prompt(&workspace_key, &task_id, &approval_prompt);
+            self.mark_task_waiting_on_vm_after_attach(&workspace_key, &task_id);
+            self.queue_task_codex_resume_until_vm_available(
+                workspace_key.clone(),
+                task_id.clone(),
+                AttachedSession {
+                    workspace_key: workspace_key.clone(),
+                    task_id: Some(task_id.clone()),
+                    session_id: task_runtime_snapshot(&snapshot, &task_id)
+                        .and_then(|task_state| task_state.session_id.clone()),
+                    initial_agent_state: None,
+                    initial_turn_metrics: None,
+                    fresh_codex_session: false,
+                },
+                Some(approval_prompt),
+                Some(should_restart),
+            );
+            self.status = format!(
+                "Queued PR approval request for '{task_id}' in workspace '{workspace_key}' until the VM is free"
+            );
+            return;
+        }
+
         self.mark_task_resuming_in_background(&workspace_key, &task_id);
         tokio::spawn(async move {
             let progress_message = if should_restart {
-                "Restarting the Codex review session before asking for PR creation..."
+                "Restarting the Codex review session before asking it to publish the approved changes..."
             } else {
-                "Asking Codex to create or update the PR..."
+                "Asking Codex to publish the approved changes..."
             };
             let _ = progress_tx.send(progress_message.to_string());
             let result = if should_restart {
@@ -1814,7 +2781,7 @@ impl TuiState {
                         &workspace_key_for_task,
                         &snapshot,
                         &task_id_for_task,
-                        CODEX_CREATE_PR_APPROVAL_PROMPT,
+                        &approval_prompt,
                     )
                     .await
             } else {
@@ -1823,23 +2790,9 @@ impl TuiState {
                         &workspace_key_for_task,
                         &snapshot,
                         &task_id_for_task,
-                        CODEX_CREATE_PR_APPROVAL_PROMPT,
+                        &approval_prompt,
                     )
                     .await
-            };
-
-            let result = match result {
-                Ok(()) => {
-                    service
-                        .prompt_task_session(
-                            &workspace_key_for_task,
-                            &snapshot,
-                            &task_id_for_task,
-                            CODEX_AUTO_RESUME_PROMPT,
-                        )
-                        .await
-                }
-                Err(err) => Err(err),
             };
 
             if let Err(err) = result {
@@ -1893,7 +2846,8 @@ impl TuiState {
             }
 
             let _ = progress_tx.send(
-                "Codex accepted the PR request and is continuing in the background.".to_string(),
+                "Codex accepted the approved publish request and is continuing in the background."
+                    .to_string(),
             );
             let _ = result_tx.send(Ok(()));
         });
@@ -1902,7 +2856,7 @@ impl TuiState {
             workspace_key: workspace_key.clone(),
             operation_name: format!("Approve {task_id}"),
             success_status: Some(format!(
-                "PR request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+                "Approved publish request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
             )),
             progress_rx,
             result_rx,
@@ -1910,7 +2864,7 @@ impl TuiState {
             cancel: None,
         });
         self.status = format!(
-            "Approved local changes for '{task_id}' in workspace '{workspace_key}'; sending the PR request to Codex in the background"
+            "Approved local changes for '{task_id}' in workspace '{workspace_key}'; sending the publish request to Codex in the background"
         );
     }
 
@@ -1943,8 +2897,10 @@ impl TuiState {
             return;
         };
         let previous_snapshot = snapshot.clone();
-        let should_restart =
-            should_restart_codex_task_for_ci_fix(task_runtime_snapshot(&snapshot, &task_id));
+        let should_restart = should_restart_codex_task_for_resume_prompt(
+            task_runtime_snapshot(&snapshot, &task_id),
+            &prompt,
+        );
         let (progress_tx, progress_rx) = watch::channel("Preparing CI fix request...".to_string());
         let (result_tx, result_rx) = oneshot::channel();
         let service = self.service.clone();
@@ -2050,6 +3006,724 @@ impl TuiState {
         });
         self.status = format!(
             "Requested CI fixes for '{task_id}' in workspace '{workspace_key}'; sending the request to Codex in the background"
+        );
+    }
+
+    async fn fix_selected_task_sonar(&mut self) {
+        if !self.selected_task_can_request_sonar_fix() {
+            self.status = "Fix Sonar is unavailable for the selected task".to_string();
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Fix Sonar is unavailable because the selected workspace could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Fix Sonar is unavailable because the selected task could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(prompt) = self.selected_task_sonar_fix_prompt() else {
+            self.status = format!(
+                "Fix Sonar is unavailable for '{task_id}' in workspace '{workspace_key}' because its PR or checkout context could not be resolved"
+            );
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            self.status = format!(
+                "Fix Sonar is unavailable for '{task_id}' in workspace '{workspace_key}' because the latest workspace snapshot is missing"
+            );
+            return;
+        };
+        let previous_snapshot = snapshot.clone();
+        let should_restart = should_restart_codex_task_for_resume_prompt(
+            task_runtime_snapshot(&snapshot, &task_id),
+            &prompt,
+        );
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing Sonar fix request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+        let task_id_for_task = task_id.clone();
+        self.persist_task_resume_prompt(&workspace_key, &task_id, &prompt);
+
+        self.mark_task_resuming_in_background(&workspace_key, &task_id);
+        tokio::spawn(async move {
+            let progress_message = if should_restart {
+                "Restarting the Codex task session before asking it to fix Sonar..."
+            } else {
+                "Asking Codex to fix Sonar failures and continue in the background..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            };
+
+            if let Err(err) = result {
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
+                    workspace.update(|next| {
+                        let mut changed = false;
+                        match previous_snapshot
+                            .task_states
+                            .get(&task_id_for_task)
+                            .cloned()
+                        {
+                            Some(previous_task_state) => {
+                                if next.task_states.get(&task_id_for_task)
+                                    != Some(&previous_task_state)
+                                {
+                                    next.task_states
+                                        .insert(task_id_for_task.clone(), previous_task_state);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if next.task_states.remove(&task_id_for_task).is_some() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if next.active_task_id != previous_snapshot.active_task_id {
+                            next.active_task_id = previous_snapshot.active_task_id.clone();
+                            changed = true;
+                        }
+                        if next.automation_agent_state != previous_snapshot.automation_agent_state {
+                            next.automation_agent_state = previous_snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status
+                            != previous_snapshot.automation_session_status
+                        {
+                            next.automation_session_status =
+                                previous_snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != previous_snapshot.automation_status {
+                            next.automation_status = previous_snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                let _ = result_tx.send(Err(err));
+                return;
+            }
+
+            let _ = progress_tx.send(
+                "Codex accepted the Sonar fix request and is continuing in the background."
+                    .to_string(),
+            );
+            let _ = result_tx.send(Ok(()));
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Fix Sonar {task_id}"),
+            success_status: Some(format!(
+                "Sonar fix request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+            )),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::None,
+            cancel: None,
+        });
+        self.status = format!(
+            "Requested Sonar fixes for '{task_id}' in workspace '{workspace_key}'; sending the request to Codex in the background"
+        );
+    }
+
+    async fn fix_selected_task_pr_review(&mut self) {
+        if !self.selected_task_can_request_pr_review_fix() {
+            self.status = "Review fix is unavailable for the selected task".to_string();
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Review fix is unavailable because the selected workspace could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Review fix is unavailable because the selected task could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(prompt) = self.selected_task_pr_review_fix_prompt() else {
+            self.status = format!(
+                "Review fix is unavailable for '{task_id}' in workspace '{workspace_key}' because its PR or checkout context could not be resolved"
+            );
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            self.status = format!(
+                "Review fix is unavailable for '{task_id}' in workspace '{workspace_key}' because the latest workspace snapshot is missing"
+            );
+            return;
+        };
+        let previous_snapshot = snapshot.clone();
+        let should_restart = should_restart_codex_task_for_resume_prompt(
+            task_runtime_snapshot(&snapshot, &task_id),
+            &prompt,
+        );
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing PR review fix request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+        let task_id_for_task = task_id.clone();
+        self.persist_task_resume_prompt(&workspace_key, &task_id, &prompt);
+
+        if should_queue_task_codex_resume_until_vm_available(&snapshot, &task_id) {
+            self.mark_task_waiting_on_vm_after_attach(&workspace_key, &task_id);
+            self.queue_task_codex_resume_until_vm_available(
+                workspace_key.clone(),
+                task_id.clone(),
+                AttachedSession {
+                    workspace_key: workspace_key.clone(),
+                    task_id: Some(task_id.clone()),
+                    session_id: task_runtime_snapshot(&snapshot, &task_id)
+                        .and_then(|task_state| task_state.session_id.clone()),
+                    initial_agent_state: None,
+                    initial_turn_metrics: None,
+                    fresh_codex_session: false,
+                },
+                Some(prompt),
+                Some(should_restart),
+            );
+            self.status = format!(
+                "Queued PR review fix request for '{task_id}' in workspace '{workspace_key}' until the VM is free"
+            );
+            return;
+        }
+
+        self.mark_task_resuming_in_background(&workspace_key, &task_id);
+        tokio::spawn(async move {
+            let progress_message = if should_restart {
+                "Restarting the Codex task session before asking it to address PR feedback..."
+            } else {
+                "Asking Codex to address PR review feedback and continue in the background..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            };
+
+            if let Err(err) = result {
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
+                    workspace.update(|next| {
+                        let mut changed = false;
+                        match previous_snapshot
+                            .task_states
+                            .get(&task_id_for_task)
+                            .cloned()
+                        {
+                            Some(previous_task_state) => {
+                                if next.task_states.get(&task_id_for_task)
+                                    != Some(&previous_task_state)
+                                {
+                                    next.task_states
+                                        .insert(task_id_for_task.clone(), previous_task_state);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if next.task_states.remove(&task_id_for_task).is_some() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if next.active_task_id != previous_snapshot.active_task_id {
+                            next.active_task_id = previous_snapshot.active_task_id.clone();
+                            changed = true;
+                        }
+                        if next.automation_agent_state != previous_snapshot.automation_agent_state {
+                            next.automation_agent_state = previous_snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status
+                            != previous_snapshot.automation_session_status
+                        {
+                            next.automation_session_status =
+                                previous_snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != previous_snapshot.automation_status {
+                            next.automation_status = previous_snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                let _ = result_tx.send(Err(err));
+                return;
+            }
+
+            let _ = progress_tx.send(
+                "Codex accepted the PR review fix request and is continuing in the background."
+                    .to_string(),
+            );
+            let _ = result_tx.send(Ok(()));
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Review {task_id}"),
+            success_status: Some(format!(
+                "PR review fix request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+            )),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::None,
+            cancel: None,
+        });
+        self.status = format!(
+            "Requested PR review fixes for '{task_id}' in workspace '{workspace_key}'; sending the request to Codex in the background"
+        );
+    }
+
+    async fn rebase_selected_task(&mut self) {
+        if !self.selected_task_can_request_pr_rebase() {
+            self.status = "Rebase is unavailable for the selected task".to_string();
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Rebase is unavailable because the selected workspace could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Rebase is unavailable because the selected task could not be resolved".to_string();
+            return;
+        };
+        let Some(prompt) = self.selected_task_pr_rebase_prompt() else {
+            self.status = format!(
+                "Rebase is unavailable for '{task_id}' in workspace '{workspace_key}' because its PR or checkout context could not be resolved"
+            );
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            self.status = format!(
+                "Rebase is unavailable for '{task_id}' in workspace '{workspace_key}' because the latest workspace snapshot is missing"
+            );
+            return;
+        };
+        let previous_snapshot = snapshot.clone();
+        let should_restart = should_restart_codex_task_for_resume_prompt(
+            task_runtime_snapshot(&snapshot, &task_id),
+            &prompt,
+        );
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing PR rebase request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+        let task_id_for_task = task_id.clone();
+        self.persist_task_resume_prompt(&workspace_key, &task_id, &prompt);
+
+        if should_queue_task_codex_resume_until_vm_available(&snapshot, &task_id) {
+            self.mark_task_waiting_on_vm_after_attach(&workspace_key, &task_id);
+            self.queue_task_codex_resume_until_vm_available(
+                workspace_key.clone(),
+                task_id.clone(),
+                AttachedSession {
+                    workspace_key: workspace_key.clone(),
+                    task_id: Some(task_id.clone()),
+                    session_id: task_runtime_snapshot(&snapshot, &task_id)
+                        .and_then(|task_state| task_state.session_id.clone()),
+                    initial_agent_state: None,
+                    initial_turn_metrics: None,
+                    fresh_codex_session: false,
+                },
+                Some(prompt),
+                Some(should_restart),
+            );
+            self.status = format!(
+                "Queued PR rebase request for '{task_id}' in workspace '{workspace_key}' until the VM is free"
+            );
+            return;
+        }
+
+        self.mark_task_resuming_in_background(&workspace_key, &task_id);
+        tokio::spawn(async move {
+            let progress_message = if should_restart {
+                "Restarting the Codex task session before asking it to rebase the PR..."
+            } else {
+                "Asking Codex to rebase the PR branch and continue in the background..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            };
+
+            if let Err(err) = result {
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
+                    workspace.update(|next| {
+                        let mut changed = false;
+                        match previous_snapshot
+                            .task_states
+                            .get(&task_id_for_task)
+                            .cloned()
+                        {
+                            Some(previous_task_state) => {
+                                if next.task_states.get(&task_id_for_task)
+                                    != Some(&previous_task_state)
+                                {
+                                    next.task_states
+                                        .insert(task_id_for_task.clone(), previous_task_state);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if next.task_states.remove(&task_id_for_task).is_some() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if next.active_task_id != previous_snapshot.active_task_id {
+                            next.active_task_id = previous_snapshot.active_task_id.clone();
+                            changed = true;
+                        }
+                        if next.automation_agent_state != previous_snapshot.automation_agent_state {
+                            next.automation_agent_state = previous_snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status
+                            != previous_snapshot.automation_session_status
+                        {
+                            next.automation_session_status =
+                                previous_snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != previous_snapshot.automation_status {
+                            next.automation_status = previous_snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                let _ = result_tx.send(Err(err));
+                return;
+            }
+
+            let _ = progress_tx.send(
+                "Codex accepted the PR rebase request and is continuing in the background."
+                    .to_string(),
+            );
+            let _ = result_tx.send(Ok(()));
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Rebase PR {task_id}"),
+            success_status: Some(format!(
+                "PR rebase request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+            )),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::None,
+            cancel: None,
+        });
+        self.status = format!(
+            "Requested a PR rebase for '{task_id}' in workspace '{workspace_key}'; sending the request to Codex in the background"
+        );
+    }
+
+    async fn merge_selected_task_pr(&mut self) {
+        if !self.selected_task_can_request_pr_merge() {
+            self.status = "Merge is unavailable for the selected task".to_string();
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Merge is unavailable because the selected workspace could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Merge is unavailable because the selected task could not be resolved".to_string();
+            return;
+        };
+        let Some(prompt) = self.selected_task_pr_merge_prompt() else {
+            self.status = format!(
+                "Merge is unavailable for '{task_id}' in workspace '{workspace_key}' because its PR or checkout context could not be resolved"
+            );
+            return;
+        };
+        let Some(snapshot) = self.snapshots.get(&workspace_key).cloned() else {
+            self.status = format!(
+                "Merge is unavailable for '{task_id}' in workspace '{workspace_key}' because the latest workspace snapshot is missing"
+            );
+            return;
+        };
+        let previous_snapshot = snapshot.clone();
+        let should_restart = should_restart_codex_task_for_resume_prompt(
+            task_runtime_snapshot(&snapshot, &task_id),
+            &prompt,
+        );
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing PR merge request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let workspace_key_for_task = workspace_key.clone();
+        let task_id_for_task = task_id.clone();
+        self.persist_task_resume_prompt(&workspace_key, &task_id, &prompt);
+
+        if should_queue_task_codex_resume_until_vm_available(&snapshot, &task_id) {
+            self.mark_task_waiting_on_vm_after_attach(&workspace_key, &task_id);
+            self.queue_task_codex_resume_until_vm_available(
+                workspace_key.clone(),
+                task_id.clone(),
+                AttachedSession {
+                    workspace_key: workspace_key.clone(),
+                    task_id: Some(task_id.clone()),
+                    session_id: task_runtime_snapshot(&snapshot, &task_id)
+                        .and_then(|task_state| task_state.session_id.clone()),
+                    initial_agent_state: None,
+                    initial_turn_metrics: None,
+                    fresh_codex_session: false,
+                },
+                Some(prompt),
+                Some(should_restart),
+            );
+            self.status = format!(
+                "Queued PR merge request for '{task_id}' in workspace '{workspace_key}' until the VM is free"
+            );
+            return;
+        }
+
+        self.mark_task_resuming_in_background(&workspace_key, &task_id);
+        tokio::spawn(async move {
+            let progress_message = if should_restart {
+                "Restarting the Codex task session before asking it to merge the PR..."
+            } else {
+                "Asking Codex to merge the PR and continue in the background..."
+            };
+            let _ = progress_tx.send(progress_message.to_string());
+            let result = if should_restart {
+                service
+                    .restart_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            } else {
+                service
+                    .prompt_task_session(
+                        &workspace_key_for_task,
+                        &snapshot,
+                        &task_id_for_task,
+                        &prompt,
+                    )
+                    .await
+            };
+
+            if let Err(err) = result {
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key_for_task) {
+                    workspace.update(|next| {
+                        let mut changed = false;
+                        match previous_snapshot
+                            .task_states
+                            .get(&task_id_for_task)
+                            .cloned()
+                        {
+                            Some(previous_task_state) => {
+                                if next.task_states.get(&task_id_for_task)
+                                    != Some(&previous_task_state)
+                                {
+                                    next.task_states
+                                        .insert(task_id_for_task.clone(), previous_task_state);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                if next.task_states.remove(&task_id_for_task).is_some() {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if next.active_task_id != previous_snapshot.active_task_id {
+                            next.active_task_id = previous_snapshot.active_task_id.clone();
+                            changed = true;
+                        }
+                        if next.automation_agent_state != previous_snapshot.automation_agent_state {
+                            next.automation_agent_state = previous_snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status
+                            != previous_snapshot.automation_session_status
+                        {
+                            next.automation_session_status =
+                                previous_snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != previous_snapshot.automation_status {
+                            next.automation_status = previous_snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                let _ = result_tx.send(Err(err));
+                return;
+            }
+
+            let _ = progress_tx.send(
+                "Codex accepted the PR merge request and is continuing in the background."
+                    .to_string(),
+            );
+            let _ = result_tx.send(Ok(()));
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Merge PR {task_id}"),
+            success_status: Some(format!(
+                "PR merge request sent for '{task_id}' in workspace '{workspace_key}'; Codex is continuing in the background"
+            )),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::None,
+            cancel: None,
+        });
+        self.status = format!(
+            "Requested PR merge for '{task_id}' in workspace '{workspace_key}'; sending the request to Codex in the background"
+        );
+    }
+
+    async fn request_selected_task_copilot_review(&mut self) {
+        if !self.selected_task_can_request_copilot_review() {
+            self.status = "Copilot review request is unavailable for the selected task".to_string();
+            return;
+        }
+        let Some(workspace_key) = self.selected_workspace_key().map(str::to_string) else {
+            self.status =
+                "Copilot review request is unavailable because the selected workspace could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(task_id) = self.selected_task_id().map(str::to_string) else {
+            self.status =
+                "Copilot review request is unavailable because the selected task could not be resolved"
+                    .to_string();
+            return;
+        };
+        let Some(pr_url) = self.selected_task_pr_link() else {
+            self.status = format!(
+                "Copilot review request is unavailable for '{task_id}' in workspace '{workspace_key}' because its PR could not be resolved"
+            );
+            return;
+        };
+        let (progress_tx, progress_rx) =
+            watch::channel("Preparing Copilot review request...".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.service.clone();
+        let task_id_for_task = task_id.clone();
+        let pr_url_for_task = pr_url.clone();
+
+        tokio::spawn(async move {
+            let _ = progress_tx
+                .send("Updating GitHub PR metadata for Copilot review request...".to_string());
+            let result = service
+                .github_status_service()
+                .request_copilot_review(&pr_url_for_task)
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|outcome| {
+                    if let Some(error) = outcome.review_request_error {
+                        let cleanup = if outcome.removed_copilot_assignees.is_empty() {
+                            "no Copilot assignee was present".to_string()
+                        } else {
+                            format!(
+                                "removed Copilot assignee(s): {}",
+                                outcome.removed_copilot_assignees.join(", ")
+                            )
+                        };
+                        Err(format!("{cleanup}; Copilot review request failed: {error}"))
+                    } else {
+                        Ok(())
+                    }
+                });
+
+            if result.is_ok() {
+                let _ = progress_tx.send(format!(
+                    "Requested Copilot review for '{task_id_for_task}' directly through GitHub."
+                ));
+            }
+            let _ = result_tx.send(result);
+        });
+
+        self.running_operation = Some(RunningOperation {
+            workspace_key: workspace_key.clone(),
+            operation_name: format!("Copilot {task_id}"),
+            success_status: Some(format!(
+                "Copilot review request sent for '{task_id}' in workspace '{workspace_key}'; refreshing PR status"
+            )),
+            progress_rx,
+            result_rx,
+            completion_action: RunningOperationCompletionAction::RefreshGithubUrl { url: pr_url },
+            cancel: None,
+        });
+        self.mode = UiMode::ToolProgressModal;
+        self.status = format!(
+            "Requested Copilot review for '{task_id}' in workspace '{workspace_key}'; updating GitHub in the background"
         );
     }
 
@@ -2424,7 +4098,7 @@ impl TuiState {
                 task_state.session_status = Some(RootSessionStatus::Busy);
                 changed = true;
             }
-            let task_status = Some("Queued until VM is free".to_string());
+            let task_status = Some(QUEUED_UNTIL_VM_FREE_STATUS.to_string());
             if task_state.status != task_status {
                 task_state.status = task_status;
                 changed = true;
@@ -2462,9 +4136,11 @@ impl TuiState {
         task_id: String,
         attached_session: AttachedSession,
         resume_prompt: Option<String>,
+        should_restart_for_resume_prompt: Option<bool>,
     ) {
         let service = self.service.clone();
         tokio::spawn(async move {
+            let mut retry_delay = Duration::from_secs(2);
             loop {
                 let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
                     return;
@@ -2524,7 +4200,9 @@ impl TuiState {
                     changed
                 });
 
-                let resume_result = if let Some(resume_prompt) = resume_prompt.clone() {
+                let (resume_result, attempted_resume_prompt) = if let Some(resume_prompt) =
+                    resume_prompt.clone()
+                {
                     if !resume_prompt.trim().is_empty() {
                         let Ok(workspace) = service.manager.get_workspace(&workspace_key) else {
                             return;
@@ -2540,9 +4218,18 @@ impl TuiState {
                             }
                         });
                     }
-                    if should_restart_codex_task_for_pr_request(task_runtime_snapshot(
-                        &snapshot, &task_id,
-                    )) {
+                    let should_restart = should_restart_for_resume_prompt.unwrap_or_else(|| {
+                        should_restart_codex_task_for_pr_approval(
+                            task_persistent_snapshot(&snapshot, &task_id)
+                                .and_then(|task| {
+                                    task_pr_link(task, task_runtime_snapshot(&snapshot, &task_id))
+                                })
+                                .is_some(),
+                            task_runtime_snapshot(&snapshot, &task_id),
+                            &resume_prompt,
+                        )
+                    });
+                    let result = if should_restart {
                         service
                             .restart_task_session(
                                 &workspace_key,
@@ -2560,7 +4247,8 @@ impl TuiState {
                                 &resume_prompt,
                             )
                             .await
-                    }
+                    };
+                    (result, Some(resume_prompt))
                 } else if let Some(session_id) = attached_session.session_id.clone() {
                     let resume_prompt = read_last_codex_session_user_message(
                         service.workspace_directory_path().to_path_buf(),
@@ -2584,7 +4272,7 @@ impl TuiState {
                             }
                         });
                     }
-                    if should_restart_task_codex_after_attach(
+                    let result = if should_restart_task_codex_after_attach(
                         Some(session_id.as_str()),
                         attached_session.fresh_codex_session,
                     ) {
@@ -2605,16 +4293,18 @@ impl TuiState {
                                 &resume_prompt,
                             )
                             .await
-                    }
+                    };
+                    (result, Some(resume_prompt))
                 } else {
-                    service
+                    let result = service
                         .prompt_task_session(
                             &workspace_key,
                             &snapshot,
                             &task_id,
                             CODEX_AUTO_RESUME_PROMPT,
                         )
-                        .await
+                        .await;
+                    (result, Some(CODEX_AUTO_RESUME_PROMPT.to_string()))
                 };
                 tracing::info!(
                     workspace_key = %workspace_key,
@@ -2622,7 +4312,35 @@ impl TuiState {
                     resume_result = ?resume_result,
                     "finished deferred codex auto-resume attempt after attach"
                 );
-                return;
+                if resume_result.is_ok() {
+                    return;
+                }
+
+                if let Ok(workspace) = service.manager.get_workspace(&workspace_key) {
+                    workspace.update(|next| {
+                        let mut changed = mark_task_deferred_codex_resume_waiting_on_vm(
+                            next,
+                            &task_id,
+                            snapshot.active_task_id.as_deref(),
+                            attempted_resume_prompt.as_deref(),
+                        );
+                        if next.automation_agent_state != snapshot.automation_agent_state {
+                            next.automation_agent_state = snapshot.automation_agent_state;
+                            changed = true;
+                        }
+                        if next.automation_session_status != snapshot.automation_session_status {
+                            next.automation_session_status = snapshot.automation_session_status;
+                            changed = true;
+                        }
+                        if next.automation_status != snapshot.automation_status {
+                            next.automation_status = snapshot.automation_status.clone();
+                            changed = true;
+                        }
+                        changed
+                    });
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
             }
         });
     }
@@ -2757,6 +4475,7 @@ impl TuiState {
                                 .clone()
                                 .expect("attached task session should exist"),
                             interrupted_resume_prompt.clone(),
+                            None,
                         );
                         self.status = format!(
                             "Detached from workspace '{key}'; task {task_id} is queued until the VM is free"
@@ -2953,6 +4672,24 @@ impl TuiState {
                                 "{} completed for workspace '{}'",
                                 running_tool.operation_name, running_tool.workspace_key
                             )
+                        });
+                    }
+                    RunningOperationCompletionAction::RefreshGithubUrl { url } => {
+                        self.mode = UiMode::Normal;
+                        let refresh_requested =
+                            self.service.github_status_service().request_refresh(&url);
+                        self.status = running_tool.success_status.unwrap_or_else(|| {
+                            if refresh_requested {
+                                format!(
+                                    "{} completed for workspace '{}'; refreshing GitHub status",
+                                    running_tool.operation_name, running_tool.workspace_key
+                                )
+                            } else {
+                                format!(
+                                    "{} completed for workspace '{}'",
+                                    running_tool.operation_name, running_tool.workspace_key
+                                )
+                            }
                         });
                     }
                     RunningOperationCompletionAction::WaitForWorkspaceStart {
@@ -3559,16 +5296,22 @@ impl TuiState {
                 if link_selected {
                     self.move_selected_link_target_up();
                 } else if self.selected_row > 0 {
-                    self.selected_row -= 1;
-                    self.selected_link_index = None;
-                    self.selected_link_target_index = 0;
+                    if let Some(next_row) =
+                        previous_selectable_table_row(&self.table_entries(), self.selected_row - 1)
+                    {
+                        self.selected_row = next_row;
+                        self.selected_link_index = None;
+                        self.selected_link_target_index = 0;
+                    }
                 }
             }
             KeyCode::Down => {
                 if link_selected {
                     self.move_selected_link_target_down();
-                } else if self.selected_row + 1 < self.table_entries().len() {
-                    self.selected_row += 1;
+                } else if let Some(next_row) =
+                    next_selectable_table_row(&self.table_entries(), self.selected_row + 1)
+                {
+                    self.selected_row = next_row;
                     self.selected_link_index = None;
                     self.selected_link_target_index = 0;
                 }
@@ -3770,6 +5513,32 @@ impl TuiState {
                 }
                 self.fix_selected_task_ci().await;
             }
+            KeyCode::Char('z') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_none() {
+                    return;
+                }
+                if !self.selected_task_can_request_sonar_fix() {
+                    self.status = "Fix Sonar is unavailable for the selected task".to_string();
+                    return;
+                }
+                self.fix_selected_task_sonar().await;
+            }
+            KeyCode::Char('v') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_none() {
+                    return;
+                }
+                if !self.selected_task_can_request_pr_review_fix() {
+                    self.status = "Review fix is unavailable for the selected task".to_string();
+                    return;
+                }
+                self.fix_selected_task_pr_review().await;
+            }
             KeyCode::Char('c') => {
                 if link_selected {
                     return;
@@ -3879,6 +5648,7 @@ impl TuiState {
                     return;
                 }
                 if self.selected_task_id().is_some() {
+                    self.open_selected_task_pr_target().await;
                     return;
                 }
                 if let Some(key) = self.selected_workspace_key().map(str::to_string) {
@@ -3920,9 +5690,41 @@ impl TuiState {
                     return;
                 }
                 if self.selected_task_id().is_some() {
+                    if !self.selected_task_can_request_pr_rebase() {
+                        self.status = "Rebase is unavailable for the selected task".to_string();
+                        return;
+                    }
+                    self.rebase_selected_task().await;
                     return;
                 }
                 self.request_selected_workspace_github_status_refresh();
+            }
+            KeyCode::Char('m') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_none() {
+                    return;
+                }
+                if !self.selected_task_can_request_pr_merge() {
+                    self.status = "Merge is unavailable for the selected task".to_string();
+                    return;
+                }
+                self.merge_selected_task_pr().await;
+            }
+            KeyCode::Char('y') => {
+                if link_selected {
+                    return;
+                }
+                if self.selected_task_id().is_none() {
+                    return;
+                }
+                if !self.selected_task_can_request_copilot_review() {
+                    self.status =
+                        "Copilot review request is unavailable for the selected task".to_string();
+                    return;
+                }
+                self.request_selected_task_copilot_review().await;
             }
             KeyCode::Char('x') => {
                 if link_selected {

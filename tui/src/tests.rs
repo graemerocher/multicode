@@ -11,23 +11,35 @@ mod tests {
 
     use super::*;
     use crate::app::{
-        CODEX_CREATE_PR_APPROVAL_PROMPT, build_codex_fix_ci_prompt, compact_github_tooltip_target,
+        CODEX_CREATE_PR_APPROVAL_PROMPT, CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT,
+        CODEX_PUBLISH_SONAR_FIX_APPROVAL_PROMPT, CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT,
+        approval_prompt_for_task, build_codex_fix_ci_prompt, build_codex_fix_pr_review_prompt,
+        build_codex_fix_sonar_prompt, build_codex_merge_task_prompt,
+        build_codex_rebase_task_prompt, compact_github_tooltip_target,
         count_codex_session_turn_metrics, github_repository_spec, github_repository_url,
-        last_user_message_from_codex_session_log_contents, repository_diff_shell_command,
-        restored_selected_row, shell_command_in_repo,
+        last_user_message_from_codex_session_log_contents,
+        mark_task_deferred_codex_resume_waiting_on_vm, pr_is_ready_for_approval_queue,
+        pr_is_ready_to_merge, repository_diff_shell_command, restored_selected_row,
+        shell_command_in_repo, should_allow_codex_task_pr_operation,
+        should_allow_codex_task_pr_publish_approval, should_allow_codex_task_pr_rebase,
         should_auto_resume_autonomous_codex_after_attach,
         should_auto_resume_task_codex_after_attach, should_offer_codex_ci_fix,
+        should_offer_codex_pr_creation, should_offer_codex_pr_rebase,
+        should_offer_codex_pr_review_fix, should_offer_codex_sonar_fix,
         should_queue_task_codex_resume_until_vm_available, should_restart_codex_task_for_ci_fix,
-        should_restart_codex_task_for_pr_request, should_restart_task_codex_after_attach,
+        should_restart_codex_task_for_pr_approval, should_restart_codex_task_for_pr_request,
+        should_restart_codex_task_for_resume_prompt, should_restart_task_codex_after_attach,
         should_resume_codex_task_after_incomplete_attached_turn,
         should_retry_codex_task_attach_with_last_thread,
         should_start_fresh_codex_task_session_after_failed_attach,
         snapshot_attach_cwd_for_selection, snapshot_attach_target_for_selection,
-        starting_modal_failure_status, task_repository_spec, working_codex_task_attach_target,
+        starting_modal_failure_status, task_entries_for_workspace_snapshot, task_repository_spec,
+        working_codex_task_attach_target,
     };
     use crate::icons::{
-        icon_glyph, issue_icon_kind_and_color, pr_build_icon_color, pr_icon_kind_and_color,
-        pr_review_icon_color,
+        git_status_icon_color, icon_glyph, issue_icon_kind_and_color, pr_build_icon_color,
+        pr_copilot_review_icon_color, pr_copilot_review_icon_label, pr_icon_kind_and_color,
+        pr_review_icon_color, pr_review_status_color, pr_sonar_icon_color,
     };
     use crate::ops::{
         SessionWaitState, attach_cli_args, build_handler_command, command_exists,
@@ -35,7 +47,7 @@ mod tests {
         task_attach_target, tmux_session_command, tmux_status_left, validate_workspace_link_target,
         workspace_attach_target, workspace_ordering,
     };
-    use crate::render::selected_link_tooltip_area;
+    use crate::render::{pr_review_status_cell_text, selected_link_tooltip_area};
     use crate::system::{
         centered_rect_fixed, disk_usage_from_statvfs, machine_cpu_percent, parse_proc_cpu_totals,
         parse_proc_meminfo_total_ram_bytes, parse_proc_meminfo_used_ram_bytes,
@@ -43,7 +55,8 @@ mod tests {
     };
     use multicode_lib::{
         PersistentWorkspaceSnapshot, RuntimeBackend, RuntimeHandleSnapshot,
-        TransientWorkspaceSnapshot, services::AgentProvider,
+        TransientWorkspaceSnapshot,
+        services::{AgentProvider, GithubPrMergeState, GithubPrReviewState, GithubPrSonarState},
     };
     use std::{
         fs,
@@ -66,6 +79,7 @@ mod tests {
         workspace_count: usize,
         selected_workspace: Option<&WorkspaceSnapshot>,
         selected_task_row: bool,
+        selected_task_has_pr: bool,
         selected_workspace_link_count: usize,
         selected_link_index: Option<usize>,
         selected_link_is_custom: bool,
@@ -85,6 +99,7 @@ mod tests {
             workspace_count,
             selected_workspace,
             selected_task_row,
+            selected_task_has_pr,
             selected_workspace_link_count,
             selected_link_index,
             selected_link_is_custom,
@@ -95,18 +110,25 @@ mod tests {
             selected_workspace_can_diff,
             selected_workspace_can_edit,
             false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
             tool_progress_can_cancel,
             tool_hotkeys,
             status,
         )
     }
 
-    fn help_line_with_task_fix(
+    fn help_line_with_task_actions(
         mode: UiMode,
         selected_row: usize,
         workspace_count: usize,
         selected_workspace: Option<&WorkspaceSnapshot>,
         selected_task_row: bool,
+        selected_task_has_pr: bool,
         selected_workspace_link_count: usize,
         selected_link_index: Option<usize>,
         selected_link_is_custom: bool,
@@ -116,7 +138,12 @@ mod tests {
         selected_workspace_can_assign_issue: bool,
         selected_workspace_can_diff: bool,
         selected_workspace_can_edit: bool,
+        selected_task_can_approve: bool,
+        selected_task_can_rebase: bool,
+        selected_task_can_fix_review: bool,
         selected_task_can_fix_ci: bool,
+        selected_task_can_fix_sonar: bool,
+        selected_task_can_merge: bool,
         tool_progress_can_cancel: bool,
         tool_hotkeys: &[(String, String)],
         status: &str,
@@ -127,6 +154,7 @@ mod tests {
             workspace_count,
             selected_workspace,
             selected_task_row,
+            selected_task_has_pr,
             selected_workspace_link_count,
             selected_link_index,
             selected_link_is_custom,
@@ -136,7 +164,13 @@ mod tests {
             selected_workspace_can_assign_issue,
             selected_workspace_can_diff,
             selected_workspace_can_edit,
+            selected_task_can_approve,
+            selected_task_can_rebase,
+            selected_task_can_fix_review,
             selected_task_can_fix_ci,
+            selected_task_can_fix_sonar,
+            selected_task_can_merge,
+            false,
             tool_progress_can_cancel,
             tool_hotkeys,
             status,
@@ -473,6 +507,38 @@ mod tests {
     }
 
     #[test]
+    fn workspace_all_issue_pr_links_includes_every_task_pr() {
+        let mut started = snapshot(true, Some("http://example"));
+        assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
+        if let Some(task) = started
+            .persistent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "task-42")
+        {
+            task.backing_pr_url = Some("https://github.com/example/repo/pull/322".to_string());
+        }
+        started.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-43".to_string(),
+                "https://github.com/example/repo/issues/43".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/323".to_string())),
+        );
+
+        let links = workspace_all_issue_pr_links(&started);
+        let link_values = links
+            .iter()
+            .map(|link| link.value.as_str())
+            .collect::<HashSet<_>>();
+        assert!(link_values.contains("https://github.com/example/repo/issues/42"));
+        assert!(link_values.contains("https://github.com/example/repo/pull/322"));
+        assert!(link_values.contains("https://github.com/example/repo/issues/43"));
+        assert!(link_values.contains("https://github.com/example/repo/pull/323"));
+    }
+
+    #[test]
     fn workspace_links_prefer_active_task_issue_and_pr_when_tasks_exist() {
         let mut started = snapshot(true, Some("http://example"));
         assign_active_task(&mut started, "https://github.com/example/repo/issues/42");
@@ -531,10 +597,13 @@ mod tests {
     #[test]
     fn should_request_autonomous_issue_scan_for_assigned_workspace_without_active_issue() {
         let mut stopped = WorkspaceSnapshot::default();
+        let github_statuses = HashMap::new();
         stopped.persistent.assigned_repository =
             Some("micronaut-projects/micronaut-serialization".to_string());
         assert!(crate::app::should_request_autonomous_issue_scan(
-            &stopped, 5
+            &stopped,
+            5,
+            &github_statuses,
         ));
 
         stopped
@@ -547,21 +616,37 @@ mod tests {
                 multicode_lib::WorkspaceTaskSource::Manual,
             ));
         assert!(crate::app::should_request_autonomous_issue_scan(
-            &stopped, 5
+            &stopped,
+            5,
+            &github_statuses,
         ));
         assert!(!crate::app::should_request_autonomous_issue_scan(
-            &stopped, 1
+            &stopped,
+            1,
+            &github_statuses,
+        ));
+        assert!(crate::app::should_request_autonomous_workspace_recheck(
+            &stopped
         ));
 
         stopped.persistent.archived = true;
         assert!(!crate::app::should_request_autonomous_issue_scan(
-            &stopped, 5
+            &stopped,
+            5,
+            &github_statuses,
+        ));
+        assert!(!crate::app::should_request_autonomous_workspace_recheck(
+            &stopped
         ));
 
         let unassigned = WorkspaceSnapshot::default();
         assert!(!crate::app::should_request_autonomous_issue_scan(
             &unassigned,
-            5
+            5,
+            &github_statuses,
+        ));
+        assert!(!crate::app::should_request_autonomous_workspace_recheck(
+            &unassigned
         ));
     }
 
@@ -607,10 +692,397 @@ mod tests {
             multicode_lib::WorkspaceTaskSource::Scan,
         );
 
-        assert_eq!(crate::task_server_label(Some(&task_state)), "Idle");
+        assert_eq!(crate::task_server_label(Some(&task_state), None), "Idle");
         assert_eq!(
-            crate::task_description(&task, Some(&task_state)),
+            crate::task_description(&task, Some(&task_state), None),
             "Review multicode-test#39"
+        );
+    }
+
+    #[test]
+    fn task_server_label_prefers_waiting_on_vm_over_review_wait() {
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            waiting_on_vm: true,
+            status: Some("Queued until VM is free".to_string()),
+            ..Default::default()
+        };
+        let pr = GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: Some(GithubPrSonarState::Succeeded),
+            review: GithubPrReviewState::Requested,
+            requested_reviewers: Some("alvarosanchez".to_string()),
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: SystemTime::UNIX_EPOCH,
+        };
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-39".to_string(),
+            "https://github.com/graemerocher/multicode-test/issues/39".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(
+            crate::task_server_label(Some(&task_state), Some(pr.clone())),
+            "Waiting on VM"
+        );
+        assert_eq!(
+            crate::task_description(&task, Some(&task_state), Some(pr)),
+            "Queued until VM is free"
+        );
+    }
+
+    #[test]
+    fn task_server_label_shows_session_busy_when_queued_task_session_is_still_busy() {
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            waiting_on_vm: true,
+            session_status: Some(RootSessionStatus::Busy),
+            status: Some("Working micrometer#924".to_string()),
+            ..Default::default()
+        };
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-924".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/924".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+
+        assert_eq!(
+            crate::task_server_label(Some(&task_state), None),
+            "Session Busy"
+        );
+        assert_eq!(
+            crate::task_description(&task, Some(&task_state), None),
+            "Working micrometer#924"
+        );
+    }
+
+    #[test]
+    fn active_task_display_prefers_workspace_working_state_over_pr_queue_state() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-467".to_string(),
+            "https://github.com/micronaut-projects/micronaut-tracing/issues/467".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot {
+            active_task_id: Some("task-467".to_string()),
+            automation_agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        snapshot.persistent.tasks.push(task.clone());
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("thread-467".to_string()),
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Review),
+            status: Some("Review micronaut-tracing#467".to_string()),
+            ..Default::default()
+        };
+        let pr = GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: Some(GithubPrSonarState::Succeeded),
+            review: GithubPrReviewState::Requested,
+            requested_reviewers: Some("alvarosanchez".to_string()),
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: SystemTime::UNIX_EPOCH,
+        };
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-467",
+                Some(&task_state),
+                Some(pr.clone())
+            ),
+            "Busy"
+        );
+        assert_eq!(
+            crate::task_description_for_display(&snapshot, &task, Some(&task_state), Some(pr)),
+            "Working tracing#467"
+        );
+    }
+
+    #[test]
+    fn inactive_busy_session_displays_session_busy_when_another_task_is_active() {
+        let active_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-937".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/937".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let inactive_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-924".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/924".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot {
+            active_task_id: Some("task-937".to_string()),
+            automation_agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        snapshot.persistent.tasks.push(active_task);
+        snapshot.persistent.tasks.push(inactive_task.clone());
+        let inactive_task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_status: Some(RootSessionStatus::Busy),
+            agent_state: Some(AutomationAgentState::Working),
+            status: Some("Working micrometer#924".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-924",
+                Some(&inactive_task_state),
+                None
+            ),
+            "Session Busy"
+        );
+        assert_eq!(
+            crate::task_description_for_display(
+                &snapshot,
+                &inactive_task,
+                Some(&inactive_task_state),
+                None
+            ),
+            "Working micrometer#924"
+        );
+    }
+
+    #[test]
+    fn resuming_background_task_does_not_display_idle() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-282".to_string(),
+            "https://github.com/micronaut-projects/micronaut-tracing/issues/282".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(task.clone());
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("Resuming in background".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::task_server_label_for_display(&snapshot, "task-282", Some(&task_state), None),
+            "Resuming"
+        );
+        assert_eq!(
+            crate::task_description_for_display(&snapshot, &task, Some(&task_state), None),
+            "Resuming in background"
+        );
+    }
+
+    #[test]
+    fn multiple_working_tasks_without_explicit_active_task_do_not_all_display_busy() {
+        let first_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-779".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/779".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let second_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-466".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/466".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(first_task);
+        snapshot.persistent.tasks.push(second_task);
+        snapshot.task_states.insert(
+            "task-779".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                status: Some("Working micrometer#779".to_string()),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-466".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                status: Some("Working micrometer#466".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-779",
+                snapshot.task_states.get("task-779"),
+                None
+            ),
+            "Busy"
+        );
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-466",
+                snapshot.task_states.get("task-466"),
+                None
+            ),
+            "Session Busy"
+        );
+    }
+
+    #[test]
+    fn automation_status_selects_busy_task_when_multiple_tasks_look_working() {
+        let first_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-779".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/779".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let second_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-466".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/466".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot {
+            automation_status: Some(
+                "Scheduling micronaut-projects/micronaut-micrometer#466".to_string(),
+            ),
+            ..Default::default()
+        };
+        snapshot.persistent.tasks.push(first_task);
+        snapshot.persistent.tasks.push(second_task);
+        for task_id in ["task-779", "task-466"] {
+            snapshot.task_states.insert(
+                task_id.to_string(),
+                multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                    session_status: Some(RootSessionStatus::Busy),
+                    agent_state: Some(AutomationAgentState::Working),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-779",
+                snapshot.task_states.get("task-779"),
+                None
+            ),
+            "Session Busy"
+        );
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-466",
+                snapshot.task_states.get("task-466"),
+                None
+            ),
+            "Busy"
+        );
+    }
+
+    #[test]
+    fn automation_status_task_match_does_not_use_issue_number_prefix() {
+        let prefix_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-46".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/46".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let full_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-466".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/466".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot {
+            automation_status: Some(
+                "Scheduling micronaut-projects/micronaut-micrometer#466".to_string(),
+            ),
+            ..Default::default()
+        };
+        snapshot.persistent.tasks.push(prefix_task);
+        snapshot.persistent.tasks.push(full_task);
+        for task_id in ["task-46", "task-466"] {
+            snapshot.task_states.insert(
+                task_id.to_string(),
+                multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                    session_status: Some(RootSessionStatus::Busy),
+                    agent_state: Some(AutomationAgentState::Working),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-46",
+                snapshot.task_states.get("task-46"),
+                None
+            ),
+            "Session Busy"
+        );
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-466",
+                snapshot.task_states.get("task-466"),
+                None
+            ),
+            "Busy"
+        );
+    }
+
+    #[test]
+    fn inactive_queued_task_displays_waiting_on_vm_even_with_idle_session() {
+        let active_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-937".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/937".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let queued_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-1003".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/1003".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        );
+        let mut snapshot = WorkspaceSnapshot {
+            active_task_id: Some("task-937".to_string()),
+            automation_agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        snapshot.persistent.tasks.push(active_task);
+        snapshot.persistent.tasks.push(queued_task.clone());
+        let queued_task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            session_status: Some(RootSessionStatus::Idle),
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("Queued until VM is free".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-1003",
+                Some(&queued_task_state),
+                None
+            ),
+            "Waiting on VM"
+        );
+        assert_eq!(
+            crate::task_description_for_display(
+                &snapshot,
+                &queued_task,
+                Some(&queued_task_state),
+                None
+            ),
+            "Queued until VM is free"
         );
     }
 
@@ -633,8 +1105,31 @@ mod tests {
         };
 
         assert_eq!(
-            crate::task_description(&task, Some(&task_state)),
+            crate::task_description(&task, Some(&task_state), None),
             "PR created #338"
+        );
+    }
+
+    #[test]
+    fn task_pr_link_prefers_persisted_backing_pr_over_stale_runtime_metadata() {
+        let task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-898".to_string(),
+            "https://github.com/micronaut-projects/micronaut-micrometer/issues/898".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        )
+        .with_backing_pr_url(Some(
+            "https://github.com/micronaut-projects/micronaut-micrometer/pull/1163".to_string(),
+        ));
+        let task_state = multicode_lib::WorkspaceTaskRuntimeSnapshot {
+            pr: vec![
+                "https://github.com/micronaut-projects/micronaut-micrometer/pull/1152".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            crate::task_pr_link(&task, Some(&task_state)),
+            Some("https://github.com/micronaut-projects/micronaut-micrometer/pull/1163")
         );
     }
 
@@ -789,6 +1284,35 @@ mod tests {
     }
 
     #[test]
+    fn detached_task_resume_queues_when_root_session_is_busy_even_if_active_task_can_yield() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-1".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
+        snapshot.task_states.insert(
+            "task-1".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-1".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                ..Default::default()
+            },
+        );
+
+        assert!(should_queue_task_codex_resume_until_vm_available(
+            &snapshot, "task-2"
+        ));
+    }
+
+    #[test]
     fn detached_task_resume_does_not_queue_when_it_already_owns_vm() {
         let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
         snapshot.active_task_id = Some("task-2".to_string());
@@ -806,6 +1330,76 @@ mod tests {
         assert!(!should_queue_task_codex_resume_until_vm_available(
             &snapshot, "task-2"
         ));
+    }
+
+    #[test]
+    fn idle_active_task_resume_queues_when_root_session_is_busy() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-2".to_string());
+        snapshot.root_session_status = Some(RootSessionStatus::Busy);
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Idle),
+                agent_state: Some(AutomationAgentState::Review),
+                ..Default::default()
+            },
+        );
+
+        assert!(should_queue_task_codex_resume_until_vm_available(
+            &snapshot, "task-2"
+        ));
+    }
+
+    #[test]
+    fn failed_deferred_task_resume_restores_waiting_on_vm_state() {
+        let mut snapshot = multicode_lib::WorkspaceSnapshot::default();
+        snapshot.active_task_id = Some("task-2".to_string());
+        snapshot.persistent.automation_issue =
+            Some("https://github.com/example/repo/issues/2".to_string());
+        snapshot
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-2".to_string(),
+                "https://github.com/example/repo/issues/2".to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            ));
+        snapshot.task_states.insert(
+            "task-2".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                session_id: Some("thread-2".to_string()),
+                session_status: Some(RootSessionStatus::Busy),
+                agent_state: Some(AutomationAgentState::Working),
+                status: Some("Resuming in background".to_string()),
+                waiting_on_vm: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(mark_task_deferred_codex_resume_waiting_on_vm(
+            &mut snapshot,
+            "task-2",
+            Some("task-2"),
+            Some(" publish the approved changes ")
+        ));
+
+        let task_state = snapshot
+            .task_states
+            .get("task-2")
+            .expect("task state should exist");
+        assert_eq!(snapshot.active_task_id.as_deref(), None);
+        assert_eq!(snapshot.persistent.automation_issue.as_deref(), None);
+        assert!(task_state.waiting_on_vm);
+        assert_eq!(
+            task_state.status.as_deref(),
+            Some("Queued until VM is free")
+        );
+        assert_eq!(
+            task_state.resume_prompt.as_deref(),
+            Some("publish the approved changes")
+        );
     }
 
     #[test]
@@ -1484,6 +2078,11 @@ mod tests {
         let command = repository_diff_shell_command();
         assert!(command.contains("git status --short"));
         assert!(command.contains("git --no-pager diff"));
+        assert!(command.contains("section()"));
+        assert!(command.contains("\\033[1;36m%s\\033[0m"));
+        assert!(command.contains("Committed branch diff"));
+        assert!(command.contains("git --no-pager log --oneline --decorate"));
+        assert!(command.contains("git merge-base HEAD"));
         assert!(command.contains("less -R -X"));
         assert!(!command.contains("less -R -F -X"));
     }
@@ -2163,7 +2762,7 @@ mod tests {
             2,
             WorkspaceLinkKind::Review,
             &targets,
-            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2, 2],
+            [10, 10, 5, 5, 5, 2, 2, 2, 2, 4, 2, 2, 2, 2, 4],
         )
         .expect("tooltip area should exist");
 
@@ -2184,7 +2783,7 @@ mod tests {
             4,
             WorkspaceLinkKind::Pr,
             &targets,
-            [10, 10, 5, 5, 5, 2, 2, 2, 2, 2, 2],
+            [10, 10, 5, 5, 5, 2, 2, 2, 2, 4, 2, 2, 2, 2, 4],
         )
         .expect("tooltip area should exist");
 
@@ -2262,9 +2861,17 @@ mod tests {
         assert_eq!(
             pr_icon_kind_and_color(GithubPrStatus {
                 state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Succeeded,
+                sonar: None,
                 review: GithubPrReviewState::Accepted,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: SystemTime::UNIX_EPOCH,
             }),
             (StatusIconKind::GitPullRequest, Color::Green)
@@ -2272,9 +2879,17 @@ mod tests {
         assert_eq!(
             pr_icon_kind_and_color(GithubPrStatus {
                 state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Succeeded,
+                sonar: None,
                 review: GithubPrReviewState::Accepted,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: true,
+                unresolved_review_threads: 0,
                 fetched_at: SystemTime::UNIX_EPOCH,
             }),
             (StatusIconKind::GitPullRequestDraft, Color::DarkGray)
@@ -2282,9 +2897,17 @@ mod tests {
         assert_eq!(
             pr_icon_kind_and_color(GithubPrStatus {
                 state: GithubPrState::Rejected,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Succeeded,
+                sonar: None,
                 review: GithubPrReviewState::Accepted,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: SystemTime::UNIX_EPOCH,
             }),
             (StatusIconKind::GitPullRequestClosed, Color::Red)
@@ -2292,9 +2915,17 @@ mod tests {
         assert_eq!(
             pr_icon_kind_and_color(GithubPrStatus {
                 state: GithubPrState::Merged,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Succeeded,
+                sonar: None,
                 review: GithubPrReviewState::Accepted,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: SystemTime::UNIX_EPOCH,
             }),
             (StatusIconKind::GitMerge, Color::Magenta)
@@ -2302,50 +2933,149 @@ mod tests {
 
         let open_pr = GithubPrStatus {
             state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: SystemTime::UNIX_EPOCH,
         };
-        assert_eq!(pr_build_icon_color(open_pr), Some(Color::Green));
-        assert_eq!(pr_review_icon_color(open_pr), Some(Color::Green));
+        assert_eq!(pr_build_icon_color(open_pr.clone()), Some(Color::Green));
+        assert_eq!(pr_review_icon_color(open_pr.clone()), Some(Color::Green));
+        assert_eq!(
+            pr_copilot_review_icon_color(open_pr.clone()),
+            Some(Color::Red)
+        );
+        assert_eq!(pr_copilot_review_icon_label(open_pr.clone()), Some("N"));
+        assert_eq!(
+            pr_copilot_review_icon_color(GithubPrStatus {
+                copilot_review: GithubPrCopilotReviewState::Requested,
+                ..open_pr.clone()
+            }),
+            Some(Color::Indexed(214))
+        );
+        assert_eq!(
+            pr_copilot_review_icon_label(GithubPrStatus {
+                copilot_review: GithubPrCopilotReviewState::Requested,
+                ..open_pr.clone()
+            }),
+            Some("?")
+        );
+        assert_eq!(
+            pr_copilot_review_icon_color(GithubPrStatus {
+                copilot_review: GithubPrCopilotReviewState::Done,
+                ..open_pr.clone()
+            }),
+            Some(Color::Indexed(46))
+        );
+        assert_eq!(
+            pr_copilot_review_icon_label(GithubPrStatus {
+                copilot_review: GithubPrCopilotReviewState::Done,
+                ..open_pr
+            }),
+            Some("C")
+        );
 
         let unreviewed_pr = GithubPrStatus {
             state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::None,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: SystemTime::UNIX_EPOCH,
         };
         assert_eq!(pr_review_icon_color(unreviewed_pr), Some(Color::DarkGray));
 
         let pending_review_pr = GithubPrStatus {
             state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Outstanding,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: SystemTime::UNIX_EPOCH,
         };
         assert_eq!(pr_review_icon_color(pending_review_pr), Some(Color::Yellow));
 
         let rejected_review_pr = GithubPrStatus {
             state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Rejected,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: SystemTime::UNIX_EPOCH,
         };
         assert_eq!(pr_review_icon_color(rejected_review_pr), Some(Color::Red));
 
         let merged_pr = GithubPrStatus {
             state: GithubPrState::Merged,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
             build: GithubPrBuildState::Succeeded,
+            sonar: None,
             review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
             is_draft: false,
+            unresolved_review_threads: 0,
             fetched_at: SystemTime::UNIX_EPOCH,
         };
-        assert_eq!(pr_build_icon_color(merged_pr), None);
+        assert_eq!(pr_build_icon_color(merged_pr.clone()), None);
         assert_eq!(pr_review_icon_color(merged_pr), None);
+
+        assert_eq!(
+            git_status_icon_color(WorkspaceTaskGitStatus::default()),
+            None
+        );
+        assert_eq!(
+            git_status_icon_color(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: false,
+            }),
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            git_status_icon_color(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: false,
+                has_unpushed_commits: true,
+            }),
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            git_status_icon_color(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: true,
+            }),
+            Some(Color::Red)
+        );
     }
 
     #[test]
@@ -2358,6 +3088,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             false,
             1,
             Some(0),
@@ -2399,6 +3130,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             1,
             Some(0),
             true,
@@ -2430,6 +3162,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             false,
             1,
             Some(0),
@@ -2465,6 +3198,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             1,
             Some(0),
             false,
@@ -2490,6 +3224,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             false,
             1,
             Some(0),
@@ -2519,6 +3254,7 @@ mod tests {
             0,
             0,
             None,
+            false,
             false,
             0,
             None,
@@ -2553,6 +3289,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             0,
             None,
             false,
@@ -2579,6 +3316,7 @@ mod tests {
             1,
             1,
             Some(&stopped),
+            false,
             false,
             0,
             None,
@@ -2612,6 +3350,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             0,
             None,
             false,
@@ -2639,6 +3378,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             0,
             None,
             false,
@@ -2665,6 +3405,7 @@ mod tests {
             1,
             1,
             Some(&stopped),
+            false,
             false,
             0,
             None,
@@ -2697,6 +3438,7 @@ mod tests {
             1,
             1,
             Some(&started),
+            false,
             false,
             0,
             None,
@@ -2731,6 +3473,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             0,
             None,
             false,
@@ -2763,6 +3506,7 @@ mod tests {
             1,
             Some(&started),
             false,
+            false,
             0,
             None,
             false,
@@ -2788,12 +3532,13 @@ mod tests {
     #[test]
     fn help_line_limits_actions_for_task_row_focus() {
         let started = snapshot(true, Some("http://example"));
-        let line = help_line(
+        let line = help_line_with_task_actions(
             UiMode::Normal,
             2,
             2,
             Some(&started),
             true,
+            false,
             0,
             None,
             false,
@@ -2803,6 +3548,12 @@ mod tests {
             false,
             true,
             true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -2828,12 +3579,13 @@ mod tests {
     fn help_line_shows_approve_hotkey_for_codex_task_row_focus() {
         let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
         started.root_session_id = Some("thread-root".to_string());
-        let line = help_line(
+        let line = help_line_with_task_actions(
             UiMode::Normal,
             2,
             2,
             Some(&started),
             true,
+            false,
             0,
             None,
             false,
@@ -2843,6 +3595,12 @@ mod tests {
             false,
             true,
             true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
             false,
             no_tool_hotkeys(),
             "",
@@ -2861,11 +3619,12 @@ mod tests {
     fn help_line_shows_fix_ci_hotkey_for_failing_task_row() {
         let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
         started.root_session_id = Some("thread-root".to_string());
-        let line = help_line_with_task_fix(
+        let line = help_line_with_task_actions(
             UiMode::Normal,
             2,
             2,
             Some(&started),
+            true,
             true,
             0,
             None,
@@ -2878,6 +3637,11 @@ mod tests {
             true,
             true,
             false,
+            false,
+            true,
+            false,
+            false,
+            false,
             no_tool_hotkeys(),
             "",
         );
@@ -2889,7 +3653,131 @@ mod tests {
 
         assert!(text.contains("a approve"));
         assert!(text.contains("f fix CI"));
-        assert!(text.contains("o open GitHub"));
+        assert!(text.contains("o open issue"));
+        assert!(text.contains("p open PR"));
+    }
+
+    #[test]
+    fn help_line_shows_task_actions_without_approve_hotkey() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        let line = help_line_with_task_actions(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            true,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!text.contains("a approve"));
+        assert!(text.contains("r rebase"));
+        assert!(text.contains("v review"));
+        assert!(text.contains("f fix CI"));
+        assert!(text.contains("z Sonar"));
+        assert!(text.contains("m merge"));
+    }
+
+    #[test]
+    fn help_line_shows_merge_hotkey_for_merge_ready_task_row() {
+        let mut started = snapshot(true, Some("ws://127.0.0.1:3456/"));
+        started.root_session_id = Some("thread-root".to_string());
+        let line = help_line_with_task_actions(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&started),
+            true,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("m merge"));
+    }
+
+    #[test]
+    fn help_line_shows_copilot_hotkey_without_approve_action() {
+        let stopped = snapshot(false, Some("http://example"));
+        let line = super::help_line(
+            UiMode::Normal,
+            2,
+            2,
+            Some(&stopped),
+            true,
+            true,
+            0,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            no_tool_hotkeys(),
+            "",
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("y Copilot"));
+        assert!(!text.contains("a approve"));
     }
 
     #[test]
@@ -2901,6 +3789,7 @@ mod tests {
             2,
             Some(&started),
             true,
+            false,
             2,
             None,
             false,
@@ -2920,7 +3809,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("o open GitHub"));
+        assert!(text.contains("o open issue"));
+        assert!(!text.contains("p open PR"));
         assert!(text.contains("x remove issue"));
     }
 
@@ -2930,9 +3820,17 @@ mod tests {
             true,
             Some(GithubPrStatus {
                 state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Failed,
+                sonar: None,
                 review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: UNIX_EPOCH,
             })
         ));
@@ -2940,9 +3838,17 @@ mod tests {
             true,
             Some(GithubPrStatus {
                 state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Building,
+                sonar: None,
                 review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: UNIX_EPOCH,
             })
         ));
@@ -2950,9 +3856,17 @@ mod tests {
             true,
             Some(GithubPrStatus {
                 state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Succeeded,
+                sonar: None,
                 review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: UNIX_EPOCH,
             })
         ));
@@ -2960,14 +3874,641 @@ mod tests {
             true,
             Some(GithubPrStatus {
                 state: GithubPrState::Merged,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
                 build: GithubPrBuildState::Failed,
+                sonar: None,
                 review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
                 is_draft: false,
+                unresolved_review_threads: 0,
                 fetched_at: UNIX_EPOCH,
             })
         ));
         assert!(should_offer_codex_ci_fix(true, None));
         assert!(!should_offer_codex_ci_fix(false, None));
+    }
+
+    #[test]
+    fn should_offer_codex_sonar_fix_requires_failed_open_pr() {
+        assert!(should_offer_codex_sonar_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: Some(GithubPrSonarState::Failed),
+                review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
+        assert!(!should_offer_codex_sonar_fix(
+            true,
+            Some(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: Some(GithubPrSonarState::Building),
+                review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: UNIX_EPOCH,
+            })
+        ));
+    }
+
+    #[test]
+    fn pr_approval_queue_and_merge_states_follow_pr_metadata() {
+        let waiting = GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: Some(GithubPrSonarState::Succeeded),
+            review: GithubPrReviewState::None,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: UNIX_EPOCH,
+        };
+        let commented = GithubPrStatus {
+            review: GithubPrReviewState::Outstanding,
+            ..waiting.clone()
+        };
+        let approved = GithubPrStatus {
+            review: GithubPrReviewState::Accepted,
+            ..waiting.clone()
+        };
+        let blocked = GithubPrStatus {
+            unresolved_review_threads: 2,
+            ..waiting.clone()
+        };
+        let needs_rebase = GithubPrStatus {
+            merge_state: Some(GithubPrMergeState::Dirty),
+            ..waiting.clone()
+        };
+
+        assert!(pr_is_ready_for_approval_queue(&waiting));
+        assert!(!pr_is_ready_to_merge(&waiting));
+        assert!(!pr_is_ready_for_approval_queue(&commented));
+        assert!(!pr_is_ready_to_merge(&commented));
+        assert!(pr_is_ready_for_approval_queue(&approved));
+        assert!(pr_is_ready_to_merge(&approved));
+        assert!(!pr_is_ready_for_approval_queue(&blocked));
+        assert!(!pr_is_ready_to_merge(&blocked));
+        assert!(!pr_is_ready_for_approval_queue(&needs_rebase));
+        assert!(!pr_is_ready_to_merge(&needs_rebase));
+    }
+
+    #[test]
+    fn task_entries_insert_approval_separator_before_waiting_tasks() {
+        let mut snapshot = WorkspaceSnapshot::default();
+        snapshot.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-active".to_string(),
+                "https://github.com/example/repo/issues/1".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/11".to_string())),
+        );
+        snapshot.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-approval".to_string(),
+                "https://github.com/example/repo/issues/2".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/12".to_string())),
+        );
+        snapshot.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-merged".to_string(),
+                "https://github.com/example/repo/issues/3".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            )
+            .with_backing_pr_url(Some("https://github.com/example/repo/pull/13".to_string())),
+        );
+
+        let mut github_link_statuses = HashMap::new();
+        github_link_statuses.insert(
+            WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value: "https://github.com/example/repo/pull/11".to_string(),
+                source: WorkspaceLinkSource::Task,
+            },
+            GithubLinkStatusView::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Failed,
+                sonar: Some(GithubPrSonarState::Failed),
+                review: GithubPrReviewState::Outstanding,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 2,
+                fetched_at: UNIX_EPOCH,
+            }),
+        );
+        github_link_statuses.insert(
+            WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value: "https://github.com/example/repo/pull/12".to_string(),
+                source: WorkspaceLinkSource::Task,
+            },
+            GithubLinkStatusView::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: Some(GithubPrSonarState::Succeeded),
+                review: GithubPrReviewState::None,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: UNIX_EPOCH,
+            }),
+        );
+        github_link_statuses.insert(
+            WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value: "https://github.com/example/repo/pull/13".to_string(),
+                source: WorkspaceLinkSource::Task,
+            },
+            GithubLinkStatusView::Pr(GithubPrStatus {
+                state: GithubPrState::Merged,
+                target_branch: None,
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: Some(GithubPrSonarState::Succeeded),
+                review: GithubPrReviewState::Accepted,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: UNIX_EPOCH,
+            }),
+        );
+
+        assert_eq!(
+            task_entries_for_workspace_snapshot(&snapshot, "tracing", &github_link_statuses),
+            vec![
+                TableEntry::Task {
+                    workspace_key: "tracing".to_string(),
+                    task_id: "task-active".to_string(),
+                },
+                TableEntry::ApprovalSeparator {
+                    workspace_key: "tracing".to_string(),
+                },
+                TableEntry::Task {
+                    workspace_key: "tracing".to_string(),
+                    task_id: "task-approval".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn should_offer_codex_review_and_rebase_require_open_pr_with_review_comments() {
+        let open = Some(GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: None,
+            review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 2,
+            fetched_at: UNIX_EPOCH,
+        });
+        let open_without_comments = Some(GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: None,
+            review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: UNIX_EPOCH,
+        });
+        let merged = Some(GithubPrStatus {
+            state: GithubPrState::Merged,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: None,
+            review: GithubPrReviewState::Accepted,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: UNIX_EPOCH,
+        });
+
+        assert!(should_offer_codex_pr_review_fix(true, open.clone()));
+        assert!(!should_offer_codex_pr_review_fix(
+            true,
+            open_without_comments
+        ));
+        assert!(should_offer_codex_pr_rebase(true, open));
+        assert!(!should_offer_codex_pr_review_fix(true, merged.clone()));
+        assert!(!should_offer_codex_pr_rebase(true, merged));
+        assert!(!should_offer_codex_pr_review_fix(true, None));
+    }
+
+    #[test]
+    fn pr_operation_gate_allows_approval_ready_prs_for_rebase() {
+        let idle_task = WorkspaceTaskRuntimeSnapshot {
+            session_id: None,
+            agent_state: Some(AutomationAgentState::Idle),
+            session_status: None,
+            status: Some("Idle".to_string()),
+            ..Default::default()
+        };
+        let approval_ready_pr = GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: None,
+            review: GithubPrReviewState::None,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 0,
+            fetched_at: UNIX_EPOCH,
+        };
+
+        assert!(!should_offer_codex_pr_creation(Some(&idle_task)));
+        assert!(should_allow_codex_task_pr_operation(
+            false,
+            Some(&idle_task),
+            Some(approval_ready_pr.clone())
+        ));
+        assert!(!should_allow_codex_task_pr_publish_approval(
+            false,
+            Some(&idle_task)
+        ));
+
+        let needs_rebase_pr = GithubPrStatus {
+            merge_state: Some(GithubPrMergeState::Dirty),
+            ..approval_ready_pr
+        };
+        assert!(!should_allow_codex_task_pr_operation(
+            true,
+            Some(&idle_task),
+            Some(needs_rebase_pr.clone())
+        ));
+        assert!(should_allow_codex_task_pr_rebase(
+            true,
+            Some(&idle_task),
+            Some(needs_rebase_pr)
+        ));
+    }
+
+    #[test]
+    fn pr_operation_gate_waits_for_git_refresh_before_existing_pr_approval() {
+        let idle_existing_pr_before_git_refresh = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("PR created #41".to_string()),
+            ..Default::default()
+        };
+        let idle_task_with_local_changes = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("PR created #42".to_string()),
+            git: Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: false,
+            }),
+            ..Default::default()
+        };
+        let idle_task_with_unpushed_work = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("PR created #43".to_string()),
+            git: Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: false,
+                has_unpushed_commits: true,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!should_offer_codex_pr_creation(Some(
+            &idle_task_with_local_changes
+        )));
+        assert!(!should_allow_codex_task_pr_publish_approval(
+            true,
+            Some(&idle_existing_pr_before_git_refresh)
+        ));
+        assert!(should_allow_codex_task_pr_publish_approval(
+            true,
+            Some(&idle_task_with_local_changes)
+        ));
+        assert!(should_allow_codex_task_pr_publish_approval(
+            true,
+            Some(&idle_task_with_unpushed_work)
+        ));
+    }
+
+    #[test]
+    fn pr_operation_gate_blocks_idle_existing_pr_after_clean_git_refresh() {
+        let idle_clean_existing_pr = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("PR created #42".to_string()),
+            git: Some(WorkspaceTaskGitStatus::default()),
+            ..Default::default()
+        };
+
+        assert!(!should_allow_codex_task_pr_publish_approval(
+            true,
+            Some(&idle_clean_existing_pr)
+        ));
+    }
+
+    #[test]
+    fn pr_approval_restarts_stale_existing_pr_publish_work_but_preserves_review_fix_context() {
+        let dirty_existing_pr = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Idle),
+            status: Some("PR created #42".to_string()),
+            git: Some(WorkspaceTaskGitStatus {
+                has_uncommitted_changes: true,
+                has_unpushed_commits: false,
+            }),
+            ..Default::default()
+        };
+
+        assert!(should_restart_codex_task_for_pr_approval(
+            true,
+            Some(&dirty_existing_pr),
+            CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT
+        ));
+        assert!(should_restart_codex_task_for_pr_approval(
+            true,
+            None,
+            CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT
+        ));
+        assert!(!should_restart_codex_task_for_pr_approval(
+            true,
+            Some(&dirty_existing_pr),
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT
+        ));
+    }
+
+    #[test]
+    fn sonar_icon_and_review_status_text_reflect_pr_metadata() {
+        let failing_review_pr = GithubPrStatus {
+            state: GithubPrState::Open,
+            target_branch: None,
+            merge_state: Some(GithubPrMergeState::Clean),
+            build: GithubPrBuildState::Succeeded,
+            sonar: Some(GithubPrSonarState::Failed),
+            review: GithubPrReviewState::Outstanding,
+            requested_reviewers: None,
+            human_approval_count: 0,
+            human_approval_total: 0,
+            copilot_review: GithubPrCopilotReviewState::None,
+            is_draft: false,
+            unresolved_review_threads: 3,
+            fetched_at: UNIX_EPOCH,
+        };
+        let clear_review_pr = GithubPrStatus {
+            sonar: Some(GithubPrSonarState::Succeeded),
+            review: GithubPrReviewState::None,
+            unresolved_review_threads: 0,
+            ..failing_review_pr.clone()
+        };
+
+        assert_eq!(
+            pr_sonar_icon_color(failing_review_pr.clone()),
+            Some(Color::Red)
+        );
+        assert_eq!(
+            pr_review_status_color(failing_review_pr.clone()),
+            Some(Color::Red)
+        );
+        assert_eq!(
+            pr_review_status_cell_text(failing_review_pr),
+            format!("{}3", icon_glyph(StatusIconKind::Eye))
+        );
+        assert_eq!(
+            pr_review_status_color(clear_review_pr.clone()),
+            Some(Color::Green)
+        );
+        assert_eq!(
+            pr_review_status_cell_text(clear_review_pr.clone()),
+            format!("{}0", icon_glyph(StatusIconKind::Eye))
+        );
+        assert_eq!(
+            crate::task_server_label(None, Some(clear_review_pr.clone())),
+            "Assign Wait"
+        );
+        assert_eq!(
+            crate::task_description(
+                &multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    multicode_lib::WorkspaceTaskSource::Scan,
+                )
+                .with_backing_pr_url(Some("https://github.com/example/repo/pull/9".to_string())),
+                None,
+                Some(clear_review_pr.clone()),
+            ),
+            "Waiting for Assignee #9"
+        );
+
+        let requested_review_pr = GithubPrStatus {
+            review: GithubPrReviewState::Requested,
+            requested_reviewers: Some("alvarosanchez".to_string()),
+            human_approval_count: 0,
+            human_approval_total: 0,
+            ..clear_review_pr.clone()
+        };
+        assert_eq!(
+            crate::task_server_label(None, Some(requested_review_pr.clone())),
+            "Review Wait"
+        );
+        assert_eq!(
+            crate::task_description(
+                &multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    multicode_lib::WorkspaceTaskSource::Scan,
+                )
+                .with_backing_pr_url(Some("https://github.com/example/repo/pull/9".to_string())),
+                None,
+                Some(requested_review_pr),
+            ),
+            "Waiting for approval by alvarosanchez #9"
+        );
+
+        let approved_pr = GithubPrStatus {
+            review: GithubPrReviewState::Accepted,
+            ..clear_review_pr
+        };
+        assert_eq!(
+            crate::task_server_label(None, Some(approved_pr.clone())),
+            "Merge Ready"
+        );
+        assert_eq!(
+            crate::task_description(
+                &multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                    "task-1".to_string(),
+                    "https://github.com/example/repo/issues/1".to_string(),
+                    multicode_lib::WorkspaceTaskSource::Scan,
+                )
+                .with_backing_pr_url(Some("https://github.com/example/repo/pull/9".to_string())),
+                None,
+                Some(approved_pr.clone()),
+            ),
+            "Can be Merged PR created #9"
+        );
+
+        let partially_approved_pr = GithubPrStatus {
+            review: GithubPrReviewState::Accepted,
+            requested_reviewers: Some("sdelamo".to_string()),
+            human_approval_count: 1,
+            human_approval_total: 2,
+            ..approved_pr.clone()
+        };
+        assert_eq!(
+            crate::task_server_label(None, Some(partially_approved_pr.clone())),
+            "Merge Ready"
+        );
+        assert_eq!(
+            crate::task_description(
+                &multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                    "task-166".to_string(),
+                    "https://github.com/example/repo/issues/166".to_string(),
+                    multicode_lib::WorkspaceTaskSource::Scan,
+                )
+                .with_backing_pr_url(Some("https://github.com/example/repo/pull/864".to_string())),
+                None,
+                Some(partially_approved_pr),
+            ),
+            "Can be Merged PR created #864; 1/2 approvals"
+        );
+
+        let rebase_pr = GithubPrStatus {
+            merge_state: Some(GithubPrMergeState::Dirty),
+            ..approved_pr
+        };
+        let rebase_task = multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+            "task-287".to_string(),
+            "https://github.com/example/repo/issues/287".to_string(),
+            multicode_lib::WorkspaceTaskSource::Scan,
+        )
+        .with_backing_pr_url(Some("https://github.com/example/repo/pull/858".to_string()));
+        assert_eq!(
+            crate::task_server_label(None, Some(rebase_pr.clone())),
+            "Needs Rebase"
+        );
+        assert_eq!(
+            crate::task_description(&rebase_task, None, Some(rebase_pr.clone())),
+            "Needs rebase before continuing #858"
+        );
+
+        let waiting_task_state = WorkspaceTaskRuntimeSnapshot {
+            waiting_on_vm: true,
+            status: Some("Queued until VM is free".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::task_server_label(Some(&waiting_task_state), Some(rebase_pr.clone())),
+            "Waiting on VM"
+        );
+        assert_eq!(
+            crate::task_description(
+                &rebase_task,
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Queued until VM is free"
+        );
+
+        let mut snapshot = WorkspaceSnapshot {
+            active_task_id: Some("task-999".to_string()),
+            automation_agent_state: Some(AutomationAgentState::Working),
+            ..Default::default()
+        };
+        snapshot
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-999".to_string(),
+                "https://github.com/example/repo/issues/999".to_string(),
+                multicode_lib::WorkspaceTaskSource::Scan,
+            ));
+        snapshot.persistent.tasks.push(rebase_task.clone());
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-287",
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Waiting on VM"
+        );
+        assert_eq!(
+            crate::task_description_for_display(
+                &snapshot,
+                &rebase_task,
+                Some(&waiting_task_state),
+                Some(rebase_pr.clone())
+            ),
+            "Queued until VM is free"
+        );
+
+        let resuming_task_state = WorkspaceTaskRuntimeSnapshot {
+            agent_state: Some(AutomationAgentState::Working),
+            session_status: Some(RootSessionStatus::Busy),
+            status: Some("Resuming in background".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::task_server_label_for_display(
+                &snapshot,
+                "task-287",
+                Some(&resuming_task_state),
+                Some(rebase_pr)
+            ),
+            "Resuming"
+        );
     }
 
     #[test]
@@ -2997,6 +4538,9 @@ mod tests {
         assert!(prompt.contains("Use the existing pull request https://github.com/micronaut-projects/micronaut-kafka/pull/1308."));
         assert!(prompt.contains("`machine-readable-pr`"));
         assert!(prompt.contains("`autonomous-state`"));
+        assert!(prompt.contains("When Multicode subagents are available"));
+        assert!(prompt.contains("`multicode_github_researcher`"));
+        assert!(prompt.contains("`multicode_reviewer`"));
         assert!(prompt.contains(
             "Run repository commands, builds, Gradle tasks, focused tests, git commits, branch pushes, and pull request updates as needed without asking for permission."
         ));
@@ -3005,6 +4549,218 @@ mod tests {
         ));
         assert!(prompt.contains("Do not create a new pull request."));
         assert!(prompt.contains("Do not merge the pull request."));
+    }
+
+    #[test]
+    fn build_codex_review_rebase_and_sonar_prompts_include_core_instructions() {
+        let review_prompt = build_codex_fix_pr_review_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+        let rebase_prompt = build_codex_rebase_task_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+        let sonar_prompt = build_codex_fix_sonar_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+        let merge_prompt = build_codex_merge_task_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+
+        assert!(review_prompt.contains("unresolved review threads"));
+        assert!(review_prompt.contains("`multicode_github_researcher`"));
+        assert!(review_prompt.contains("`multicode_test_risk`"));
+        assert!(review_prompt.contains("`multicode_reviewer`"));
+        assert!(review_prompt.contains("Do not commit, do not push"));
+        assert!(
+            review_prompt
+                .contains("Summarize exactly what is ready to publish once approval is given.")
+        );
+        assert!(review_prompt.contains("already fixed and pushed"));
+        assert!(review_prompt.contains("outdated, invalid, unsafe, or not applicable"));
+        assert!(review_prompt.contains(
+            "Keep going until the local PR feedback fixes are ready for approval or you need human feedback."
+        ));
+        assert!(!review_prompt.contains(
+            "git commits, branch pushes, and pull request updates as needed without asking for permission."
+        ));
+        assert!(rebase_prompt.contains("determine its current target/base branch"));
+        assert!(rebase_prompt.contains("rebase the current task branch onto that target branch"));
+        assert!(sonar_prompt.contains("`sonar-pr-report`"));
+        assert!(sonar_prompt.contains("`multicode_security_cve`"));
+        assert!(sonar_prompt.contains("dependency tree"));
+        assert!(sonar_prompt.contains("`gradle/libs.versions.toml`"));
+        assert!(sonar_prompt.contains("Micronaut-managed dependency or Micronaut module"));
+        assert!(
+            sonar_prompt.contains("prefer moving `micronaut-kafka` from `6.0.0-M1` to `6.0.0-M2`")
+        );
+        assert!(
+            sonar_prompt.contains("Only add or change a version in `gradle/libs.versions.toml`")
+        );
+        assert!(sonar_prompt.contains("`5.0.0-M10` < `5.0.0-M11`"));
+        assert!(sonar_prompt.contains("highest safe patch"));
+        assert!(sonar_prompt.contains("highest available `-M` suffix"));
+        assert!(sonar_prompt.contains("Do not commit, do not push"));
+        assert!(
+            sonar_prompt
+                .contains("Summarize exactly what is ready to publish once approval is given.")
+        );
+        assert!(sonar_prompt.contains(
+            "Keep going until the local Sonar-related fixes are ready for approval or you need human feedback."
+        ));
+        assert!(!sonar_prompt.contains(
+            "git commits, branch pushes, and pull request updates as needed without asking for permission."
+        ));
+        assert!(merge_prompt.contains("Confirm the pull request is still green"));
+        assert!(merge_prompt.contains("has no unresolved review threads"));
+        assert!(merge_prompt.contains("has the required approval"));
+    }
+
+    #[test]
+    fn approval_prompt_for_task_matches_publish_state() {
+        let review_prompt = build_codex_fix_pr_review_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+        let sonar_prompt = build_codex_fix_sonar_prompt(
+            "micronaut-projects/micronaut-kafka",
+            "https://github.com/micronaut-projects/micronaut-kafka/issues/873",
+            "https://github.com/micronaut-projects/micronaut-kafka/pull/1308",
+            std::path::Path::new("/tmp/work/micronaut-kafka-873"),
+            std::path::Path::new("/tmp/state/task-873.state"),
+            Some("thread-task-873"),
+        );
+
+        let mut first_publish = WorkspaceSnapshot::default();
+        first_publish
+            .persistent
+            .tasks
+            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-873".to_string(),
+                "https://github.com/micronaut-projects/micronaut-kafka/issues/873".to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            ));
+        let create_prompt = approval_prompt_for_task(
+            &first_publish,
+            "task-873",
+            Some(review_prompt.as_str()),
+            Some(sonar_prompt.as_str()),
+        );
+        assert!(create_prompt.starts_with(CODEX_CREATE_PR_APPROVAL_PROMPT));
+        assert!(
+            create_prompt.contains(
+                "Resolves https://github.com/micronaut-projects/micronaut-kafka/issues/873"
+            )
+        );
+
+        let mut existing_pr = WorkspaceSnapshot::default();
+        existing_pr.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+                "task-873".to_string(),
+                "https://github.com/micronaut-projects/micronaut-kafka/issues/873".to_string(),
+                multicode_lib::WorkspaceTaskSource::Manual,
+            )
+            .with_backing_pr_url(Some(
+                "https://github.com/micronaut-projects/micronaut-kafka/pull/1308".to_string(),
+            )),
+        );
+        let update_prompt = approval_prompt_for_task(
+            &existing_pr,
+            "task-873",
+            Some(review_prompt.as_str()),
+            Some(sonar_prompt.as_str()),
+        );
+        assert!(update_prompt.starts_with(CODEX_UPDATE_EXISTING_PR_APPROVAL_PROMPT));
+        assert!(
+            update_prompt.contains(
+                "Resolves https://github.com/micronaut-projects/micronaut-kafka/issues/873"
+            )
+        );
+
+        existing_pr.task_states.insert(
+            "task-873".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                resume_prompt: Some(review_prompt.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            approval_prompt_for_task(
+                &existing_pr,
+                "task-873",
+                Some(review_prompt.as_str()),
+                Some(sonar_prompt.as_str()),
+            ),
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT.to_string()
+        );
+        assert!(
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT
+                .contains("use the specific review threads you identified as addressed")
+        );
+        assert!(
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT
+                .contains("already fixed by the current pushed branch")
+        );
+        assert!(CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT.contains("outdated by newer code"));
+        assert!(
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT
+                .contains("Do not reply to or resolve unrelated unresolved threads")
+        );
+
+        existing_pr.task_states.insert(
+            "task-873".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                resume_prompt: Some(sonar_prompt),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            approval_prompt_for_task(
+                &existing_pr,
+                "task-873",
+                Some(review_prompt.as_str()),
+                existing_pr
+                    .task_states
+                    .get("task-873")
+                    .and_then(|state| state.resume_prompt.as_deref()),
+            ),
+            CODEX_PUBLISH_SONAR_FIX_APPROVAL_PROMPT.to_string()
+        );
+
+        existing_pr.task_states.insert(
+            "task-873".to_string(),
+            multicode_lib::WorkspaceTaskRuntimeSnapshot {
+                resume_prompt: Some("Wrapper text.\nFetch the latest pull request review feedback, requested changes, review comments, and unresolved review threads for this task's existing pull request.\nMore wrapper text.".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            approval_prompt_for_task(&existing_pr, "task-873", None, None),
+            CODEX_PUBLISH_REVIEW_FIX_APPROVAL_PROMPT.to_string()
+        );
     }
 
     #[test]
@@ -3066,6 +4822,7 @@ mod tests {
             2,
             Some(&started),
             true,
+            false,
             2,
             Some(0),
             false,
@@ -3100,6 +4857,7 @@ mod tests {
             2,
             Some(&started),
             true,
+            false,
             2,
             Some(0),
             false,
@@ -3133,6 +4891,7 @@ mod tests {
             1,
             Some(&started),
             true,
+            false,
             0,
             None,
             false,
@@ -3160,6 +4919,7 @@ mod tests {
             1,
             Some(&started),
             true,
+            false,
             0,
             None,
             false,
@@ -3190,6 +4950,7 @@ mod tests {
             1,
             Some(&snapshot(false, None)),
             false,
+            false,
             0,
             None,
             false,
@@ -3219,6 +4980,7 @@ mod tests {
             1,
             1,
             Some(&snapshot(false, None)),
+            false,
             false,
             0,
             None,
@@ -3252,6 +5014,7 @@ mod tests {
             1,
             Some(&snapshot(false, None)),
             false,
+            false,
             0,
             None,
             false,
@@ -3282,6 +5045,7 @@ mod tests {
             1,
             1,
             Some(&snapshot(false, None)),
+            false,
             false,
             0,
             None,
@@ -3364,6 +5128,7 @@ mod tests {
             1,
             Some(&started),
             true,
+            false,
             0,
             None,
             false,
@@ -3529,6 +5294,7 @@ mod tests {
             1,
             Some(&active),
             false,
+            false,
             0,
             None,
             false,
@@ -3556,6 +5322,7 @@ mod tests {
             1,
             1,
             Some(&archived),
+            false,
             false,
             0,
             None,
@@ -3900,6 +5667,7 @@ mod tests {
             1,
             Some(&snapshot(true, Some("http://example"))),
             false,
+            false,
             0,
             None,
             false,
@@ -3929,6 +5697,7 @@ mod tests {
             2,
             None,
             false,
+            false,
             0,
             None,
             false,
@@ -3956,6 +5725,7 @@ mod tests {
             2,
             2,
             Some(&last_workspace),
+            false,
             false,
             0,
             None,
@@ -3990,6 +5760,7 @@ mod tests {
         snapshots.insert("wksp-short".to_string(), snapshot(false, None));
         snapshots.insert("wksp-longer-name".to_string(), busy);
         let ordered_keys = vec!["wksp-short".to_string(), "wksp-longer-name".to_string()];
+        let github_link_statuses = HashMap::new();
 
         let (
             workspace_width,
@@ -4001,11 +5772,16 @@ mod tests {
             is_width,
             t_width,
             pr_width,
+            target_branch_width,
+            git_width,
+            copilot_width,
             build_width,
+            sonar_width,
             review_width,
         ) = table_column_widths(
             &ordered_keys,
             &snapshots,
+            &github_link_statuses,
             "Machine:",
             "2200%",
             &machine_ram_cell_label(Some(31.0_f64.mul_add(1024.0 * 1024.0 * 1024.0, 0.0) as u64)),
@@ -4030,7 +5806,11 @@ mod tests {
         assert_eq!(is_width, content_width("IS").max(LINK_COLUMN_WIDTH));
         assert_eq!(t_width, content_width("T").max(TYPE_COLUMN_WIDTH));
         assert_eq!(pr_width, content_width("PR").max(LINK_COLUMN_WIDTH));
+        assert_eq!(target_branch_width, content_width("Base"));
+        assert_eq!(git_width, content_width("G").max(STATUS_COLUMN_WIDTH));
+        assert_eq!(copilot_width, content_width("C").max(STATUS_COLUMN_WIDTH));
         assert_eq!(build_width, content_width("B").max(STATUS_COLUMN_WIDTH));
+        assert_eq!(sonar_width, content_width("S").max(STATUS_COLUMN_WIDTH));
         assert_eq!(
             review_width,
             content_width("R").max(REVIEW_STATUS_COLUMN_WIDTH)
@@ -4040,14 +5820,16 @@ mod tests {
     #[test]
     fn table_column_widths_include_task_cost_and_server_labels() {
         let mut workspace = snapshot(true, Some("http://example"));
-        workspace
-            .persistent
-            .tasks
-            .push(multicode_lib::WorkspaceTaskPersistentSnapshot::new(
+        workspace.persistent.tasks.push(
+            multicode_lib::WorkspaceTaskPersistentSnapshot::new(
                 "task-39".to_string(),
                 "https://github.com/graemerocher/multicode-test/issues/39".to_string(),
                 multicode_lib::WorkspaceTaskSource::Scan,
-            ));
+            )
+            .with_backing_pr_url(Some(
+                "https://github.com/graemerocher/multicode-test/pull/338".to_string(),
+            )),
+        );
         workspace.task_states.insert(
             "task-39".to_string(),
             WorkspaceTaskRuntimeSnapshot {
@@ -4059,17 +5841,85 @@ mod tests {
         let mut snapshots = HashMap::new();
         snapshots.insert("e2e-test".to_string(), workspace);
         let ordered_keys = vec!["e2e-test".to_string()];
+        let github_link_statuses = HashMap::from([(
+            WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value: "https://github.com/graemerocher/multicode-test/pull/338".to_string(),
+                source: WorkspaceLinkSource::Task,
+            },
+            GithubLinkStatusView::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: Some("refs/heads/release/very-long-target".to_string()),
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: None,
+                review: GithubPrReviewState::None,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: SystemTime::UNIX_EPOCH,
+            }),
+        )]);
 
-        let (_, server_width, _, _, cost_width, _, _, _, _, _, _) = table_column_widths(
+        let (_, server_width, _, _, cost_width, _, _, _, _, target_branch_width, _, _, _, _, _) =
+            table_column_widths(
+                &ordered_keys,
+                &snapshots,
+                &github_link_statuses,
+                "Machine:",
+                "2200%",
+                &machine_ram_cell_label(Some(0)),
+            );
+
+        assert!(server_width >= content_width("Waiting on VM"));
+        assert!(cost_width >= content_width("123456k"));
+        assert_eq!(target_branch_width, TARGET_BRANCH_COLUMN_MAX_WIDTH);
+    }
+
+    #[test]
+    fn table_column_widths_include_workspace_pr_target_branch() {
+        let mut workspace = snapshot(true, Some("http://example"));
+        workspace.persistent.custom_links.pr =
+            vec!["https://github.com/graemerocher/multicode-test/pull/338".to_string()];
+        let mut snapshots = HashMap::new();
+        snapshots.insert("e2e-test".to_string(), workspace);
+        let ordered_keys = vec!["e2e-test".to_string()];
+        let github_link_statuses = HashMap::from([(
+            WorkspaceLink {
+                kind: WorkspaceLinkKind::Pr,
+                value: "https://github.com/graemerocher/multicode-test/pull/338".to_string(),
+                source: WorkspaceLinkSource::Custom,
+            },
+            GithubLinkStatusView::Pr(GithubPrStatus {
+                state: GithubPrState::Open,
+                target_branch: Some("refs/heads/release/very-long-target".to_string()),
+                merge_state: Some(GithubPrMergeState::Clean),
+                build: GithubPrBuildState::Succeeded,
+                sonar: None,
+                review: GithubPrReviewState::None,
+                requested_reviewers: None,
+                human_approval_count: 0,
+                human_approval_total: 0,
+                copilot_review: GithubPrCopilotReviewState::None,
+                is_draft: false,
+                unresolved_review_threads: 0,
+                fetched_at: SystemTime::UNIX_EPOCH,
+            }),
+        )]);
+
+        let (_, _, _, _, _, _, _, _, _, target_branch_width, _, _, _, _, _) = table_column_widths(
             &ordered_keys,
             &snapshots,
+            &github_link_statuses,
             "Machine:",
             "2200%",
             &machine_ram_cell_label(Some(0)),
         );
 
-        assert!(server_width >= content_width("Waiting on VM"));
-        assert!(cost_width >= content_width("123456k"));
+        assert_eq!(target_branch_width, TARGET_BRANCH_COLUMN_MAX_WIDTH);
     }
 
     #[test]
@@ -4135,6 +5985,42 @@ mod tests {
         };
 
         assert!(should_restart_codex_task_for_ci_fix(Some(&task_state)));
+    }
+
+    #[test]
+    fn rebase_and_merge_prompts_keep_idle_review_task_session() {
+        let task_state = WorkspaceTaskRuntimeSnapshot {
+            session_id: Some("session-1".to_string()),
+            agent_state: Some(AutomationAgentState::Review),
+            session_status: Some(RootSessionStatus::Idle),
+            status: Some("Idle".to_string()),
+            ..Default::default()
+        };
+        let rebase_prompt = build_codex_rebase_task_prompt(
+            "example/repo",
+            "https://github.com/example/repo/issues/1",
+            "https://github.com/example/repo/pull/2",
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/task-state"),
+            Some("session-1"),
+        );
+        let merge_prompt = build_codex_merge_task_prompt(
+            "example/repo",
+            "https://github.com/example/repo/issues/1",
+            "https://github.com/example/repo/pull/2",
+            std::path::Path::new("/tmp/repo"),
+            std::path::Path::new("/tmp/task-state"),
+            Some("session-1"),
+        );
+
+        assert!(!should_restart_codex_task_for_resume_prompt(
+            Some(&task_state),
+            &rebase_prompt
+        ));
+        assert!(!should_restart_codex_task_for_resume_prompt(
+            Some(&task_state),
+            &merge_prompt
+        ));
     }
 
     #[test]

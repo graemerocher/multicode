@@ -1021,12 +1021,52 @@ impl AppleContainerRuntime {
         program: String,
         args: Vec<String>,
     ) -> Result<Output, CombinedServiceError> {
-        let output = run_blocking_process(program.clone(), args.clone()).await?;
+        let mut output = run_blocking_process(program.clone(), args.clone()).await?;
         if output.status.success() {
             return Ok(output);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if container_start_reports_service_unavailable(&stderr) {
+            tracing::warn!(
+                stderr = %stderr.trim(),
+                "apple container service is unavailable; starting service before retry"
+            );
+            let start_output = run_blocking_process(
+                container_program(),
+                vec!["system".to_string(), "start".to_string()],
+            )
+            .await?;
+            if !start_output.status.success() {
+                let start_stderr = String::from_utf8_lossy(&start_output.stderr)
+                    .trim()
+                    .to_string();
+                return Err(CombinedServiceError::StartWorkspaceFailed {
+                    status: output.status.code(),
+                    stderr: if start_stderr.is_empty() {
+                        format!("{stderr}\nautomatic container system start failed")
+                    } else {
+                        format!("{stderr}\nautomatic container system start failed: {start_stderr}")
+                    },
+                });
+            }
+
+            tracing::info!("apple container service start succeeded; retrying workspace startup");
+            output = run_blocking_process(program.clone(), args.clone()).await?;
+            if output.status.success() {
+                return Ok(output);
+            }
+            stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if container_start_reports_service_unavailable(&stderr) {
+                return Err(CombinedServiceError::StartWorkspaceFailed {
+                    status: output.status.code(),
+                    stderr: format!(
+                        "{}\nautomatic container system start was insufficient",
+                        stderr.trim()
+                    ),
+                });
+            }
+        }
         if !container_start_reports_allocator_exhaustion(&stderr) {
             return Ok(output);
         }
@@ -1708,7 +1748,11 @@ impl AppleContainerRuntime {
     fn generate_runtime_id(&self, key: &str) -> String {
         let key_segment: String = key.chars().take(APPLE_RUNTIME_ID_KEY_LIMIT).collect();
         let random = Uuid::new_v4().simple().to_string();
-        format!("mc-{}-{}", key_segment, &random[..APPLE_RUNTIME_ID_SUFFIX_LEN])
+        format!(
+            "mc-{}-{}",
+            key_segment,
+            &random[..APPLE_RUNTIME_ID_SUFFIX_LEN]
+        )
     }
 }
 
@@ -1926,6 +1970,13 @@ fn container_start_reports_allocator_exhaustion(stderr: &str) -> bool {
     stderr
         .to_ascii_lowercase()
         .contains("no free indices are available for allocation")
+}
+
+fn container_start_reports_service_unavailable(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("xpc connection error: connection invalid")
+        || stderr.contains("ensure container system service has been started")
+        || stderr.contains("apiserver is not running")
 }
 
 fn docker_context_host_to_socket_path(host: &str) -> Option<PathBuf> {
@@ -2266,6 +2317,7 @@ mod tests {
         AddedSkillMount, AgentProvider, CodexAgentConfig, CodexApprovalPolicy, CodexNetworkAccess,
         CodexSandboxMode, IsolationConfig,
     };
+    use crate::test_support::ENV_VAR_LOCK;
     use std::{
         fs,
         os::unix::{fs::symlink, net::UnixListener},
@@ -2428,6 +2480,19 @@ mod tests {
     }
 
     #[test]
+    fn container_start_reports_service_unavailable_matches_apple_xpc_error() {
+        assert!(container_start_reports_service_unavailable(
+            "Error: internalError: \"failed to list containers\" (cause: \"interrupted: \"XPC connection error: Connection invalid\"\")\nEnsure container system service has been started with `container system start`."
+        ));
+        assert!(container_start_reports_service_unavailable(
+            "apiserver is not running and not registered with launchd"
+        ));
+        assert!(!container_start_reports_service_unavailable(
+            "Error: failed to bootstrap container: permission denied"
+        ));
+    }
+
+    #[test]
     fn apple_container_run_command_honors_limits_and_mounts() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2435,6 +2500,9 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let readable = root.path().join("readonly");
@@ -2526,6 +2594,9 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let home = root.path().join("home");
@@ -2866,12 +2937,11 @@ mod tests {
 
     #[test]
     fn docker_context_host_to_socket_path_expands_home_relative_socket() {
+        let _env_lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous_home = std::env::var_os("HOME");
-        let fake_home = std::env::temp_dir().join(format!(
-            "multicode-docker-home-{}-{}",
-            std::process::id(),
-            Uuid::new_v4().as_simple()
-        ));
+        let fake_home = PathBuf::from(format!("/tmp/mcdh-{}", std::process::id()));
         let docker_socket = fake_home.join(".rd/docker.sock");
         fs::create_dir_all(&fake_home).expect("fake home should exist");
         fs::create_dir_all(
@@ -2939,6 +3009,9 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let bin_dir = root.path().join("bin");
@@ -2980,11 +3053,9 @@ mod tests {
                 .join("alpha")
                 .join("server.env");
 
-            let resolved_socket = docker_context_host_to_socket_path(&format!(
-                "unix://{}",
-                socket_path.display()
-            ))
-            .expect("docker socket path should canonicalize");
+            let resolved_socket =
+                docker_context_host_to_socket_path(&format!("unix://{}", socket_path.display()))
+                    .expect("docker socket path should canonicalize");
             let docker_mount = format!(
                 "{}:{}",
                 resolved_socket.display(),
@@ -3019,6 +3090,9 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let bin_dir = root.path().join("bin");
@@ -3105,6 +3179,9 @@ mod tests {
             .expect("tokio runtime should build");
 
         runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = TestDir::new();
             let workspace_root = root.path().join("workspaces");
             let _host_override_guard = EnvVarGuard::set(

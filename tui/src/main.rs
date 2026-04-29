@@ -15,10 +15,12 @@ use crossterm::{
 };
 use multicode_lib::{
     AutomationAgentState, RootSessionStatus, WorkspaceIssueType, WorkspaceSnapshot,
-    WorkspaceTaskPersistentSnapshot, WorkspaceTaskRuntimeSnapshot, logging, opencode,
+    WorkspaceTaskGitStatus, WorkspaceTaskPersistentSnapshot, WorkspaceTaskRuntimeSnapshot, logging,
+    opencode,
     services::{
         CombinedService, GithubIssueState, GithubIssueStatus, GithubPrBuildState,
-        GithubPrReviewState, GithubPrState, GithubPrStatus, GithubStatus, ToolConfig, ToolType,
+        GithubPrCopilotReviewState, GithubPrReviewState, GithubPrState, GithubPrStatus,
+        GithubStatus, ToolConfig, ToolType,
     },
     tree_scan,
 };
@@ -61,10 +63,12 @@ const AGENT_LINK_COLOR: Color = Color::Rgb(255, 182, 193);
 const OOM_COLOR: Color = Color::Red;
 const RAM_LIMIT_WARNING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 const RAM_COLUMN_WIDTH: u16 = 10;
+const SERVER_COLUMN_MIN_WIDTH: u16 = 12;
 const LINK_COLUMN_WIDTH: u16 = 2;
 const TYPE_COLUMN_WIDTH: u16 = 1;
 const STATUS_COLUMN_WIDTH: u16 = 2;
-const REVIEW_STATUS_COLUMN_WIDTH: u16 = 2;
+const TARGET_BRANCH_COLUMN_MAX_WIDTH: u16 = 14;
+const REVIEW_STATUS_COLUMN_WIDTH: u16 = 4;
 const CPU_COLUMN_MIN_WIDTH: u16 = 5;
 const MACHINE_USAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const ROOT_SESSION_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -223,10 +227,13 @@ struct RunningOperation {
     cancel: Option<tokio::task::AbortHandle>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum RunningOperationCompletionAction {
     #[default]
     None,
+    RefreshGithubUrl {
+        url: String,
+    },
     WaitForWorkspaceStart {
         attach_when_ready: bool,
     },
@@ -236,6 +243,9 @@ enum RunningOperationCompletionAction {
 enum TableEntry {
     Create,
     Workspace {
+        workspace_key: String,
+    },
+    ApprovalSeparator {
         workspace_key: String,
     },
     Task {
@@ -254,16 +264,6 @@ fn workspace_supports_pause(snapshot: &WorkspaceSnapshot) -> bool {
         && (snapshot.persistent.automation_paused
             || snapshot.persistent.assigned_repository.is_some()
             || !snapshot.persistent.tasks.is_empty())
-}
-
-fn workspace_supports_task_approval(snapshot: &WorkspaceSnapshot) -> bool {
-    workspace_is_usable(snapshot)
-        && workspace_state(snapshot) == WorkspaceUiState::Started
-        && snapshot
-            .transient
-            .as_ref()
-            .and_then(|transient| Url::parse(&transient.uri).ok())
-            .is_some_and(|uri| matches!(uri.scheme(), "ws" | "wss"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,7 +294,7 @@ enum WorkspaceLinkValidationResult {
     Invalid(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GithubLinkStatusView {
     Issue(GithubIssueStatus),
     Pr(GithubPrStatus),
@@ -315,6 +315,7 @@ enum StatusIconKind {
     GitPullRequestDraft,
     GitPullRequestClosed,
     GitMerge,
+    GitCommit,
     IssueOpened,
     IssueClosed,
 }
@@ -434,6 +435,17 @@ fn task_issue_reference(task: &WorkspaceTaskPersistentSnapshot) -> String {
     task.issue_url.clone()
 }
 
+fn pr_approval_progress_description(pr_status: &GithubPrStatus) -> Option<String> {
+    (pr_status.human_approval_count > 0
+        && pr_status.human_approval_total > pr_status.human_approval_count)
+        .then(|| {
+            format!(
+                "{}/{} approvals",
+                pr_status.human_approval_count, pr_status.human_approval_total
+            )
+        })
+}
+
 fn task_row_label(task: &WorkspaceTaskPersistentSnapshot) -> String {
     format!("➡️ {}", task_issue_reference(task))
 }
@@ -451,9 +463,9 @@ fn task_pr_link<'a>(
     task: &'a WorkspaceTaskPersistentSnapshot,
     task_state: Option<&'a WorkspaceTaskRuntimeSnapshot>,
 ) -> Option<&'a str> {
-    task_state
-        .and_then(|state| state.pr.first().map(String::as_str))
-        .or(task.backing_pr_url.as_deref())
+    task.backing_pr_url
+        .as_deref()
+        .or_else(|| task_state.and_then(|state| state.pr.first().map(String::as_str)))
 }
 
 fn github_link_badge(url: &str) -> String {
@@ -478,6 +490,15 @@ fn task_pr_created_status(
         .map(github_link_badge)
         .filter(|reference| !reference.is_empty())
         .map(|reference| format!("PR created {reference}"))
+}
+
+fn task_pr_reference(
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> Option<String> {
+    task_pr_link(task, task_state)
+        .map(github_link_badge)
+        .filter(|reference| !reference.is_empty())
 }
 
 fn workspace_active_task<'a>(
@@ -517,9 +538,39 @@ fn is_generic_review_task_status(status: &str) -> bool {
         || status.starts_with("PR created ")
 }
 
-fn task_server_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> &'static str {
+fn task_server_label(
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+) -> &'static str {
     if task_state.is_some_and(|state| state.waiting_on_vm) {
+        if task_state.is_some_and(task_session_is_busy) {
+            return "Session Busy";
+        }
         return "Waiting on VM";
+    }
+    if task_state.is_some_and(task_is_resuming_in_background) {
+        return "Resuming";
+    }
+    if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
+        return "Needs Rebase";
+    }
+    if pr_status
+        .as_ref()
+        .is_some_and(crate::app::pr_is_ready_to_merge)
+    {
+        return "Merge Ready";
+    }
+    if pr_status.as_ref().is_some_and(|status| {
+        crate::app::pr_is_ready_for_approval_queue(status)
+            && status.review == GithubPrReviewState::Requested
+    }) {
+        return "Review Wait";
+    }
+    if pr_status
+        .as_ref()
+        .is_some_and(crate::app::pr_is_ready_for_approval_queue)
+    {
+        return "Assign Wait";
     }
     match task_effective_agent_state(task_state) {
         Some(AutomationAgentState::Working) => "Busy",
@@ -537,13 +588,144 @@ fn task_server_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> &'sta
     }
 }
 
-fn task_server_style(task_state: Option<&WorkspaceTaskRuntimeSnapshot>, archived: bool) -> Style {
+fn active_task_display_agent_state(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+) -> Option<AutomationAgentState> {
+    let resolved_active_task_id = active_task_id_for_display(snapshot);
+    let is_active = resolved_active_task_id.as_deref() == Some(task_id);
+    if is_active {
+        match snapshot.automation_agent_state {
+            Some(
+                AutomationAgentState::Working
+                | AutomationAgentState::WaitingOnVm
+                | AutomationAgentState::Question
+                | AutomationAgentState::Stale,
+            ) => return snapshot.automation_agent_state,
+            Some(AutomationAgentState::Review | AutomationAgentState::Idle) | None => {}
+        }
+        if task_effective_agent_state(task_state) == Some(AutomationAgentState::Working) {
+            return Some(AutomationAgentState::Working);
+        }
+    }
+    match task_effective_agent_state(task_state) {
+        Some(AutomationAgentState::Working) if resolved_active_task_id.is_some() => {
+            Some(AutomationAgentState::WaitingOnVm)
+        }
+        Some(AutomationAgentState::Review | AutomationAgentState::Idle)
+            if resolved_active_task_id.is_some()
+                && task_state.is_some_and(|state| {
+                    state.status.as_deref().is_some_and(|status| {
+                        status.trim() == "Queued until VM is free"
+                            || status.trim().starts_with("Queued until VM ")
+                    })
+                }) =>
+        {
+            Some(AutomationAgentState::WaitingOnVm)
+        }
+        other => other,
+    }
+}
+
+fn active_task_id_for_display(snapshot: &WorkspaceSnapshot) -> Option<String> {
+    if let Some(task_id) = snapshot
+        .active_task_id
+        .as_deref()
+        .filter(|task_id| snapshot.task_persistent_snapshot(task_id).is_some())
+    {
+        return Some(task_id.to_string());
+    }
+    if let Some(task_id) = snapshot.resolved_active_task_id() {
+        return Some(task_id);
+    }
+    if let Some(status) = snapshot.automation_status.as_deref() {
+        for task in &snapshot.persistent.tasks {
+            if status_contains_task_reference(status, &task.id)
+                || status_contains_task_reference(status, &task_issue_reference(task))
+            {
+                return Some(task.id.clone());
+            }
+        }
+    }
+
+    let mut working_tasks = snapshot
+        .persistent
+        .tasks
+        .iter()
+        .filter(|task| {
+            task_effective_agent_state(snapshot.task_states.get(&task.id))
+                == Some(AutomationAgentState::Working)
+        })
+        .map(|task| task.id.clone());
+    let first = working_tasks.next()?;
+    if working_tasks.next().is_some() {
+        return Some(first);
+    }
+    Some(first)
+}
+
+fn status_contains_task_reference(status: &str, reference: &str) -> bool {
+    if reference.is_empty() {
+        return false;
+    }
+    status.match_indices(reference).any(|(index, _)| {
+        let before = status[..index].chars().next_back();
+        let after = status[index + reference.len()..].chars().next();
+        !before.is_some_and(|ch| ch.is_ascii_alphanumeric())
+            && !after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '#')
+    })
+}
+
+fn task_server_label_for_display(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+) -> &'static str {
+    if task_state.is_some_and(task_is_resuming_in_background) {
+        return "Resuming";
+    }
+    let display_agent_state = active_task_display_agent_state(snapshot, task_id, task_state);
+    if display_agent_state == Some(AutomationAgentState::WaitingOnVm)
+        && task_state.is_some_and(task_session_is_busy)
+    {
+        return "Session Busy";
+    }
+    match display_agent_state {
+        Some(AutomationAgentState::Working) => "Busy",
+        Some(AutomationAgentState::Question) => "Question",
+        Some(AutomationAgentState::WaitingOnVm) => "Waiting on VM",
+        Some(AutomationAgentState::Stale) => "Stale",
+        Some(AutomationAgentState::Review | AutomationAgentState::Idle) | None => {
+            task_server_label(task_state, pr_status)
+        }
+    }
+}
+
+fn task_server_style_for_display(
+    snapshot: &WorkspaceSnapshot,
+    task_id: &str,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+    archived: bool,
+) -> Style {
     if archived {
         return Style::default();
     }
-    match task_server_label(task_state) {
+    match task_server_label_for_display(snapshot, task_id, task_state, pr_status) {
+        "Merge Ready" => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        "Review Wait" => Style::default().fg(Color::Yellow),
+        "Assign Wait" => Style::default().fg(Color::LightCyan),
+        "Needs Rebase" => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
         "Idle" => Style::default().fg(IDLE_COLOR),
         "Busy" => Style::default().fg(BUSY_COLOR),
+        "Session Busy" => Style::default().fg(BUSY_COLOR),
+        "Resuming" => Style::default().fg(BUSY_COLOR),
         "Question" => Style::default().fg(WAITING_FOR_INPUT_COLOR),
         "Waiting on VM" => Style::default().fg(Color::Blue),
         "Stale" => Style::default().fg(OOM_COLOR),
@@ -551,11 +733,86 @@ fn task_server_style(task_state: Option<&WorkspaceTaskRuntimeSnapshot>, archived
     }
 }
 
+fn task_is_resuming_in_background(task_state: &WorkspaceTaskRuntimeSnapshot) -> bool {
+    task_state.status.as_deref().is_some_and(|status| {
+        let status = status.trim();
+        status == "Resuming in background" || status.starts_with("Resuming ")
+    })
+}
+
+fn task_session_is_busy(task_state: &WorkspaceTaskRuntimeSnapshot) -> bool {
+    task_state.session_status == Some(RootSessionStatus::Busy)
+}
+
 fn task_description(
     task: &WorkspaceTaskPersistentSnapshot,
     task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
 ) -> String {
     let pr_created_status = task_pr_created_status(task, task_state);
+    let pr_reference = task_pr_reference(task, task_state);
+    if task_state.is_some_and(|state| state.waiting_on_vm) {
+        return task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| !status.trim().is_empty())
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| "Queued until VM is free".to_string());
+    }
+    if pr_status.as_ref().is_some_and(crate::app::pr_needs_rebase) {
+        return pr_reference
+            .map(|reference| format!("Needs rebase before continuing {reference}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "Needs rebase before continuing {}",
+                    task_issue_reference(task)
+                )
+            });
+    }
+    if pr_status
+        .as_ref()
+        .is_some_and(crate::app::pr_is_ready_to_merge)
+    {
+        let approval_progress = pr_status
+            .as_ref()
+            .and_then(pr_approval_progress_description);
+        return pr_created_status
+            .map(|status| {
+                approval_progress
+                    .as_ref()
+                    .map(|progress| format!("Can be Merged {status}; {progress}"))
+                    .unwrap_or_else(|| format!("Can be Merged {status}"))
+            })
+            .unwrap_or_else(|| {
+                let status = format!("Can be Merged {}", task_issue_reference(task));
+                approval_progress
+                    .as_ref()
+                    .map(|progress| format!("{status}; {progress}"))
+                    .unwrap_or(status)
+            });
+    }
+    if pr_status
+        .as_ref()
+        .is_some_and(crate::app::pr_is_ready_for_approval_queue)
+    {
+        if pr_status
+            .as_ref()
+            .is_some_and(|status| status.review == GithubPrReviewState::Requested)
+        {
+            let reviewers = pr_status
+                .as_ref()
+                .and_then(|status| status.requested_reviewers.as_deref())
+                .filter(|reviewers| !reviewers.trim().is_empty())
+                .unwrap_or("reviewer");
+            return format!(
+                "Waiting for approval by {reviewers} {}",
+                pr_reference.unwrap_or_else(|| task_issue_reference(task)),
+            );
+        }
+        return format!(
+            "Waiting for Assignee {}",
+            pr_reference.unwrap_or_else(|| task_issue_reference(task))
+        );
+    }
     if let Some(status) = task_state.and_then(|state| state.status.as_deref())
         && !status.trim().is_empty()
     {
@@ -569,9 +826,6 @@ fn task_description(
         }
         return status.trim().to_string();
     }
-    if task_state.is_some_and(|state| state.waiting_on_vm) {
-        return "Queued until VM is free".to_string();
-    }
     match task_effective_agent_state(task_state) {
         Some(AutomationAgentState::Working) => format!("Working {}", task_issue_reference(task)),
         Some(AutomationAgentState::Question) => format!("Question {}", task_issue_reference(task)),
@@ -583,6 +837,53 @@ fn task_description(
             .unwrap_or_else(|| format!("Wait close {}", task_issue_reference(task))),
         Some(AutomationAgentState::Stale) => format!("Stalled {}", task_issue_reference(task)),
         None => task_issue_reference(task),
+    }
+}
+
+fn task_description_for_display(
+    snapshot: &WorkspaceSnapshot,
+    task: &WorkspaceTaskPersistentSnapshot,
+    task_state: Option<&WorkspaceTaskRuntimeSnapshot>,
+    pr_status: Option<GithubPrStatus>,
+) -> String {
+    match active_task_display_agent_state(snapshot, &task.id, task_state) {
+        Some(AutomationAgentState::Working) => task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| {
+                let status = status.trim();
+                !status.is_empty() && !is_generic_review_task_status(status)
+            })
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| format!("Working {}", task_issue_reference(task))),
+        Some(AutomationAgentState::Question) => task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| !status.trim().is_empty())
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| format!("Question {}", task_issue_reference(task))),
+        Some(AutomationAgentState::WaitingOnVm) => task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| {
+                let status = status.trim();
+                !status.is_empty()
+                    && (task_state.is_some_and(task_session_is_busy)
+                        || !status.starts_with("Working "))
+            })
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| {
+                if task_state.is_some_and(task_session_is_busy) {
+                    "Session busy; queued until VM is free".to_string()
+                } else {
+                    "Queued until VM is free".to_string()
+                }
+            }),
+        Some(AutomationAgentState::Stale) => task_state
+            .and_then(|state| state.status.as_deref())
+            .filter(|status| !status.trim().is_empty())
+            .map(|status| status.trim().to_string())
+            .unwrap_or_else(|| format!("Stalled {}", task_issue_reference(task))),
+        Some(AutomationAgentState::Review | AutomationAgentState::Idle) | None => {
+            task_description(task, task_state, pr_status)
+        }
     }
 }
 
@@ -607,6 +908,7 @@ fn task_effective_agent_state(
     }
 }
 
+#[cfg(test)]
 fn next_non_stopped_row(
     current_row: usize,
     ordered_keys: &[String],
@@ -681,6 +983,34 @@ fn task_cost_cell_label(task_state: Option<&WorkspaceTaskRuntimeSnapshot>) -> St
         return format_tokens_compact(tokens);
     }
     String::new()
+}
+
+fn target_branch_cell_label(pr_status: Option<GithubPrStatus>) -> String {
+    pr_status
+        .and_then(|status| status.target_branch)
+        .map(|branch| compact_target_branch_label(&branch))
+        .unwrap_or_default()
+}
+
+fn compact_target_branch_label(branch: &str) -> String {
+    let branch = branch
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or_else(|| branch.trim())
+        .strip_prefix("origin/")
+        .unwrap_or_else(|| {
+            branch
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or_else(|| branch.trim())
+        });
+    if content_width(branch) <= TARGET_BRANCH_COLUMN_MAX_WIDTH {
+        return branch.to_string();
+    }
+    let keep = TARGET_BRANCH_COLUMN_MAX_WIDTH.saturating_sub(3) as usize;
+    let mut label = branch.chars().take(keep).collect::<String>();
+    label.push_str("...");
+    label
 }
 
 fn workspace_usage_totals(snapshot: &WorkspaceSnapshot) -> (Option<f64>, Option<u64>) {
@@ -952,6 +1282,16 @@ fn workspace_issue_pr_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> 
     );
 
     links
+}
+
+fn workspace_all_issue_pr_links(snapshot: &WorkspaceSnapshot) -> Vec<WorkspaceLink> {
+    let mut links = HashSet::new();
+    links.extend(workspace_issue_pr_links(snapshot));
+    for task in &snapshot.persistent.tasks {
+        links.extend(task_links(task, task_runtime_snapshot(snapshot, &task.id)));
+    }
+
+    links.into_iter().collect()
 }
 
 fn task_links(
@@ -1371,12 +1711,31 @@ fn right_align_cell_text(text: &str, width: u16) -> String {
 fn table_column_widths(
     ordered_keys: &[String],
     snapshots: &HashMap<String, WorkspaceSnapshot>,
+    github_link_statuses: &HashMap<WorkspaceLink, GithubLinkStatusView>,
     create_row_server: &str,
     create_row_cpu: &str,
     create_row_ram: &str,
-) -> (u16, u16, u16, u16, u16, u16, u16, u16, u16, u16, u16) {
+) -> (
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+    u16,
+) {
     let mut workspace_width = content_width("Workspace").max(content_width(CREATE_ROW_LABEL));
-    let mut server_width = content_width("Server").max(content_width(create_row_server));
+    let mut server_width = content_width("Server")
+        .max(content_width(create_row_server))
+        .max(SERVER_COLUMN_MIN_WIDTH);
     let mut cpu_width = content_width("CPU")
         .max(content_width("100%"))
         .max(content_width("2200%"))
@@ -1390,7 +1749,11 @@ fn table_column_widths(
     let is_width = content_width("IS").max(LINK_COLUMN_WIDTH);
     let t_width = content_width("T").max(TYPE_COLUMN_WIDTH);
     let pr_width = content_width("PR").max(LINK_COLUMN_WIDTH);
+    let mut target_branch_width = content_width("Base");
+    let git_width = content_width("G").max(STATUS_COLUMN_WIDTH);
+    let copilot_width = content_width("C").max(STATUS_COLUMN_WIDTH);
     let build_width = content_width("B").max(STATUS_COLUMN_WIDTH);
+    let sonar_width = content_width("S").max(STATUS_COLUMN_WIDTH);
     let review_width = content_width("R").max(REVIEW_STATUS_COLUMN_WIDTH);
     for key in ordered_keys {
         workspace_width = workspace_width.max(content_width(key));
@@ -1398,14 +1761,36 @@ fn table_column_widths(
             server_width = server_width.max(content_width(server_cell_label(snapshot)));
             cpu_width = cpu_width.max(content_width(&cpu_cell_label(snapshot)));
             cost_width = cost_width.max(content_width(&cost_cell_label(snapshot)));
+            for link in workspace_links(snapshot) {
+                if let Some(GithubLinkStatusView::Pr(pr_status)) = github_link_statuses.get(&link) {
+                    target_branch_width = target_branch_width
+                        .max(content_width(&target_branch_cell_label(Some(
+                            pr_status.clone(),
+                        ))))
+                        .min(TARGET_BRANCH_COLUMN_MAX_WIDTH);
+                }
+            }
             for task in &snapshot.persistent.tasks {
+                let task_state = task_runtime_snapshot(snapshot, &task.id);
                 workspace_width = workspace_width.max(content_width(&task_row_label(task)));
-                server_width = server_width.max(content_width(task_server_label(
-                    task_runtime_snapshot(snapshot, &task.id),
+                server_width = server_width.max(content_width(task_server_label_for_display(
+                    snapshot, &task.id, task_state, None,
                 )));
-                cost_width = cost_width.max(content_width(&task_cost_cell_label(
-                    task_runtime_snapshot(snapshot, &task.id),
-                )));
+                cost_width = cost_width.max(content_width(&task_cost_cell_label(task_state)));
+                let pr_status = task_pr_link(task, task_state)
+                    .map(|pr| WorkspaceLink {
+                        kind: WorkspaceLinkKind::Pr,
+                        value: pr.to_string(),
+                        source: WorkspaceLinkSource::Task,
+                    })
+                    .and_then(|link| github_link_statuses.get(&link))
+                    .and_then(|status| match status {
+                        GithubLinkStatusView::Pr(pr_status) => Some(pr_status.clone()),
+                        _ => None,
+                    });
+                target_branch_width = target_branch_width
+                    .max(content_width(&target_branch_cell_label(pr_status)))
+                    .min(TARGET_BRANCH_COLUMN_MAX_WIDTH);
             }
         }
     }
@@ -1419,7 +1804,11 @@ fn table_column_widths(
         is_width,
         t_width,
         pr_width,
+        target_branch_width,
+        git_width,
+        copilot_width,
         build_width,
+        sonar_width,
         review_width,
     )
 }
@@ -1445,6 +1834,7 @@ fn help_line(
     workspace_count: usize,
     selected_workspace: Option<&WorkspaceSnapshot>,
     selected_task_row: bool,
+    selected_task_has_pr: bool,
     selected_workspace_link_count: usize,
     selected_link_index: Option<usize>,
     selected_link_is_custom: bool,
@@ -1454,7 +1844,13 @@ fn help_line(
     selected_workspace_can_assign_issue: bool,
     selected_workspace_can_diff: bool,
     selected_workspace_can_edit: bool,
+    selected_task_can_approve: bool,
+    selected_task_can_rebase: bool,
+    selected_task_can_fix_review: bool,
     selected_task_can_fix_ci: bool,
+    selected_task_can_fix_sonar: bool,
+    selected_task_can_merge: bool,
+    selected_task_can_request_copilot_review: bool,
     tool_progress_can_cancel: bool,
     tool_hotkeys: &[(String, String)],
     status: &str,
@@ -1486,6 +1882,10 @@ fn help_line(
                             }
                             return Line::from(spans);
                         }
+                        push_hotkey(&mut spans, "o", " open issue  ");
+                        if selected_task_has_pr {
+                            push_hotkey(&mut spans, "p", " open PR  ");
+                        }
                         if workspace_is_usable(snapshot)
                             && workspace_state(snapshot) == WorkspaceUiState::Started
                         {
@@ -1501,13 +1901,27 @@ fn help_line(
                         if selected_workspace_can_edit {
                             push_hotkey(&mut spans, "e", " edit  ");
                         }
-                        if workspace_supports_task_approval(snapshot) {
+                        if selected_task_can_approve {
                             push_hotkey(&mut spans, "a", " approve  ");
-                            if selected_task_can_fix_ci {
-                                push_hotkey(&mut spans, "f", " fix CI  ");
-                            }
                         }
-                        push_hotkey(&mut spans, "o", " open GitHub  ");
+                        if selected_task_can_rebase {
+                            push_hotkey(&mut spans, "r", " rebase  ");
+                        }
+                        if selected_task_can_fix_review {
+                            push_hotkey(&mut spans, "v", " review  ");
+                        }
+                        if selected_task_can_fix_ci {
+                            push_hotkey(&mut spans, "f", " fix CI  ");
+                        }
+                        if selected_task_can_fix_sonar {
+                            push_hotkey(&mut spans, "z", " Sonar  ");
+                        }
+                        if selected_task_can_merge {
+                            push_hotkey(&mut spans, "m", " merge  ");
+                        }
+                        if selected_task_can_request_copilot_review {
+                            push_hotkey(&mut spans, "y", " Copilot  ");
+                        }
                         for (tool_key, tool_name) in tool_hotkeys {
                             push_hotkey(&mut spans, tool_key.clone(), format!(" {}  ", tool_name));
                         }
@@ -1682,6 +2096,7 @@ fn tool_is_usable(tool: &ToolConfig, snapshot: &WorkspaceSnapshot) -> bool {
     }
 }
 
+#[cfg(test)]
 fn contextual_tool_hotkeys(
     tools: &[ToolConfig],
     selected_workspace: Option<&WorkspaceSnapshot>,

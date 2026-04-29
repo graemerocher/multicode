@@ -21,6 +21,8 @@ use std::{collections::BTreeMap, fmt, sync::Arc, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+pub const CODEX_MULTICODE_SUBAGENT_INSTRUCTIONS: &str = "When Multicode subagents are available, use them for bounded sidecar work that can run independently of implementation: ask `multicode_planner_architect` to plan larger or cross-cutting state-machine changes, `multicode_code_mapper` to trace unfamiliar code paths before risky edits, `multicode_github_researcher` to inspect GitHub/CI/PR metadata without mutating it, `multicode_docs_researcher` to verify current external API or Codex behavior from primary docs, `multicode_security_cve` for CVE/security/dependency/isolation concerns, `multicode_test_risk` for focused automated verification planning, `multicode_qa_scenarios` for user-facing TUI/live workflow checks, and `multicode_reviewer` for a final read-only review of non-trivial changes before requesting publish approval. Do not delegate the immediate implementation path when your next local step depends on it, and do not ask read-only subagents to edit files, push, comment, assign, request reviews, or merge.";
+
 /// Workspace metadata provided in machine-readable form by the agent. See
 /// /workspace-skills/machine-readable-*
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +161,14 @@ pub struct WorkspaceTaskRuntimeSnapshot {
     pub repository: Vec<String>,
     pub issue: Vec<String>,
     pub pr: Vec<String>,
+    pub git: Option<WorkspaceTaskGitStatus>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkspaceTaskGitStatus {
+    pub has_uncommitted_changes: bool,
+    pub has_unpushed_commits: bool,
 }
 
 /// Workspace metadata that is saved in persistent storage, i.e. survives a host reboot.

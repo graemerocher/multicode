@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use diesel::{
-    QueryableByName, RunQueryDsl,
+    RunQueryDsl,
     r2d2::{ConnectionManager, CustomizeConnection, Pool},
     sql_query,
     sqlite::SqliteConnection,
@@ -79,21 +79,21 @@ fn configure_database(connection: &mut SqliteConnection) -> Result<(), diesel::r
     Ok(())
 }
 
-#[derive(Debug, QueryableByName)]
+#[derive(Debug, diesel::QueryableByName)]
 #[cfg(test)]
 struct SqliteTableExistsRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     table_exists: bool,
 }
 
-#[derive(Debug, QueryableByName)]
+#[derive(Debug, diesel::QueryableByName)]
 #[cfg(test)]
 struct SqliteForeignKeysPragmaRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     foreign_keys: i32,
 }
 
-#[derive(Debug, QueryableByName)]
+#[derive(Debug, diesel::QueryableByName)]
 #[cfg(test)]
 struct SqliteBusyTimeoutPragmaRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
