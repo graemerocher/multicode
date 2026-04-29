@@ -65,10 +65,10 @@ const RAM_LIMIT_WARNING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 const RAM_COLUMN_WIDTH: u16 = 10;
 const SERVER_COLUMN_MIN_WIDTH: u16 = 12;
 const LINK_COLUMN_WIDTH: u16 = 2;
-const TYPE_COLUMN_WIDTH: u16 = 1;
+const TYPE_COLUMN_WIDTH: u16 = 2;
 const STATUS_COLUMN_WIDTH: u16 = 2;
 const TARGET_BRANCH_COLUMN_MAX_WIDTH: u16 = 14;
-const REVIEW_STATUS_COLUMN_WIDTH: u16 = 4;
+const REVIEW_STATUS_COLUMN_WIDTH: u16 = 5;
 const CPU_COLUMN_MIN_WIDTH: u16 = 5;
 const MACHINE_USAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const ROOT_SESSION_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -447,7 +447,7 @@ fn pr_approval_progress_description(pr_status: &GithubPrStatus) -> Option<String
 }
 
 fn task_row_label(task: &WorkspaceTaskPersistentSnapshot) -> String {
-    format!("➡️ {}", task_issue_reference(task))
+    format!("> {}", task_issue_reference(task))
 }
 
 fn task_issue_link<'a>(

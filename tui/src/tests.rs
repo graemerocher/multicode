@@ -381,7 +381,7 @@ mod tests {
             multicode_lib::WorkspaceTaskSource::Scan,
         );
 
-        assert_eq!(crate::task_row_label(&task), "➡️ multicode-test#8");
+        assert_eq!(crate::task_row_label(&task), "> multicode-test#8");
     }
 
     #[test]
@@ -392,7 +392,7 @@ mod tests {
             multicode_lib::WorkspaceTaskSource::Scan,
         );
 
-        assert_eq!(crate::task_row_label(&task), "➡️ graphql#12");
+        assert_eq!(crate::task_row_label(&task), "> graphql#12");
     }
 
     #[test]

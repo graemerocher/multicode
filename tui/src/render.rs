@@ -57,7 +57,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
                 .get(workspace_key)
                 .and_then(|snapshot| task_persistent_snapshot(snapshot, task_id))
                 .map(task_row_label)
-                .unwrap_or_else(|| "➡️ task".to_string()),
+                .unwrap_or_else(|| "> task".to_string()),
         };
         width.max(content_width(&label))
     });
@@ -890,7 +890,7 @@ fn status_icon_cell(kind: StatusIconKind, color: Color, reversed: bool) -> Cell<
     } else {
         style
     };
-    Cell::from(format!("{} ", icon_glyph(kind))).style(style)
+    Cell::from(icon_glyph(kind).to_string()).style(style)
 }
 
 fn pr_copilot_review_cell(pr: GithubPrStatus, archived: bool) -> Cell<'static> {
