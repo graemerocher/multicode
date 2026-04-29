@@ -11,6 +11,17 @@ This is the recommended build command:
 ./gradlew spotlessApply check -q -x japiCmp -x checkVersionCatalogCompatibility
 ```
 
+If you used Gradle during the task and the work is otherwise complete, stop the Gradle daemon
+before finishing:
+
+```sh
+./gradlew --stop
+```
+
+Treat this as end-of-task cleanup to release file handles and background daemon state. Do not run
+it in the middle of an active debugging or validation loop where you expect to reuse the daemon
+immediately.
+
 Note that for projects using the Micronaut build systems, gradle modules have a prefix: For example the folder 
 `context-propagation` corresponds to the gradle module `:micronaut-context-propagation`.
 

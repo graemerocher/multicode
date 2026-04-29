@@ -321,6 +321,8 @@ pub struct IsolationConfig {
     pub memory_max: Option<String>,
     #[serde(default)]
     pub cpu: Option<String>,
+    #[serde(default)]
+    pub nofile: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +342,7 @@ pub(super) struct ExpandedIsolationConfig {
     pub(super) memory_high_bytes: Option<u64>,
     pub(super) memory_max_bytes: Option<u64>,
     pub(super) cpu: Option<String>,
+    pub(super) nofile: Option<u64>,
 }
 
 impl ExpandedIsolationConfig {
@@ -363,6 +366,7 @@ impl ExpandedIsolationConfig {
                 "memory_max",
             )?,
             cpu: config.cpu.clone(),
+            nofile: config.nofile,
         })
     }
 }

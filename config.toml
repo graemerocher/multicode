@@ -71,6 +71,7 @@ inherit-env = [
 memory-high = "12 GiB"
 memory-max = "16 GiB"
 cpu = "300%"
+nofile = 16384
 
 
 [handler]

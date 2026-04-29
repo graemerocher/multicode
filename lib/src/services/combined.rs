@@ -531,7 +531,7 @@ impl CombinedService {
                 return Err(CombinedServiceError::RepositoryPreparation(format!(
                     "failed to remove task worktree '{}': {}",
                     task_root.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    git_command_error(&output)
                 )));
             }
 
@@ -539,7 +539,7 @@ impl CombinedService {
             prune
                 .arg("-C")
                 .arg(&repo_root)
-                .args(["worktree", "prune"])
+                .args(["worktree", "prune", "--expire", "now"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -1516,7 +1516,7 @@ impl CombinedService {
         prune
             .arg("-C")
             .arg(repo_root)
-            .args(["worktree", "prune"])
+            .args(["worktree", "prune", "--expire", "now"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1540,13 +1540,13 @@ impl CombinedService {
             command.env(name, value);
         }
         let output = command.output().await?;
-        if output.status.success() {
+        if output.status.success() || path_has_git_entry(task_root).await? {
             Ok(())
         } else {
             Err(CombinedServiceError::RepositoryPreparation(format!(
                 "failed to create task worktree '{}': {}",
                 task_root.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                git_command_error(&output)
             )))
         }
     }
@@ -1630,7 +1630,7 @@ impl CombinedService {
             Err(CombinedServiceError::RepositoryPreparation(format!(
                 "failed to {description} for '{}': {}",
                 repo_root.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                git_command_error(&output)
             )))
         }
     }
@@ -1923,6 +1923,23 @@ fn issue_url_number(issue_url: &str) -> Option<&str> {
 
 fn repository_clone_url(repository: &str) -> String {
     format!("https://github.com/{repository}.git")
+}
+
+fn git_command_error(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    match output.status.code() {
+        Some(code) => format!("git exited with status {code} without output"),
+        None => "git exited unsuccessfully without output".to_string(),
+    }
 }
 
 fn git_program() -> String {
@@ -4451,6 +4468,89 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR"]
     }
 
     #[test]
+    fn ensure_workspace_task_checkout_recovers_missing_recent_worktree_registration() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let bin_dir = root.path().join("bin");
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace root should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+            let fake_opencode = bin_dir.join("opencode");
+            fs::write(&fake_opencode, "#!/bin/sh\nexit 0\n")
+                .expect("fake opencode should be written");
+            make_executable(&fake_opencode);
+
+            let _path_guard = EnvVarGuard::set("PATH", &bin_dir);
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    "workspace-directory = \"{}\"\nopencode = [\"opencode\"]\n\n[isolation]\n",
+                    workspace_directory.display()
+                ),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace_with_repository("alpha", "example/repo")
+                .await
+                .expect("workspace should be created with repository");
+
+            let repo_root = service.workspace_repo_root_path("alpha", "example/repo");
+            init_test_git_repository(&repo_root);
+
+            let issue_url = "https://github.com/example/repo/issues/42";
+            let task_root = service
+                .ensure_workspace_task_checkout("alpha", "example/repo", issue_url)
+                .await
+                .expect("initial task checkout should be prepared");
+
+            fs::remove_dir_all(&task_root).expect("task worktree dir should be removed manually");
+            assert!(
+                tokio::fs::metadata(&task_root).await.is_err(),
+                "task worktree dir should now be missing"
+            );
+
+            let recreated = service
+                .ensure_workspace_task_checkout("alpha", "example/repo", issue_url)
+                .await
+                .expect("missing registered worktree should be recreated immediately");
+
+            assert_eq!(recreated, task_root);
+            assert!(
+                tokio::fs::symlink_metadata(task_root.join(".git"))
+                    .await
+                    .expect("recreated worktree should have git entry")
+                    .file_type()
+                    .is_file(),
+                "recreated worktree should expose a .git file"
+            );
+            assert_eq!(
+                git_stdout(&task_root, &["rev-parse", "--is-inside-work-tree"]),
+                "true"
+            );
+        });
+    }
+
+    #[test]
     fn task_worktree_uses_origin_default_branch_tip_instead_of_local_repo_head() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4706,6 +4806,7 @@ inherit-env = ["HOME", "XDG_RUNTIME_DIR", "MISSING_VAR"]
 memory_high = "8 GB"
 memory_max = "10 GB"
 cpu = "400%"
+nofile = 8192
 "#,
             )
             .expect("config should be written");
@@ -4745,6 +4846,7 @@ cpu = "400%"
             ));
             assert!(contains_sequence(&args, &["-p", "MemorySwapMax=0"]));
             assert!(contains_sequence(&args, &["-p", "CPUQuota=400%"]));
+            assert!(contains_sequence(&args, &["-p", "LimitNOFILE=8192"]));
             assert!(args.iter().any(|arg| arg == "bwrap"));
             assert!(!args.iter().any(|arg| arg == "--clearenv"));
             assert!(

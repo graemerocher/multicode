@@ -746,6 +746,10 @@ impl LinuxSystemdBwrapRuntime {
             args.push("-p".to_string());
             args.push(format!("CPUQuota={cpu}"));
         }
+        if let Some(nofile) = self.context.expanded_isolation.nofile {
+            args.push("-p".to_string());
+            args.push(format!("LimitNOFILE={nofile}"));
+        }
     }
 
     async fn append_bwrap_sandbox_args(
@@ -1413,6 +1417,10 @@ impl AppleContainerRuntime {
         if let Some(memory_limit) = memory_limit {
             args.push("--memory".to_string());
             args.push(memory_limit.to_string());
+        }
+        if let Some(nofile) = self.context.expanded_isolation.nofile {
+            args.push("--ulimit".to_string());
+            args.push(format!("nofile={nofile}:{nofile}"));
         }
     }
 
@@ -2523,6 +2531,7 @@ mod tests {
                     memory_high: Some("8 GB".to_string()),
                     memory_max: Some("10 GB".to_string()),
                     cpu: Some("300%".to_string()),
+                    nofile: Some(8192),
                 },
             );
 
@@ -2553,6 +2562,10 @@ mod tests {
             assert!(contains_sequence(
                 &command.args,
                 &["--memory", "10000000000"]
+            ));
+            assert!(contains_sequence(
+                &command.args,
+                &["--ulimit", "nofile=8192:8192"]
             ));
             assert!(contains_sequence(
                 &command.args,
@@ -3290,6 +3303,7 @@ mod tests {
                     memory_high: None,
                     memory_max: None,
                     cpu: None,
+                    nofile: None,
                 },
             );
 
@@ -3393,6 +3407,7 @@ mod tests {
                         memory_high_bytes: None,
                         memory_max_bytes: None,
                         cpu: None,
+                        nofile: None,
                     },
                     agent_provider: AgentProvider::Opencode,
                     host_agent_command: "/opt/opencode/bin/opencode".to_string(),
@@ -3485,6 +3500,7 @@ mod tests {
                         memory_high_bytes: None,
                         memory_max_bytes: None,
                         cpu: None,
+                        nofile: None,
                     },
                     agent_provider: AgentProvider::Opencode,
                     host_agent_command: "/opt/opencode/bin/opencode".to_string(),
@@ -3587,6 +3603,7 @@ mod tests {
                         memory_high_bytes: None,
                         memory_max_bytes: None,
                         cpu: None,
+                        nofile: None,
                     },
                     agent_provider: AgentProvider::Opencode,
                     host_agent_command: "/opt/opencode/bin/opencode".to_string(),

@@ -156,7 +156,8 @@ Isolation is implemented using `systemd-run` (for resource constraints) and
 
 On newer Apple Silicon Macs, there is also an experimental Apple `container` runtime backend. It
 reuses the existing `[isolation]` configuration for readable, writable, isolated, and `tmpfs`
-paths, and maps CPU / memory limits onto container allocation settings.
+paths, and maps CPU / memory limits onto container allocation settings. It also supports a
+per-workspace file descriptor ceiling via `[isolation].nofile`.
 
 ### macOS setup for Apple containers
 
@@ -242,6 +243,7 @@ tmpfs = ["/tmp"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
 cpu = "300%"
+nofile = 16384
 ```
 
 Mounting `~/.config/opencode` read-only lets the container see the same profiles, models,
@@ -273,6 +275,7 @@ writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
 cpu = "300%"
+nofile = 16384
 ```
 
 For Codex, multicode prepares a synthetic per-workspace `CODEX_HOME` inside the isolate/container.
