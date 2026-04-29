@@ -586,6 +586,14 @@ impl WorkspaceRuntime {
                     .as_deref()
                     .unwrap_or_default()
             ),
+            format!(
+                "nofile={}",
+                context
+                    .expanded_isolation
+                    .nofile
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            ),
         ];
         parts.push(format!(
             "workspace-root={}",

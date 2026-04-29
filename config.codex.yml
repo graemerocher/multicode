@@ -45,6 +45,7 @@ inherit-env = [
 memory-high = "6 GiB"
 memory-max = "8 GiB"
 cpu = "300%"
+nofile = 16384
 
 [handler]
 review = "/usr/bin/open ."
