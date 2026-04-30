@@ -46,7 +46,8 @@ async fn watch_workspace_snapshot(
     key: String,
     mut workspace_rx: watch::Receiver<WorkspaceSnapshot>,
 ) {
-    let idle_delay = Duration::from_secs(service.config.autonomous.idle_runtime_cleanup_delay_seconds);
+    let idle_delay =
+        Duration::from_secs(service.config.autonomous.idle_runtime_cleanup_delay_seconds);
     let cleanup_interval = Duration::from_secs(
         service
             .config
@@ -59,7 +60,7 @@ async fn watch_workspace_snapshot(
     let mut next_cleanup_at: Option<Instant> = None;
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let snapshot = workspace_rx.borrow_and_update().clone();
         let runtime_id = snapshot
             .transient
             .as_ref()
@@ -113,7 +114,10 @@ async fn watch_workspace_snapshot(
                     {
                         let latest_snapshot = workspace.subscribe().borrow().clone();
                         if workspace_is_idle_for_gradle_cleanup(&latest_snapshot) {
-                            match service.restart_workspace_runtime_preserving_state(&key).await {
+                            match service
+                                .restart_workspace_runtime_preserving_state(&key)
+                                .await
+                            {
                                 Ok(()) => {
                                     tracing::info!(
                                         workspace_key = %key,

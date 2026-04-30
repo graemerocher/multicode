@@ -19,7 +19,7 @@ pub(crate) async fn watch_workspace_task<K, FKey, FDetached, FRestart, FSpawn>(
     let mut current_task: Option<(K, JoinHandle<()>)> = None;
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let snapshot = workspace_rx.borrow_and_update().clone();
         let next_key = derive_key(&snapshot);
 
         let Some(next_key) = next_key else {

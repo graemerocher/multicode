@@ -59,7 +59,7 @@ async fn watch_workspace(
     refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let snapshot = workspace_rx.borrow_and_update().clone();
         let should_track = snapshot.transient.is_some()
             && !snapshot.persistent.archived
             && !snapshot.persistent.automation_paused

@@ -46,7 +46,7 @@ async fn watch_workspace_snapshot(
     let mut next_sample_at: Option<Instant> = None;
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let snapshot = workspace_rx.borrow_and_update().clone();
         let transient = snapshot.transient.clone();
 
         let Some(transient) = transient else {

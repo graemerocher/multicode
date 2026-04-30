@@ -69,12 +69,50 @@ const BUG_ISSUE_LABELS: [&str; 2] = ["type: bug", "status: bug"];
 const REGRESSION_ISSUE_LABELS: [&str; 2] = ["type: regression", "status: regression"];
 const IMPROVEMENT_ISSUE_LABELS: [&str; 1] = ["type: improvement"];
 const ENHANCEMENT_ISSUE_LABELS: [&str; 1] = ["type: enhancement"];
+const ACTIVE_CODEX_TASK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const FULL_CODEX_TASK_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const ACTIVE_TASK_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const FULL_TASK_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct QueuedIssueCandidate {
     issue: SelectedIssue,
     backing_pr_url: Option<String>,
     dependency_upgrade_backing_pr: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTaskRefreshFingerprint {
+    transient_uri: Option<String>,
+    active_task_id: Option<String>,
+    root_session_id: Option<String>,
+    tasks: Vec<CodexTaskRefreshEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTaskRefreshEntry {
+    task_id: String,
+    issue_url: String,
+    backing_pr_url: Option<String>,
+    dependency_upgrade_backing_pr: bool,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskGitRefreshFingerprint {
+    tasks: Vec<TaskGitRefreshEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskGitRefreshEntry {
+    task_id: String,
+    issue_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskRefreshScope {
+    ActiveOnly,
+    All,
 }
 
 #[derive(Debug)]
@@ -139,9 +177,16 @@ async fn watch_workspace(
     let mut blocked_start_scan_request_nonce: Option<u64> = None;
     let mut previous_active_issue_url: Option<String> = None;
     let mut startup_scan_pending = !service.config.autonomous.scan_on_startup;
+    let mut last_full_codex_task_refresh_at: Option<Instant> = None;
+    let mut last_active_codex_task_refresh_at: Option<Instant> = None;
+    let mut last_codex_task_refresh_fingerprint: Option<CodexTaskRefreshFingerprint> = None;
+    let mut last_full_task_git_refresh_at: Option<Instant> = None;
+    let mut last_active_task_git_refresh_at: Option<Instant> = None;
+    let mut last_task_git_refresh_fingerprint: Option<TaskGitRefreshFingerprint> = None;
 
     loop {
-        let mut snapshot = workspace_rx.borrow().clone();
+        let mut snapshot = workspace_rx.borrow_and_update().clone();
+        let now = Instant::now();
         let assigned_repository = snapshot.persistent.assigned_repository.clone();
         let scan_requested = snapshot.automation_scan_request_nonce != previous_scan_request_nonce;
         previous_scan_request_nonce = snapshot.automation_scan_request_nonce;
@@ -150,24 +195,6 @@ async fn watch_workspace(
         previous_queue_next_request_nonce = snapshot.automation_queue_next_request_nonce;
         if scan_requested || queue_next_requested || !snapshot.persistent.tasks.is_empty() {
             startup_scan_pending = false;
-        }
-
-        if assigned_repository.is_some() || !snapshot.persistent.tasks.is_empty() {
-            tracing::warn!(
-                workspace_key,
-                assigned_repository = assigned_repository.as_deref(),
-                transient_uri = snapshot.transient.as_ref().map(|transient| transient.uri.as_str()),
-                active_task_id = snapshot.active_task_id.as_deref(),
-                resolved_active_task_id = snapshot.resolved_active_task_id().as_deref(),
-                automation_issue = snapshot.persistent.automation_issue.as_deref(),
-                task_count = snapshot.persistent.tasks.len(),
-                root_session_id = snapshot.root_session_id.as_deref(),
-                root_status = ?snapshot.root_session_status,
-                scan_requested,
-                queue_next_requested,
-                paused = snapshot.persistent.automation_paused,
-                "autonomous workspace iteration"
-            );
         }
 
         if snapshot.persistent.archived || assigned_repository.is_none() {
@@ -181,6 +208,12 @@ async fn watch_workspace(
             previous_root_status = snapshot.root_session_status;
             clear_automation_runtime_state(&workspace);
             set_automation_status(&workspace, None);
+            last_full_codex_task_refresh_at = None;
+            last_active_codex_task_refresh_at = None;
+            last_codex_task_refresh_fingerprint = None;
+            last_full_task_git_refresh_at = None;
+            last_active_task_git_refresh_at = None;
+            last_task_git_refresh_fingerprint = None;
             if workspace_rx.changed().await.is_err() {
                 break;
             }
@@ -199,6 +232,12 @@ async fn watch_workspace(
             previous_active_issue_url = None;
             previous_root_status = snapshot.root_session_status;
             set_paused_automation_state(&workspace, repository_label);
+            last_full_codex_task_refresh_at = None;
+            last_active_codex_task_refresh_at = None;
+            last_codex_task_refresh_fingerprint = None;
+            last_full_task_git_refresh_at = None;
+            last_active_task_git_refresh_at = None;
+            last_task_git_refresh_fingerprint = None;
             if workspace_rx.changed().await.is_err() {
                 break;
             }
@@ -206,33 +245,81 @@ async fn watch_workspace(
         }
         sync_task_runtime_state(&workspace, &snapshot);
         snapshot = workspace.subscribe().borrow().clone();
-        recover_codex_task_sessions(
-            &service,
-            &workspace,
-            &snapshot,
-            &workspace_key,
-            &assigned_repository,
-        )
-        .await;
-        snapshot = workspace.subscribe().borrow().clone();
-        reconcile_codex_task_runtime_states(
-            &service,
-            &workspace,
-            &snapshot,
-            &workspace_key,
-            &assigned_repository,
-        )
-        .await;
-        snapshot = workspace.subscribe().borrow().clone();
-        refresh_task_git_statuses(
-            &service,
-            &workspace,
-            &snapshot,
-            &workspace_key,
-            &assigned_repository,
-        )
-        .await;
-        snapshot = workspace.subscribe().borrow().clone();
+        let next_codex_task_refresh_fingerprint = codex_task_refresh_fingerprint(&snapshot);
+        if let Some(refresh_scope) = task_refresh_scope(
+            now,
+            next_codex_task_refresh_fingerprint.as_ref(),
+            last_codex_task_refresh_fingerprint.as_ref(),
+            last_full_codex_task_refresh_at,
+            last_active_codex_task_refresh_at,
+            snapshot.active_task_id.as_deref(),
+            FULL_CODEX_TASK_RECONCILE_INTERVAL,
+            ACTIVE_CODEX_TASK_RECONCILE_INTERVAL,
+        ) {
+            if refresh_scope == TaskRefreshScope::All {
+                recover_codex_task_sessions(
+                    &service,
+                    &workspace,
+                    &snapshot,
+                    &workspace_key,
+                    &assigned_repository,
+                )
+                .await;
+                snapshot = workspace.subscribe().borrow().clone();
+            }
+            reconcile_codex_task_runtime_states(
+                &service,
+                &workspace,
+                &snapshot,
+                &workspace_key,
+                &assigned_repository,
+                refresh_scope,
+            )
+            .await;
+            snapshot = workspace.subscribe().borrow().clone();
+            match refresh_scope {
+                TaskRefreshScope::ActiveOnly => {
+                    last_active_codex_task_refresh_at = Some(now);
+                }
+                TaskRefreshScope::All => {
+                    last_full_codex_task_refresh_at = Some(now);
+                    last_active_codex_task_refresh_at = Some(now);
+                    last_codex_task_refresh_fingerprint = codex_task_refresh_fingerprint(&snapshot);
+                }
+            }
+        }
+        let next_task_git_refresh_fingerprint = task_git_refresh_fingerprint(&snapshot);
+        if let Some(refresh_scope) = task_refresh_scope(
+            now,
+            next_task_git_refresh_fingerprint.as_ref(),
+            last_task_git_refresh_fingerprint.as_ref(),
+            last_full_task_git_refresh_at,
+            last_active_task_git_refresh_at,
+            snapshot.active_task_id.as_deref(),
+            FULL_TASK_GIT_REFRESH_INTERVAL,
+            ACTIVE_TASK_GIT_REFRESH_INTERVAL,
+        ) {
+            refresh_task_git_statuses(
+                &service,
+                &workspace,
+                &snapshot,
+                &workspace_key,
+                &assigned_repository,
+                refresh_scope,
+            )
+            .await;
+            snapshot = workspace.subscribe().borrow().clone();
+            match refresh_scope {
+                TaskRefreshScope::ActiveOnly => {
+                    last_active_task_git_refresh_at = Some(now);
+                }
+                TaskRefreshScope::All => {
+                    last_full_task_git_refresh_at = Some(now);
+                    last_active_task_git_refresh_at = Some(now);
+                    last_task_git_refresh_fingerprint = task_git_refresh_fingerprint(&snapshot);
+                }
+            }
+        }
         sync_task_issue_status_receivers(&service, &snapshot, &mut task_issue_status_rxs);
         sync_task_pr_status_receivers(&service, &snapshot, &mut task_pr_status_rxs);
         let current_issue_url = active_issue_url_for_snapshot(&snapshot);
@@ -1828,6 +1915,97 @@ fn set_automation_status(workspace: &Workspace, next_status: Option<String>) {
     });
 }
 
+fn codex_task_refresh_fingerprint(
+    snapshot: &WorkspaceSnapshot,
+) -> Option<CodexTaskRefreshFingerprint> {
+    if snapshot.persistent.tasks.is_empty() {
+        return None;
+    }
+
+    Some(CodexTaskRefreshFingerprint {
+        transient_uri: snapshot
+            .transient
+            .as_ref()
+            .map(|transient| transient.uri.clone()),
+        active_task_id: snapshot.active_task_id.clone(),
+        root_session_id: snapshot.root_session_id.clone(),
+        tasks: snapshot
+            .persistent
+            .tasks
+            .iter()
+            .map(|task| CodexTaskRefreshEntry {
+                task_id: task.id.clone(),
+                issue_url: task.issue_url.clone(),
+                backing_pr_url: task.backing_pr_url.clone(),
+                dependency_upgrade_backing_pr: task.dependency_upgrade_backing_pr,
+                session_id: snapshot
+                    .task_states
+                    .get(&task.id)
+                    .and_then(|state| state.session_id.clone()),
+            })
+            .collect(),
+    })
+}
+
+fn task_git_refresh_fingerprint(snapshot: &WorkspaceSnapshot) -> Option<TaskGitRefreshFingerprint> {
+    if snapshot.persistent.tasks.is_empty() {
+        return None;
+    }
+
+    Some(TaskGitRefreshFingerprint {
+        tasks: snapshot
+            .persistent
+            .tasks
+            .iter()
+            .map(|task| TaskGitRefreshEntry {
+                task_id: task.id.clone(),
+                issue_url: task.issue_url.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn task_refresh_scope<T: PartialEq>(
+    now: Instant,
+    next: Option<&T>,
+    previous: Option<&T>,
+    last_full_refresh_at: Option<Instant>,
+    last_active_refresh_at: Option<Instant>,
+    active_task_id: Option<&str>,
+    full_interval: Duration,
+    active_interval: Duration,
+) -> Option<TaskRefreshScope> {
+    let Some(next) = next else {
+        return None;
+    };
+
+    if previous != Some(next) {
+        return Some(TaskRefreshScope::All);
+    }
+
+    if active_task_id.is_some()
+        && last_active_refresh_at
+            .is_none_or(|last_refresh_at| now >= last_refresh_at + active_interval)
+    {
+        return Some(TaskRefreshScope::ActiveOnly);
+    }
+
+    last_full_refresh_at
+        .is_none_or(|last_refresh_at| now >= last_refresh_at + full_interval)
+        .then_some(TaskRefreshScope::All)
+}
+
+fn task_matches_refresh_scope(
+    task_id: &str,
+    active_task_id: Option<&str>,
+    scope: TaskRefreshScope,
+) -> bool {
+    match scope {
+        TaskRefreshScope::All => true,
+        TaskRefreshScope::ActiveOnly => active_task_id == Some(task_id),
+    }
+}
+
 fn effective_automation_agent_state(snapshot: &WorkspaceSnapshot) -> Option<AutomationAgentState> {
     snapshot
         .active_task_id
@@ -2028,6 +2206,7 @@ async fn reconcile_codex_task_runtime_states(
     snapshot: &WorkspaceSnapshot,
     workspace_key: &str,
     assigned_repository: &str,
+    refresh_scope: TaskRefreshScope,
 ) {
     if service.agent_provider() != AgentProvider::Codex {
         return;
@@ -2046,6 +2225,9 @@ async fn reconcile_codex_task_runtime_states(
     let active_task_id = snapshot.active_task_id.as_deref();
     let mut clear_state_file = false;
     for task in &snapshot.persistent.tasks {
+        if !task_matches_refresh_scope(&task.id, active_task_id, refresh_scope) {
+            continue;
+        }
         let Some(task_state) = snapshot.task_states.get(&task.id) else {
             continue;
         };
@@ -2170,18 +2352,6 @@ async fn reconcile_codex_task_runtime_states(
             task_session_id.clone(),
         )
         .await;
-        tracing::warn!(
-            workspace_key,
-            task_id = %task.id,
-            issue_url = %task.issue_url,
-            task_session_id = %task_session_id,
-            previous_agent_state = ?task_state.agent_state,
-            previous_session_status = ?task_state.session_status,
-            status = ?status,
-            next_agent_state = ?next_agent_state,
-            next_session_status = ?next_session_status,
-            "reconciled codex task runtime state"
-        );
         if !task_session_id_is_current(workspace, &task.id, &task_session_id) {
             tracing::info!(
                 workspace_key,
@@ -3799,9 +3969,14 @@ async fn refresh_task_git_statuses(
     snapshot: &WorkspaceSnapshot,
     workspace_key: &str,
     assigned_repository: &str,
+    refresh_scope: TaskRefreshScope,
 ) {
     let mut updates = Vec::new();
+    let active_task_id = snapshot.active_task_id.as_deref();
     for task in &snapshot.persistent.tasks {
+        if !task_matches_refresh_scope(&task.id, active_task_id, refresh_scope) {
+            continue;
+        }
         let checkout = task_cwd_path(service, workspace_key, assigned_repository, &task.issue_url);
         let status = read_task_git_status(&checkout).await;
         updates.push((task.id.clone(), status));
@@ -5873,7 +6048,7 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::watch;
 
@@ -7266,6 +7441,67 @@ exit 1\n",
                 Some("https://github.com/example/repo/pull/1163")
             );
         });
+    }
+
+    #[test]
+    fn task_refresh_scope_prefers_full_refresh_when_fingerprint_changes() {
+        let now = Instant::now();
+        let next = "next";
+        let previous = "previous";
+
+        assert_eq!(
+            task_refresh_scope(
+                now,
+                Some(&next),
+                Some(&previous),
+                Some(now),
+                Some(now),
+                Some("task-1"),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            ),
+            Some(TaskRefreshScope::All)
+        );
+    }
+
+    #[test]
+    fn task_refresh_scope_uses_active_only_between_full_sweeps() {
+        let now = Instant::now();
+        let fingerprint = "same";
+
+        assert_eq!(
+            task_refresh_scope(
+                now,
+                Some(&fingerprint),
+                Some(&fingerprint),
+                Some(now),
+                Some(now - Duration::from_secs(6)),
+                Some("task-1"),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            ),
+            Some(TaskRefreshScope::ActiveOnly)
+        );
+    }
+
+    #[test]
+    fn task_refresh_scope_runs_full_refresh_without_active_task_when_due() {
+        let now = Instant::now();
+        let fingerprint = "same";
+
+        assert_eq!(
+            task_refresh_scope(
+                now,
+                Some(&fingerprint),
+                Some(&fingerprint),
+                Some(now - Duration::from_secs(61)),
+                Some(now),
+                None,
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            ),
+            Some(TaskRefreshScope::All)
+        );
     }
 
     #[test]

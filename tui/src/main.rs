@@ -73,7 +73,7 @@ const CPU_COLUMN_MIN_WIDTH: u16 = 5;
 const MACHINE_USAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const ROOT_SESSION_ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const PROMPT_TOOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const UI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const UI_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CREATE_MODAL_WIDTH: u16 = 72;
 const CREATE_MODAL_HEIGHT: u16 = 13;
 const STARTING_MODAL_WIDTH: u16 = 62;
@@ -2196,12 +2196,14 @@ async fn run_app(
                 needs_redraw = true;
             }
         } else {
-            app.sync_from_manager();
-            app.refresh_machine_usage_if_due(Instant::now()).await;
-            app.poll_running_prompt_tool();
-            app.poll_workspace_link_validations();
-            app.handle_auto_attach_when_ready(terminal).await;
-            needs_redraw = true;
+            let now = Instant::now();
+            let mut changed = false;
+            changed |= app.sync_from_manager();
+            changed |= app.refresh_machine_usage_if_due(now).await;
+            changed |= app.poll_running_prompt_tool();
+            changed |= app.poll_workspace_link_validations();
+            changed |= app.handle_auto_attach_when_ready(terminal).await;
+            needs_redraw = changed;
         }
     }
 

@@ -1396,13 +1396,20 @@ impl TuiState {
         Ok(state)
     }
 
-    pub(crate) async fn refresh_machine_usage_if_due(&mut self, now: Instant) {
+    pub(crate) async fn refresh_machine_usage_if_due(&mut self, now: Instant) -> bool {
         if let Some(next_sample_at) = self.next_machine_sample_at
             && now < next_sample_at
         {
-            return;
+            return false;
         }
 
+        let previous = (
+            self.machine_cpu_count,
+            self.machine_cpu_percent,
+            self.machine_used_ram_bytes,
+            self.machine_total_ram_bytes,
+            self.machine_agent_directory_disk_usage,
+        );
         let logical_cpu_count = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1);
@@ -1429,21 +1436,43 @@ impl TuiState {
                 .ok()
                 .flatten();
         self.next_machine_sample_at = Some(now + MACHINE_USAGE_SAMPLE_INTERVAL);
+        previous
+            != (
+                self.machine_cpu_count,
+                self.machine_cpu_percent,
+                self.machine_used_ram_bytes,
+                self.machine_total_ram_bytes,
+                self.machine_agent_directory_disk_usage,
+            )
     }
 
-    pub(crate) fn sync_from_manager(&mut self) {
+    pub(crate) fn sync_from_manager(&mut self) -> bool {
         let previous_selected_entry = self.selected_entry();
         let previous_selected_workspace_key = self.selected_workspace_key().map(str::to_string);
         let previous_selected_automation_status = previous_selected_workspace_key
             .as_ref()
             .and_then(|key| self.snapshots.get(key))
             .and_then(|snapshot| snapshot.automation_status.clone());
+        let previous_ordered_keys = self.ordered_keys.clone();
+        let previous_selected_row = self.selected_row;
+        let previous_selected_link_index = self.selected_link_index;
+        let previous_mode = self.mode;
+        let previous_status = self.status.clone();
 
         let workspace_keys = self.workspace_keys_rx.borrow().clone();
+        let mut changed = false;
 
+        let previous_workspace_rx_len = self.workspace_rxs.len();
         self.workspace_rxs
             .retain(|key, _| workspace_keys.contains(key));
+        if self.workspace_rxs.len() != previous_workspace_rx_len {
+            changed = true;
+        }
+        let previous_snapshot_len = self.snapshots.len();
         self.snapshots.retain(|key, _| workspace_keys.contains(key));
+        if self.snapshots.len() != previous_snapshot_len {
+            changed = true;
+        }
 
         for key in &workspace_keys {
             if !self.workspace_rxs.contains_key(key)
@@ -1451,10 +1480,15 @@ impl TuiState {
             {
                 self.workspace_rxs
                     .insert(key.clone(), workspace.subscribe());
+                changed = true;
             }
 
-            if let Some(rx) = self.workspace_rxs.get(key) {
-                self.snapshots.insert(key.clone(), rx.borrow().clone());
+            if let Some(rx) = self.workspace_rxs.get_mut(key)
+                && (!self.snapshots.contains_key(key) || rx.has_changed().unwrap_or(false))
+            {
+                self.snapshots
+                    .insert(key.clone(), rx.borrow_and_update().clone());
+                changed = true;
             }
         }
 
@@ -1462,9 +1496,12 @@ impl TuiState {
         self.ordered_keys.sort_by(|left_key, right_key| {
             workspace_ordering(left_key, right_key, &self.snapshots)
         });
+        if self.ordered_keys != previous_ordered_keys {
+            changed = true;
+        }
 
-        self.refresh_workspace_link_validations();
-        self.refresh_github_link_statuses();
+        changed |= self.refresh_workspace_link_validations();
+        changed |= self.refresh_github_link_statuses();
 
         let table_entries = self.table_entries();
         self.selected_row = normalize_selected_row(
@@ -1475,6 +1512,9 @@ impl TuiState {
                 self.selected_row,
             ),
         );
+        if self.selected_row != previous_selected_row {
+            changed = true;
+        }
 
         if let Some(key) = self.selected_workspace_key()
             && previous_selected_workspace_key.as_deref() == Some(key)
@@ -1489,6 +1529,9 @@ impl TuiState {
         }
 
         self.normalize_selected_link_index();
+        if self.selected_link_index != previous_selected_link_index {
+            changed = true;
+        }
 
         if self.selected_workspace_key().is_none() {
             match self.mode {
@@ -1586,6 +1629,12 @@ impl TuiState {
             self.pending_delete_target = None;
             self.pending_task_removal_action = TaskRemovalAction::default();
         }
+
+        if self.mode != previous_mode || self.status != previous_status {
+            changed = true;
+        }
+
+        changed
     }
 
     pub(crate) fn selected_workspace_key(&self) -> Option<&str> {
@@ -1850,7 +1899,9 @@ impl TuiState {
         self.normalize_selected_link_target_index();
     }
 
-    fn refresh_workspace_link_validations(&mut self) {
+    fn refresh_workspace_link_validations(&mut self) -> bool {
+        let previous_results_len = self.workspace_link_validation_results.len();
+        let previous_pending_len = self.pending_workspace_link_validations.len();
         let mut active_links = HashSet::new();
         for snapshot in self.snapshots.values() {
             active_links.extend(workspace_links(snapshot));
@@ -1882,9 +1933,12 @@ impl TuiState {
             self.pending_workspace_link_validations
                 .insert(link, result_rx);
         }
+        self.workspace_link_validation_results.len() != previous_results_len
+            || self.pending_workspace_link_validations.len() != previous_pending_len
     }
 
-    pub(crate) fn poll_workspace_link_validations(&mut self) {
+    pub(crate) fn poll_workspace_link_validations(&mut self) -> bool {
+        let previous_selected_link_index = self.selected_link_index;
         let mut completed = Vec::new();
         for (link, result_rx) in &mut self.pending_workspace_link_validations {
             match result_rx.try_recv() {
@@ -1898,6 +1952,7 @@ impl TuiState {
                 )),
             }
         }
+        let had_completed = !completed.is_empty();
 
         for (link, result) in completed {
             self.pending_workspace_link_validations.remove(&link);
@@ -1910,10 +1965,13 @@ impl TuiState {
         }
 
         self.normalize_selected_link_index();
-        self.refresh_github_link_statuses();
+        let github_changed = self.refresh_github_link_statuses();
+        had_completed || github_changed || self.selected_link_index != previous_selected_link_index
     }
 
-    fn refresh_github_link_statuses(&mut self) {
+    fn refresh_github_link_statuses(&mut self) -> bool {
+        let previous_rxs_len = self.github_link_status_rxs.len();
+        let previous_statuses = self.github_link_statuses.clone();
         let mut active_issue_or_pr_links = HashSet::new();
         for snapshot in self.snapshots.values() {
             active_issue_or_pr_links.extend(workspace_issue_pr_links(snapshot).into_iter().filter(
@@ -1980,6 +2038,8 @@ impl TuiState {
                 self.github_link_statuses.remove(&link);
             }
         }
+        self.github_link_status_rxs.len() != previous_rxs_len
+            || self.github_link_statuses != previous_statuses
     }
 
     pub(crate) fn selected_workspace_link_count(&self) -> usize {
@@ -3752,12 +3812,12 @@ impl TuiState {
     pub(crate) async fn handle_auto_attach_when_ready(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) {
+    ) -> bool {
         if !self.starting_attach_when_ready {
-            return;
+            return false;
         }
         let Some(key) = self.auto_attach_ready_key(Instant::now()) else {
-            return;
+            return false;
         };
 
         self.mode = UiMode::Normal;
@@ -3818,6 +3878,7 @@ impl TuiState {
                 self.status = format!("Failed to attach to workspace '{key}': {err}");
             }
         }
+        true
     }
 
     async fn handle_attach_exit(&mut self, key: &str) {
@@ -4648,7 +4709,7 @@ impl TuiState {
         should_resume
     }
 
-    pub(crate) fn poll_running_prompt_tool(&mut self) {
+    pub(crate) fn poll_running_prompt_tool(&mut self) -> bool {
         let completion = match self.running_operation.as_mut() {
             Some(running_tool) => match running_tool.result_rx.try_recv() {
                 Ok(result) => Some(result),
@@ -4720,6 +4781,9 @@ impl TuiState {
                     );
                 }
             }
+            true
+        } else {
+            false
         }
     }
 

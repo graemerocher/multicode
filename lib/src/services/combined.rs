@@ -6402,7 +6402,10 @@ inherit-env = ["TERM", "COLORTERM"]
             let config_path = root.path().join("config.toml");
             fs::write(
                 &config_path,
-                apple_container_config(&workspace_directory, "ghcr.io/example/multicode-java25:latest"),
+                apple_container_config(
+                    &workspace_directory,
+                    "ghcr.io/example/multicode-java25:latest",
+                ),
             )
             .expect("config should be written");
 

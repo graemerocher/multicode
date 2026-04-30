@@ -59,7 +59,7 @@ async fn watch_workspace_snapshot(
     expected_spec: String,
 ) {
     loop {
-        let current_transient = workspace_rx.borrow().transient.clone();
+        let current_transient = workspace_rx.borrow_and_update().transient.clone();
         if let Some(transient) = current_transient {
             if should_invalidate_runtime(&transient, expected_backend, &expected_spec) {
                 tracing::info!(

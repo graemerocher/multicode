@@ -68,7 +68,7 @@ async fn watch_workspace_snapshot(
     let event_generation = Arc::new(AtomicU64::new(0));
 
     loop {
-        let snapshot = workspace_rx.borrow().clone();
+        let snapshot = workspace_rx.borrow_and_update().clone();
         let transient = snapshot.transient.clone();
         let should_monitor = transient.is_some();
 
