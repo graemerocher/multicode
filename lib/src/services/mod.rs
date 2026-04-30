@@ -5,6 +5,7 @@ pub mod codex_root_session_service;
 pub mod combined;
 pub mod config;
 pub mod github_status_service;
+pub mod idle_runtime_cleanup_service;
 pub mod multicode_metadata_service;
 pub mod opencode_client_service;
 pub mod persistent_storage;
@@ -33,6 +34,9 @@ pub use github_status_service::{
     GithubIssueState, GithubIssueStatus, GithubPrBuildState, GithubPrCopilotReviewState,
     GithubPrMergeState, GithubPrReviewState, GithubPrSonarState, GithubPrState, GithubPrStatus,
     GithubStatus, GithubStatusService, GithubStatusServiceError,
+};
+pub use idle_runtime_cleanup_service::{
+    IdleRuntimeCleanupServiceError, idle_runtime_cleanup_service,
 };
 pub use multicode_metadata_service::{MulticodeMetadataServiceError, multicode_metadata_service};
 pub use opencode_client_service::{OpencodeClientServiceError, opencode_client_service};

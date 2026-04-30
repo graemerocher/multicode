@@ -1961,7 +1961,7 @@ fn container_cpu_value(value: &str) -> Option<String> {
     Some(cpus.ceil().max(1.0).to_string())
 }
 
-fn container_program() -> String {
+pub(crate) fn container_program() -> String {
     std::env::var("MULTICODE_CONTAINER_COMMAND").unwrap_or_else(|_| "container".to_string())
 }
 

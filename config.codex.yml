@@ -24,6 +24,7 @@ populate-git-credentials = true
 
 [autonomous]
 scan-on-startup = false
+idle-runtime-cleanup = true
 
 [isolation]
 add-skills-from = ["./workspace-skills"]

@@ -82,6 +82,9 @@ Queueing is controlled in `config.toml` with the `[autonomous]` section:
 max-parallel-issues = 5
 issue-scan-delay-seconds = 900
 scan-on-startup = true
+idle-runtime-cleanup = false
+idle-runtime-cleanup-delay-seconds = 300
+idle-runtime-cleanup-interval-seconds = 900
 ```
 
 Notes:
@@ -94,6 +97,13 @@ Notes:
   (15 minutes).
 - `scan-on-startup` controls whether an assigned workspace immediately begins autonomous issue scanning when it starts
   with an empty queue. The default is `true`.
+- `idle-runtime-cleanup` controls whether multicode periodically runs `gradle --stop` and then
+  terminates any remaining Gradle daemon/worker processes inside Apple container workspaces that
+  have stayed idle. The default is `false`.
+- `idle-runtime-cleanup-delay-seconds` controls how long a workspace must remain idle before the
+  first Gradle cleanup attempt. The default is `300` seconds.
+- `idle-runtime-cleanup-interval-seconds` controls how often multicode repeats that cleanup while
+  the workspace stays idle. The default is `900` seconds.
 - Set `scan-on-startup = false` if you want to start a workspace without it auto-populating issues. In that mode you
   can still queue work manually with `i` or use `n` to queue the next available issue on demand.
 
@@ -235,6 +245,9 @@ provider = "opencode"
 backend = "apple-container"
 opencode-image = "ghcr.io/example/multicode-opencode-java25:latest"
 
+[autonomous]
+idle-runtime-cleanup = true
+
 [isolation]
 writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
 readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
@@ -268,6 +281,9 @@ network-access = "enabled"
 [runtime]
 backend = "apple-container"
 codex-image = "ghcr.io/example/multicode-codex-java25:latest"
+
+[autonomous]
+idle-runtime-cleanup = true
 
 [isolation]
 add-skills-from = ["./workspace-skills"]

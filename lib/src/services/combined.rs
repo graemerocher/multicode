@@ -34,8 +34,8 @@ use super::{
         validate_handler_config, validate_remote_config, validate_tool_config_entries,
         validate_workspace_key,
     },
-    multicode_metadata_service, opencode_client_service, persistent_storage,
-    resource_usage_service, root_session_service,
+    idle_runtime_cleanup_service, multicode_metadata_service, opencode_client_service,
+    persistent_storage, resource_usage_service, root_session_service,
     runtime::{WorkspaceRuntime, automation_task_state_file_source},
     runtime_reconciliation_service::runtime_reconciliation_service,
     transient_storage, usage_aggregation_service,
@@ -165,6 +165,7 @@ impl CombinedService {
             github_git_credentials_env,
         };
 
+        spawn_idle_runtime_cleanup_service(service.clone());
         spawn_autonomous_workspace_service(service.clone());
 
         Ok(service)
@@ -2415,6 +2416,14 @@ fn spawn_automation_state_file_service(
     tokio::spawn(async move {
         if let Err(err) = automation_state_file_service(manager, workspace_directory_path).await {
             tracing::error!(error = ?err, "automation state file service terminated");
+        }
+    });
+}
+
+fn spawn_idle_runtime_cleanup_service(service: CombinedService) {
+    tokio::spawn(async move {
+        if let Err(err) = idle_runtime_cleanup_service(service).await {
+            tracing::error!(error = ?err, "idle runtime cleanup service terminated");
         }
     });
 }

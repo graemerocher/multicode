@@ -30,6 +30,9 @@ image = "multicode-java25:latest"
 token = {keychain-service = "multicode.github", keychain-account = "github-mcp-token"}
 populate-git-credentials = true
 
+[autonomous]
+idle-runtime-cleanup = true
+
 [isolation]
 add-skills-from = ["./workspace-skills"]
 writable = [

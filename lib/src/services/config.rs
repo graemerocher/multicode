@@ -49,6 +49,21 @@ pub struct AutonomousConfig {
     pub max_parallel_issues: usize,
     #[serde(default = "default_scan_on_startup", alias = "scan-on-startup")]
     pub scan_on_startup: bool,
+    #[serde(
+        default = "default_idle_runtime_cleanup",
+        alias = "idle-runtime-cleanup"
+    )]
+    pub idle_runtime_cleanup: bool,
+    #[serde(
+        default = "default_idle_runtime_cleanup_delay_seconds",
+        alias = "idle-runtime-cleanup-delay-seconds"
+    )]
+    pub idle_runtime_cleanup_delay_seconds: u64,
+    #[serde(
+        default = "default_idle_runtime_cleanup_interval_seconds",
+        alias = "idle-runtime-cleanup-interval-seconds"
+    )]
+    pub idle_runtime_cleanup_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -147,6 +162,9 @@ impl Default for AutonomousConfig {
             issue_scan_delay_seconds: default_issue_scan_delay_seconds(),
             max_parallel_issues: default_max_parallel_issues(),
             scan_on_startup: default_scan_on_startup(),
+            idle_runtime_cleanup: default_idle_runtime_cleanup(),
+            idle_runtime_cleanup_delay_seconds: default_idle_runtime_cleanup_delay_seconds(),
+            idle_runtime_cleanup_interval_seconds: default_idle_runtime_cleanup_interval_seconds(),
         }
     }
 }
@@ -271,6 +289,18 @@ fn default_max_parallel_issues() -> usize {
 
 fn default_scan_on_startup() -> bool {
     true
+}
+
+fn default_idle_runtime_cleanup() -> bool {
+    false
+}
+
+fn default_idle_runtime_cleanup_delay_seconds() -> u64 {
+    5 * 60
+}
+
+fn default_idle_runtime_cleanup_interval_seconds() -> u64 {
+    15 * 60
 }
 
 fn default_handler_review() -> String {
@@ -838,6 +868,16 @@ mod tests {
             .expect("config without workspace-directory should parse");
 
         assert_eq!(config.workspace_directory, "~/dev/multicode-workspaces");
+    }
+
+    #[test]
+    fn autonomous_cleanup_defaults_are_applied() {
+        let config: Config = toml::from_str("[isolation]\n")
+            .expect("config with default autonomous settings should parse");
+
+        assert!(!config.autonomous.idle_runtime_cleanup);
+        assert_eq!(config.autonomous.idle_runtime_cleanup_delay_seconds, 300);
+        assert_eq!(config.autonomous.idle_runtime_cleanup_interval_seconds, 900);
     }
 
     #[cfg(target_os = "macos")]
