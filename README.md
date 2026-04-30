@@ -345,6 +345,10 @@ That script produces:
 
 The split keeps the existing OpenCode image compatible while allowing the Codex image to install Codex-specific tooling without changing the OpenCode bootstrap path.
 
+Both Apple-container images also set `GRADLE_OPTS=-Dorg.gradle.daemon=false` so Gradle defaults to
+non-daemon execution inside workspace containers, even when the host `HOME` is mounted through the
+runtime.
+
 Apple workspaces also expose the host `~/.gitconfig` automatically. The runtime mounts it through
 an internal read-only path and sets `GIT_CONFIG_GLOBAL` so git can use your host global identity
 and defaults without requiring a direct file bind.

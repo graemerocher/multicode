@@ -65,6 +65,7 @@ ENV JDK21_HOME=/opt/jdks/jdk21
 ENV JDK25_HOME=/opt/jdks/jdk25
 ENV USER=multicode
 ENV PATH=/usr/local/bin:${PATH}
+ENV GRADLE_OPTS=-Dorg.gradle.daemon=false
 
 USER multicode
 WORKDIR /workspace
