@@ -63,6 +63,8 @@ When adding or updating public APIs that need Javadoc `@since`, derive the value
 - If the target branch itself is `major.minor.x`, treat it as a patch branch and use the next patch after the latest released version in that line.
 - If you cannot determine the latest released patch version from tags, release notes, or repository metadata, stop and ask instead of inventing an `@since` value.
 
+When implementing framework behavior in Micronaut Java code, avoid traditional Java reflection APIs from `java.util.reflect` unless there is no Micronaut-native alternative that can satisfy the requirement. Prefer Micronaut primitives such as `BeanIntrospection`, `BeanDefinition`, `ExecutableMethod`, `Argument`, and related metadata / invocation APIs so implementations remain compatible with Micronaut's compile-time model, AOT optimizations, and native-image expectations.
+
 ## Multi-project development
 
 When a fix needs validation across multiple Gradle projects:
@@ -81,7 +83,7 @@ When writing documentation:
 - Unless the project only supports a narrower set, create snippets for Java, Kotlin, and Groovy.
 - Resolve documentation snippets from the project's `doc-examples` subdirectory.
 - Structure `doc-examples` in the same style used by `micronaut-graphql`'s `docs-examples` reference project on the `5.0.x` branch.
-- For configuration examples, prefer the `configuration` macro:
+- For configuration examples, use the `configuration` macro instead of `[source,yaml]`:
 
 ```adoc
 [configuration]
