@@ -4,6 +4,7 @@
 - When interacting with the opencode server, prefer the existing SSE infrastructure over polling.
 - IO operations should happen asynchronously so they do not make the TUI unresponsive.
 - When adding dependencies, use the latest stable version. For the version number, specify only the major release, unless that major release is "0", in which case specify major + minor.
+- In Gradle build configuration, use version-catalog type-safe dependency references instead of string coordinates whenever available. Prefer forms like `implementation(mn.micronaut.http.netty)` over `implementation("io.micronaut:micronaut-http-netty")`.
 - Do not bother preserving rust API stability, this project is not a library
 
 ## Testing

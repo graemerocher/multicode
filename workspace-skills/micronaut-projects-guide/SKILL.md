@@ -43,6 +43,23 @@ micronautBuild {
 
 Set `X.Y.Z` to the next unreleased major, minor, or patch version as appropriate for the branch you are changing.
 
+When editing Gradle build configuration in Micronaut projects, use the version catalog's type-safe
+dependency accessors instead of raw string coordinates whenever the catalog already exposes that
+dependency. Prefer:
+
+```groovy
+implementation(mn.micronaut.http.netty)
+```
+
+instead of:
+
+```groovy
+implementation("io.micronaut:micronaut-http-netty")
+```
+
+Apply the same rule to other configurations such as `api`, `compileOnly`, `runtimeOnly`,
+`testImplementation`, and `testRuntimeOnly`.
+
 Rules for creating new tests:
 
 - Prefer junit over spock, unless there is already a spock test that can easily be altered to test this issue
