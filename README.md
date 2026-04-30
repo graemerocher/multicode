@@ -374,6 +374,9 @@ Practical requirements:
 - Install a Docker-compatible host runtime such as Docker Desktop or Rancher Desktop.
 - Make sure the host `docker` CLI is installed and on `PATH`.
 - Make sure the active Docker context points at a local Unix socket.
+- If you use Rancher Desktop, enable its admin/rootful networking access and restart it. Without
+  that, Apple-container guests may be able to use the mounted Docker socket but still fail to
+  reach Docker-published host ports, which breaks Testcontainers and Ryuk callbacks.
 
 You can verify the host setup with:
 
@@ -416,6 +419,8 @@ Notes:
   ports through `host.multicode.test:<port>`.
 - If the alias is missing, Docker can still work inside the workspace via the mounted socket, but
   Testcontainers host-port access will fail.
+- With Rancher Desktop, host-port callback reachability may still fail until admin access is
+  enabled and Rancher Desktop has been restarted.
 
 ## Git / GitHub integration
 
