@@ -29,11 +29,11 @@ idle-runtime-cleanup = true
 [isolation]
 add-skills-from = ["./workspace-skills"]
 writable = [
-    "~/.gradle",
     "~/.m2/repository",
     "~/.config/gh",
     "$XDG_RUNTIME_DIR",
 ]
+isolated = ["~/.gradle"]
 tmpfs = ["/tmp"]
 inherit-env = [
     "XDG_RUNTIME_DIR",

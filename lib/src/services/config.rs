@@ -64,6 +64,11 @@ pub struct AutonomousConfig {
         alias = "idle-runtime-cleanup-interval-seconds"
     )]
     pub idle_runtime_cleanup_interval_seconds: u64,
+    #[serde(
+        default = "default_idle_runtime_restart",
+        alias = "idle-runtime-restart"
+    )]
+    pub idle_runtime_restart: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -165,6 +170,7 @@ impl Default for AutonomousConfig {
             idle_runtime_cleanup: default_idle_runtime_cleanup(),
             idle_runtime_cleanup_delay_seconds: default_idle_runtime_cleanup_delay_seconds(),
             idle_runtime_cleanup_interval_seconds: default_idle_runtime_cleanup_interval_seconds(),
+            idle_runtime_restart: default_idle_runtime_restart(),
         }
     }
 }
@@ -301,6 +307,10 @@ fn default_idle_runtime_cleanup_delay_seconds() -> u64 {
 
 fn default_idle_runtime_cleanup_interval_seconds() -> u64 {
     15 * 60
+}
+
+fn default_idle_runtime_restart() -> bool {
+    false
 }
 
 fn default_handler_review() -> String {
@@ -878,6 +888,7 @@ mod tests {
         assert!(!config.autonomous.idle_runtime_cleanup);
         assert_eq!(config.autonomous.idle_runtime_cleanup_delay_seconds, 300);
         assert_eq!(config.autonomous.idle_runtime_cleanup_interval_seconds, 900);
+        assert!(!config.autonomous.idle_runtime_restart);
     }
 
     #[cfg(target_os = "macos")]

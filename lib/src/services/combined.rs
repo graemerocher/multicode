@@ -585,6 +585,69 @@ impl CombinedService {
         Ok(())
     }
 
+    pub(crate) async fn restart_workspace_runtime_preserving_state(
+        &self,
+        key: &str,
+    ) -> Result<(), CombinedServiceError> {
+        let key = validate_workspace_key(key)?;
+        self.ensure_workspace_not_archived(&key)?;
+        let workspace = self.manager.get_workspace(&key)?;
+        let current_transient = workspace
+            .subscribe()
+            .borrow()
+            .transient
+            .clone()
+            .ok_or_else(|| CombinedServiceError::TransientSnapshotMissing(key.clone()))?;
+
+        let inherited_env = self
+            .sandbox_env_pairs(Vec::<(String, String)>::new())
+            .await?;
+        self.runtime.stop_server(&current_transient.runtime).await?;
+
+        let mut cleared = false;
+        workspace.update(|snapshot| {
+            if snapshot.transient.as_ref() == Some(&current_transient) {
+                snapshot.transient = None;
+                cleared = true;
+                true
+            } else {
+                false
+            }
+        });
+
+        if !cleared {
+            return Ok(());
+        }
+
+        let start = self.runtime.start_server(&key, &inherited_env).await?;
+        tracing::info!(
+            workspace_key = %key,
+            backend = ?self.config.runtime.backend,
+            runtime_id = %start.transient.runtime.id,
+            "restarted workspace runtime while preserving workspace state"
+        );
+
+        let mut replaced = false;
+        workspace.update(|snapshot| {
+            if snapshot.transient.is_none() {
+                snapshot.transient = Some(start.transient.clone());
+                replaced = true;
+                true
+            } else {
+                false
+            }
+        });
+
+        if !replaced {
+            self.runtime.stop_server(&start.transient.runtime).await?;
+            return Err(CombinedServiceError::TransientSnapshotAlreadyPresent(
+                key.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub async fn delete_workspace(&self, key: &str) -> Result<(), CombinedServiceError> {
         let key = validate_workspace_key(key)?;
         let workspace = self.manager.get_workspace(&key)?;
@@ -2572,6 +2635,92 @@ Ensure container system service has been started with `container system start`."
         format!(
             "workspace-directory = \"{workspace_directory}\"\nopencode = [\"/bin/sh\"]\ncreate-ssh-agent = false\n\n[isolation]\n"
         )
+    }
+
+    fn apple_container_config(workspace_directory: &Path, image: &str) -> String {
+        format!(
+            "workspace-directory = \"{}\"\nopencode = [\"/bin/sh\"]\ncreate-ssh-agent = false\n\n[runtime]\nbackend = \"apple-container\"\nimage = \"{}\"\n\n[isolation]\n",
+            workspace_directory.display(),
+            image,
+        )
+    }
+
+    fn write_fake_container_cli(path: &Path) {
+        fs::write(
+            path,
+            r#"#!/bin/bash
+set -euo pipefail
+root="${MULTICODE_FAKE_CONTAINER_ROOT:?missing MULTICODE_FAKE_CONTAINER_ROOT}"
+state_dir="$root/state"
+counter_file="$root/counter"
+mkdir -p "$state_dir"
+printf '%s\n' "$*" >> "$root/commands.log"
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  run)
+    count=0
+    if [ -f "$counter_file" ]; then
+      count="$(cat "$counter_file")"
+    fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$counter_file"
+    name=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name)
+          name="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    if [ -n "$name" ]; then
+      : > "$state_dir/$name"
+    fi
+    ;;
+  rm)
+    if [ "${1:-}" = "-f" ] && [ -n "${2:-}" ]; then
+      rm -f "$state_dir/$2"
+    fi
+    ;;
+  system)
+    if [ "${1:-}" = "dns" ] && [ "${2:-}" = "list" ]; then
+      printf 'DOMAIN\n'
+      printf '%s\n' "${MULTICODE_FAKE_CONTAINER_DNS_DOMAIN:-host.multicode.test}"
+    fi
+    ;;
+  inspect)
+    if [ -n "${1:-}" ] && [ -e "$state_dir/$1" ]; then
+      printf '[{\"status\":\"running\"}]\n'
+      exit 0
+    fi
+    exit 1
+    ;;
+  list)
+    for file in "$state_dir"/*; do
+      [ -e "$file" ] || continue
+      basename "$file"
+    done
+    ;;
+  *)
+    ;;
+esac
+"#,
+        )
+        .expect("fake container script should be written");
+        make_executable(path);
+    }
+
+    fn read_commands(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .expect("commands log should be readable")
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     fn default_config() -> Config {
@@ -6211,6 +6360,116 @@ inherit-env = ["TERM", "COLORTERM"]
                 err,
                 CombinedServiceError::TransientSnapshotMissing(key) if key == "alpha"
             ));
+        });
+    }
+
+    #[test]
+    fn restart_workspace_runtime_preserves_automation_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+
+        runtime.block_on(async {
+            let _env_lock = ENV_VAR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let root = TestDir::new();
+            let home = root.path().join("home");
+            let runtime_dir = root.path().join("runtime");
+            let workspace_directory = home.join("workspaces");
+            let bin_dir = root.path().join("bin");
+            let fake_container_root = root.path().join("fake-container");
+            fs::create_dir_all(&home).expect("home should exist");
+            fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+            fs::create_dir_all(&workspace_directory).expect("workspace directory should exist");
+            fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+            fs::create_dir_all(&fake_container_root).expect("fake container root should exist");
+
+            write_fake_container_cli(&bin_dir.join("container"));
+
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            let test_path = format!("{}:{}", bin_dir.display(), old_path);
+            let _path_guard = EnvVarGuard::set_value("PATH", test_path);
+            let _container_guard =
+                EnvVarGuard::set("MULTICODE_CONTAINER_COMMAND", &bin_dir.join("container"));
+            let _port_guard = EnvVarGuard::set_value("MULTICODE_FIXED_PORT", "43123");
+            let _home_guard = EnvVarGuard::set("HOME", &home);
+            let _xdg_guard = EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir);
+            let _fake_root_guard =
+                EnvVarGuard::set("MULTICODE_FAKE_CONTAINER_ROOT", &fake_container_root);
+
+            let config_path = root.path().join("config.toml");
+            fs::write(
+                &config_path,
+                apple_container_config(&workspace_directory, "ghcr.io/example/multicode-java25:latest"),
+            )
+            .expect("config should be written");
+
+            let service = CombinedService::from_config_path(&config_path)
+                .await
+                .expect("combined service should start");
+            service
+                .create_workspace("alpha")
+                .await
+                .expect("workspace should be created");
+            service
+                .start_workspace("alpha")
+                .await
+                .expect("workspace should start");
+
+            let workspace = service
+                .manager
+                .get_workspace("alpha")
+                .expect("workspace should exist");
+            let initial_snapshot = workspace.subscribe().borrow().clone();
+            let original_runtime = initial_snapshot
+                .transient
+                .as_ref()
+                .expect("workspace should have runtime")
+                .runtime
+                .id
+                .clone();
+
+            workspace.update(|snapshot| {
+                snapshot.persistent.automation_paused = true;
+                snapshot.automation_scan_request_nonce = 7;
+                snapshot.automation_status = Some("Idle restart test".to_string());
+                true
+            });
+
+            service
+                .restart_workspace_runtime_preserving_state("alpha")
+                .await
+                .expect("workspace runtime should restart");
+
+            let restarted_snapshot = workspace.subscribe().borrow().clone();
+            let restarted_runtime = restarted_snapshot
+                .transient
+                .as_ref()
+                .expect("workspace should still have runtime")
+                .runtime
+                .id
+                .clone();
+            assert_ne!(restarted_runtime, original_runtime);
+            assert!(restarted_snapshot.persistent.automation_paused);
+            assert_eq!(restarted_snapshot.automation_scan_request_nonce, 7);
+
+            let commands = read_commands(&fake_container_root.join("commands.log"));
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains(&format!("rm -f {original_runtime}"))),
+                "restart should stop the original runtime"
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.starts_with("run "))
+                    .count(),
+                2,
+                "restart should start a replacement runtime"
+            );
         });
     }
 

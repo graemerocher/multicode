@@ -85,6 +85,7 @@ scan-on-startup = true
 idle-runtime-cleanup = false
 idle-runtime-cleanup-delay-seconds = 300
 idle-runtime-cleanup-interval-seconds = 900
+idle-runtime-restart = false
 ```
 
 Notes:
@@ -104,6 +105,8 @@ Notes:
   first Gradle cleanup attempt. The default is `300` seconds.
 - `idle-runtime-cleanup-interval-seconds` controls how often multicode repeats that cleanup while
   the workspace stays idle. The default is `900` seconds.
+- `idle-runtime-restart` controls whether multicode also recycles an idle Apple container runtime
+  after that cleanup. The default is `false`.
 - Set `scan-on-startup = false` if you want to start a workspace without it auto-populating issues. In that mode you
   can still queue work manually with `i` or use `n` to queue the next available issue on demand.
 
@@ -230,7 +233,9 @@ The minimum setup flow on macOS is therefore:
 6. Set `[runtime].backend = "apple-container"` and point `image`, `opencode-image`, or
    `codex-image` at that image.
 7. Configure `[isolation]` mounts for caches and credentials you want the workspace to reuse, such
-   as `~/.gradle`, `~/.m2/repository`, `~/.config/gh`, and provider-specific config paths.
+   as `~/.m2/repository`, `~/.config/gh`, and provider-specific config paths. On macOS Apple
+   containers, prefer isolating `~/.gradle` per workspace instead of bind-mounting the host cache
+   tree.
 
 If `container` is missing, the image does not include the selected agent CLI, or the host does not
 have the matching CLI for TUI attach, Apple-container workspaces will start or attach incorrectly.
@@ -249,9 +254,9 @@ opencode-image = "ghcr.io/example/multicode-opencode-java25:latest"
 idle-runtime-cleanup = true
 
 [isolation]
-writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
+writable = ["~/.m2/repository", "~/.config/gh"]
 readable = ["~/.config/opencode", "~/.local/share/opencode/auth.json"]
-isolated = ["~/.local/share/opencode", "~/.local/state/opencode"]
+isolated = ["~/.gradle", "~/.local/share/opencode", "~/.local/state/opencode"]
 tmpfs = ["/tmp"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
@@ -287,7 +292,8 @@ idle-runtime-cleanup = true
 
 [isolation]
 add-skills-from = ["./workspace-skills"]
-writable = ["~/.gradle", "~/.m2/repository", "~/.config/gh"]
+writable = ["~/.m2/repository", "~/.config/gh"]
+isolated = ["~/.gradle"]
 inherit-env = ["HOME", "PATH", "XDG_RUNTIME_DIR"]
 memory-max = "16 GiB"
 cpu = "300%"
@@ -346,8 +352,12 @@ That script produces:
 The split keeps the existing OpenCode image compatible while allowing the Codex image to install Codex-specific tooling without changing the OpenCode bootstrap path.
 
 Both Apple-container images also set `GRADLE_OPTS=-Dorg.gradle.daemon=false` so Gradle defaults to
-non-daemon execution inside workspace containers, even when the host `HOME` is mounted through the
-runtime.
+non-daemon execution inside workspace containers.
+
+On macOS Apple-container backends, isolating `~/.gradle` per workspace is strongly recommended.
+The host Virtualization VM process can retain very large numbers of FDs for `~/.gradle/caches`
+entries that the guest has traversed, which can create host-wide FD pressure even when no Gradle
+daemon is left running inside the container.
 
 Apple workspaces also expose the host `~/.gitconfig` automatically. The runtime mounts it through
 an internal read-only path and sets `GIT_CONFIG_GLOBAL` so git can use your host global identity

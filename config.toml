@@ -40,7 +40,6 @@ writable = [
     "~/.cache/opencode",
     "~/.bun",
     "~/.cache/bun",
-    "~/.gradle",
     "~/.claude",
     "~/.m2/repository",
     "~/.config/gh",
@@ -49,9 +48,7 @@ writable = [
 isolated = [
     "~/.local/share/opencode",
     "/var/tmp",
-    "~/.gradle/daemon",
-    "~/.gradle/.tmp",
-    "~/.gradle/kotlin-profile",
+    "~/.gradle",
     "~/.local/share/kotlin",
     "~/.local/state/opencode",
 ]

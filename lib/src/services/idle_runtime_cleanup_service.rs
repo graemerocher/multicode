@@ -107,6 +107,31 @@ async fn watch_workspace_snapshot(
                             );
                         }
                     }
+
+                    if service.config.autonomous.idle_runtime_restart
+                        && let Ok(workspace) = service.manager.get_workspace(&key)
+                    {
+                        let latest_snapshot = workspace.subscribe().borrow().clone();
+                        if workspace_is_idle_for_gradle_cleanup(&latest_snapshot) {
+                            match service.restart_workspace_runtime_preserving_state(&key).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        workspace_key = %key,
+                                        runtime_id = %transient.runtime.id,
+                                        "restarted idle Apple workspace runtime after Gradle cleanup"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        workspace_key = %key,
+                                        runtime_id = %transient.runtime.id,
+                                        error = ?err,
+                                        "failed to restart idle Apple workspace runtime after Gradle cleanup"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 next_cleanup_at = Some(now + cleanup_interval);
             }
