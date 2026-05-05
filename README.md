@@ -96,6 +96,41 @@ rows for queued or running issues.
 
 Blank status cells mean multicode does not currently have that link or status for the row.
 
+## Issue row shortcuts
+
+When a queued issue or task row is focused, the help line only shows shortcuts that are usable for
+that row's current state.
+
+| Shortcut | Meaning |
+| --- | --- |
+| `↑` / `↓` | Move between selectable rows. |
+| `←` / `→` / `Tab` | Move focus from the row to one of its issue or PR link cells. |
+| `Enter` | Attach to the task session when the workspace is running, or start the workspace and attach when it is stopped. |
+| `o` | Open the task's GitHub issue. |
+| `p` | Open the task's pull request. Shown only when the task has a PR link. |
+| `c` | Open the task checkout in the configured terminal diff/compare view. Shown only when a task checkout is available. |
+| `e` | Open the task checkout in the configured editor. Shown only when a task checkout and editor integration are available. |
+| `a` | Approve publishing local task work. For Codex tasks this asks the agent to create or update the PR, or publish already prepared review/Sonar fixes. |
+| `r` | Ask Codex to rebase the task PR. Shown when the task has an open or refreshable PR and rebase is allowed. |
+| `v` | Ask Codex to address unresolved PR review feedback. Shown when the open PR has unresolved review threads. |
+| `f` | Ask Codex to fix failing CI for the task PR. Shown when the PR exists and CI is not known to have succeeded. |
+| `z` | Ask Codex to fix Sonar failures for the task PR. Shown when the open PR has a failing Sonar status. |
+| `m` | Ask Codex to merge the PR. Shown only when the PR is open, green, approved, has no unresolved review threads, and has no local unpublished task work. |
+| `y` | Request a Copilot PR review. Shown when the task has a PR link. |
+| configured tool key | Run a configured `exec` tool against the task checkout. Shown only for usable task-scoped tools. |
+| `x` | Remove the issue from the workspace queue. The confirmation dialog lets you remove it, remove and ignore it, or cancel. |
+| `q` | Quit the TUI. |
+
+When an issue or PR link cell inside the issue row is focused, the shortcuts change:
+
+| Shortcut | Meaning |
+| --- | --- |
+| `↑` / `↓` | Move between matching link targets when more than one exists. |
+| `Enter` | Open the focused link with the configured handler. |
+| `o` | Open the focused GitHub issue or PR in the browser. |
+| `Esc` | Return focus to the issue row. |
+| `q` | Quit the TUI. |
+
 ## Autonomous queueing
 
 When a workspace is assigned to a GitHub repository, *multicode* can scan for issues and queue multiple issue tasks in
