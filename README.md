@@ -70,6 +70,32 @@ slate.
 The workspace root is configurable with `workspace-directory`. If you omit it, multicode defaults
 to `~/dev/multicode-workspaces`.
 
+## Overview columns
+
+The main TUI table shows one row per workspace and, when autonomous queueing is active, nested task
+rows for queued or running issues.
+
+| Column | Meaning |
+| --- | --- |
+| `Workspace` | Workspace key. Task rows are shown underneath as `> owner/repo#number`. |
+| `Server` | Workspace or task state, such as `Starting`, `Idle`, `Busy`, `Question`, `Waiting on VM`, `Needs Rebase`, `Review Wait`, `Assign Wait`, or `Merge Ready`. |
+| `CPU` | Current workspace CPU usage. |
+| `RAM` | Current workspace memory usage. Turns warning-colored near the configured memory limit. |
+| `Cost` | Agent usage cost when available, otherwise compact token usage. Workspace rows sum task tokens when task usage exists. |
+| `RE` | Review repository link. Selecting it opens the configured git review or diff tool. |
+| `IS` | GitHub issue link and status. Open issues are green; closed issues are magenta. |
+| `T` | Issue type for the active task or task row. Types include bug, docs, enhancement, improvement, regression, and dependency upgrade. |
+| `PR` | Pull request link and state. Open PRs are green, drafts are dark gray, rejected PRs are red, and merged PRs are magenta. |
+| `Base` | Pull request target branch, shortened when needed. |
+| `G` | Git status for task worktrees. Yellow means uncommitted changes, cyan means unpushed commits, red means both, and blank means clean and pushed. |
+| `C` | Copilot review state for open PRs. `N` means no Copilot review, `?` means requested, and `C` means completed. |
+| `B` | Build/check status for open PRs. Yellow means running, green means succeeded, and red means failed. |
+| `S` | Sonar status for open PRs. Yellow means running, green means succeeded, and red means failed. |
+| `R` | Open PR review-thread count. Green means no unresolved review threads; red means at least one unresolved thread. |
+| `Description` | User description, automation status, session title, or task progress text. |
+
+Blank status cells mean multicode does not currently have that link or status for the row.
+
 ## Autonomous queueing
 
 When a workspace is assigned to a GitHub repository, *multicode* can scan for issues and queue multiple issue tasks in
