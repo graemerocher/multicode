@@ -2823,6 +2823,18 @@ mod tests {
     }
 
     #[test]
+    fn workspace_name_cell_style_distinguishes_workspace_rows() {
+        assert_eq!(
+            workspace_name_cell_style(false).fg,
+            Some(WORKSPACE_NAME_COLOR)
+        );
+        assert_eq!(
+            workspace_name_cell_style(true).fg,
+            Some(SECONDARY_ROW_COLOR)
+        );
+    }
+
+    #[test]
     fn every_status_icon_kind_has_a_nerd_font_glyph() {
         for kind in [
             StatusIconKind::Eye,

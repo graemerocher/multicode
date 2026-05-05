@@ -254,7 +254,7 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &mut TuiState) {
 
                 rows.push(
                     Row::new(vec![
-                        Cell::from(key.clone()),
+                        Cell::from(key.clone()).style(workspace_name_cell_style(archived)),
                         Cell::from(server_cell_label(snapshot))
                             .style(server_cell_style(snapshot, archived)),
                         Cell::from(cpu),

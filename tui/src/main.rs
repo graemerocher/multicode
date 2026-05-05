@@ -55,6 +55,7 @@ use crate::icons::{icon_glyph, issue_type_icon_kind_and_color};
 const CREATE_ROW_LABEL: &str = "Create new workspace…";
 const SECONDARY_ROW_COLOR: Color = Color::DarkGray;
 const CREATE_ROW_COLOR: Color = Color::LightBlue;
+const WORKSPACE_NAME_COLOR: Color = Color::LightCyan;
 const IDLE_COLOR: Color = Color::Indexed(208);
 const BUSY_COLOR: Color = Color::Green;
 const WAITING_FOR_INPUT_COLOR: Color = Color::Yellow;
@@ -1672,6 +1673,14 @@ fn workspace_row_style(snapshot: &WorkspaceSnapshot) -> Style {
         Style::default().fg(SECONDARY_ROW_COLOR)
     } else {
         Style::default()
+    }
+}
+
+fn workspace_name_cell_style(archived: bool) -> Style {
+    if archived {
+        Style::default().fg(SECONDARY_ROW_COLOR)
+    } else {
+        Style::default().fg(WORKSPACE_NAME_COLOR)
     }
 }
 
